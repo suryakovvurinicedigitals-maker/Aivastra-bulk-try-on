@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Bulk Try-On — Control Panel</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark">AV</span>
+        <div>
+          <div class="brand-name">AI Vastra</div>
+          <div class="brand-sub">Bulk Try-On</div>
+        </div>
+      </div>
+
+      <nav class="nav">
+        <a href="#upload" class="nav-link" data-view="upload"><span class="nav-icon">⬆</span>Upload</a>
+        <a href="#results" class="nav-link" data-view="results"><span class="nav-icon">📁</span>Results</a>
+        <a href="#users" class="nav-link" data-view="users" id="nav-users-link" hidden><span class="nav-icon">👥</span>Users</a>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="sidebar-user" id="sidebar-user" hidden>
+          <div class="who">
+            <span class="username" id="sidebar-username"></span>
+            <span class="role" id="sidebar-role"></span>
+          </div>
+          <button type="button" class="logout-btn" id="logout-btn">Log out</button>
+        </div>
+        <div class="balance-card" id="sidebar-balance">Loading balance…</div>
+        <div class="env-tag">● PRODUCTION</div>
+      </div>
+    </aside>
+
+    <div class="content">
+      <!-- ============ UPLOAD VIEW ============ -->
+      <section class="view" data-view="upload">
+        <header class="view-header">
+          <h1>Upload &amp; Generate</h1>
+          <p class="subtitle">Add photos, review the plan, then run the batch — all in one place.</p>
+        </header>
+
+        <section class="panel" id="plan-panel">
+          <div class="plan-head">
+            <div>
+              <h2>📊 Current plan</h2>
+              <p class="hint">How many try-on jobs this data would produce.</p>
+            </div>
+            <button id="generate-btn" class="btn-primary" disabled>Generate</button>
+          </div>
+          <div class="scope-row">
+            <span class="selection-summary" id="selection-summary"></span>
+            <button class="link-btn" id="clear-selection-btn" type="button">Clear selection</button>
+          </div>
+          <div id="plan-summary">Loading…</div>
+          <div class="run-banner" id="upload-run-banner" hidden></div>
+          <div class="confirm-panel" id="confirm-panel" hidden>
+            <p id="confirm-text"></p>
+            <div class="confirm-actions">
+              <button id="confirm-cancel-btn" class="btn-secondary">Cancel</button>
+              <button id="confirm-run-btn" class="btn-danger">Yes, run it</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="plan-head">
+            <h2>👤 Upload person photos</h2>
+            <button type="button" class="link-btn danger" id="person-clear-btn">Clear all uploaded</button>
+          </div>
+          <p class="hint">One person per photo. Matched against every garment of the same gender you upload below.</p>
+          <div class="upload-row">
+            <label>Gender
+              <select id="person-gender">
+                <option value="men">Men</option>
+                <option value="women">Women</option>
+              </select>
+            </label>
+            <div class="dropzone" id="person-dropzone" tabindex="0">
+              <input type="file" id="person-input" accept="image/*" multiple hidden />
+              <input type="file" id="person-folder-input" webkitdirectory multiple hidden />
+              <span class="icon">⬆</span>
+              <span>Click or drag photos (or a whole folder) here — <button type="button" class="link-btn" id="person-folder-btn">choose a folder</button></span>
+            </div>
+          </div>
+          <div class="status" id="person-status"></div>
+          <div class="upload-thumbs" id="person-thumbs"></div>
+        </section>
+
+        <section class="panel">
+          <div class="plan-head">
+            <h2>👗 Upload garment photos</h2>
+            <button type="button" class="link-btn danger" id="garment-clear-btn">Clear all uploaded</button>
+          </div>
+          <p class="hint">Pick the category that matches the garment's admin-configured workflow.</p>
+          <div class="upload-row">
+            <label>Gender
+              <select id="garment-gender">
+                <option value="men">Men</option>
+                <option value="women">Women</option>
+              </select>
+            </label>
+            <label>Category
+              <select id="garment-category">
+                <!-- Real slugs, not a placeholder — the dropdown must never
+                     be stuck on a non-slug value if /api/categories is slow
+                     or fails to reach the browser. app.js replaces these with
+                     the live list once it loads, silently, same values today. -->
+                <option value="upper">upper</option>
+                <option value="lower">lower</option>
+                <option value="suits">suits</option>
+                <option value="saree">saree</option>
+                <option value="dress">dress</option>
+                <option value="general">general</option>
+              </select>
+            </label>
+            <div class="dropzone" id="garment-dropzone" tabindex="0">
+              <input type="file" id="garment-input" accept="image/*" multiple hidden />
+              <input type="file" id="garment-folder-input" webkitdirectory multiple hidden />
+              <span class="icon">⬆</span>
+              <span>Click or drag photos (or a whole folder) here — <button type="button" class="link-btn" id="garment-folder-btn">choose a folder</button></span>
+            </div>
+          </div>
+          <div class="status" id="garment-status"></div>
+          <div class="upload-thumbs" id="garment-thumbs"></div>
+        </section>
+      </section>
+
+      <!-- ============ RESULTS VIEW ============ -->
+      <section class="view" data-view="results" hidden>
+        <header class="view-header">
+          <h1>Results</h1>
+          <p class="subtitle">Every try-on job that's been run, across every batch.</p>
+        </header>
+
+        <section class="panel results-panel">
+          <div class="run-banner" id="run-banner" hidden></div>
+
+          <div class="filter-bar">
+            <label>Run
+              <select id="filter-run"><option value="">All runs</option></select>
+            </label>
+            <label>Gender
+              <select id="filter-gender"><option value="">All</option></select>
+            </label>
+            <label>Category
+              <select id="filter-category"><option value="">All</option></select>
+            </label>
+            <label>Status
+              <select id="filter-status">
+                <option value="">All</option>
+                <option value="COMPLETED">Completed</option>
+                <option value="FAILED">Failed</option>
+                <option value="ERROR">Error</option>
+              </select>
+            </label>
+            <label>User
+              <select id="filter-user"><option value="">All</option></select>
+            </label>
+            <label>Flag
+              <select id="filter-flagged">
+                <option value="">All</option>
+                <option value="1">Flagged only</option>
+                <option value="resolved">Resolved only</option>
+              </select>
+            </label>
+            <label class="filter-search">Search
+              <input type="search" id="filter-search" placeholder="Person or garment name…" />
+            </label>
+            <button id="filter-apply-btn" class="btn-primary btn-small">Apply</button>
+            <button id="filter-clear-btn" class="btn-secondary btn-small">Clear</button>
+          </div>
+
+          <div class="results-meta" id="results-meta">Loading…</div>
+
+          <div class="results-table-wrap">
+            <table class="results-table">
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>User</th>
+                  <th>Person</th>
+                  <th>Garment</th>
+                  <th>Category</th>
+                  <th>Output</th>
+                  <th>Status</th>
+                  <th>When</th>
+                  <th>Flag</th>
+                </tr>
+              </thead>
+              <tbody id="results-tbody">
+                <tr><td colspan="9" class="empty">Loading…</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="pagination" id="results-pagination"></div>
+        </section>
+      </section>
+
+      <!-- ============ USERS VIEW (super admin only) ============ -->
+      <section class="view" data-view="users" hidden>
+        <header class="view-header">
+          <h1>Users</h1>
+          <p class="subtitle">Create accounts for anyone else who needs to use this panel.</p>
+        </header>
+
+        <section class="panel">
+          <h2>➕ Create user</h2>
+          <p class="hint">New accounts are regular users — there is only ever one super admin.</p>
+          <form class="users-form-row" id="create-user-form">
+            <label>Username
+              <input type="text" id="new-user-username" autocomplete="off" required />
+            </label>
+            <label>Password
+              <input type="password" id="new-user-password" autocomplete="new-password" required />
+            </label>
+            <button type="submit" class="btn-primary" id="create-user-btn">Create</button>
+          </form>
+          <div class="status" id="create-user-status"></div>
+        </section>
+
+        <section class="panel">
+          <h2>👥 All users</h2>
+          <p class="hint">Only a super admin can reset or change a password — there is no self-service or "forgot password" flow. Set one here, then copy it and send it to them yourself.</p>
+          <div class="status" id="users-action-status"></div>
+          <div class="results-table-wrap">
+            <table class="results-table" id="users-table">
+              <thead>
+                <tr>
+                  <th>Username</th>
+                  <th>Role</th>
+                  <th>Created</th>
+                  <th>Password</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="users-tbody">
+                <tr><td colspan="5" class="empty">Loading…</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+    </div>
+  </div>
+
+  <!-- Fullscreen image viewer, shared by every image in the Results table -->
+  <div class="lightbox" id="lightbox" hidden>
+    <button type="button" class="lightbox-close" id="lightbox-close" aria-label="Close">×</button>
+    <a class="lightbox-download" id="lightbox-download" download title="Download">⬇ Download</a>
+    <img id="lightbox-img" src="" alt="" />
+  </div>
+
+  <!-- Flag job modal -->
+  <div class="modal-overlay" id="flag-modal-overlay" hidden>
+    <div class="modal-card">
+      <h3 id="flag-modal-title">Flag job</h3>
+      <p class="subtitle" id="flag-modal-subtitle"></p>
+      <label class="modal-field" id="flag-reason-group">Reason
+        <select id="flag-reason"></select>
+      </label>
+      <label class="modal-field">Note (optional)
+        <textarea id="flag-note" rows="3" maxlength="500" placeholder="Any extra detail…"></textarea>
+      </label>
+      <div class="status err" id="flag-modal-error" hidden></div>
+      <div class="modal-actions">
+        <button type="button" class="btn-secondary btn-small" id="flag-modal-cancel">Cancel</button>
+        <button type="button" class="btn-secondary btn-small" id="flag-modal-unflag" hidden>Unflag</button>
+        <button type="button" class="btn-primary btn-small" id="flag-modal-submit">Flag job</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

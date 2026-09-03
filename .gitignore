@@ -1,0 +1,26 @@
+node_modules
+*.tsbuildinfo
+.DS_Store
+Thumbs.db
+.idea
+.vscode/
+*.log
+
+.env*
+!.env.example
+
+# Uploaded person/garment photos and generated results — real (often
+# production) images and outputs, never belongs in the repo.
+/input/
+/output/
+
+# The SQLite store (lib/db.mts) — run history, QA flags, and web-login
+# accounts, all local state. -wal/-shm are SQLite's WAL sidecar files,
+# present whenever the DB has been opened since the last clean checkpoint.
+/data/
+
+# Pre-DB local state, retired by lib/db.mts's one-time migration (renamed to
+# *.migrated instead of deleted — see db.mts) but still gitignored in case an
+# old copy lingers on disk.
+/webapp/users.json*
+/webapp/flags.json*

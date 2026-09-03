@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Bulk Try-On — Log in</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div class="login-page">
+    <form class="login-card" id="login-form">
+      <div class="brand login-brand">
+        <span class="brand-mark">AV</span>
+        <div>
+          <div class="brand-name">AI Vastra</div>
+          <div class="brand-sub">Bulk Try-On</div>
+        </div>
+      </div>
+      <h1>Log in</h1>
+      <p class="hint">Ask your super admin for an account if you don't have one.</p>
+
+      <label>Username
+        <input type="text" id="login-username" name="username" autocomplete="username" required autofocus />
+      </label>
+      <label>Password
+        <input type="password" id="login-password" name="password" autocomplete="current-password" required />
+      </label>
+
+      <div class="status err" id="login-status"></div>
+
+      <button type="submit" class="btn-primary login-submit" id="login-submit-btn">Log in</button>
+    </form>
+  </div>
+
+  <script src="/login.js"></script>
+</body>
+</html>

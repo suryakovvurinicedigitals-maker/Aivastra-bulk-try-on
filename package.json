@@ -1,0 +1,19 @@
+{
+  "name": "aivastra-bulk-tryon",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Standalone local control panel + CLI for bulk AI virtual try-on job generation against AI Vastra's public dev API. Talks to https://app.aivastra.com over HTTPS only — no code or database from the aivastra monorepo.",
+  "engines": {
+    "node": ">=23.4.0"
+  },
+  "scripts": {
+    "cli": "tsx --env-file=.env run.mts",
+    "web": "tsx --env-file=.env webapp/server.mts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "tsx": "^4.19.1",
+    "typescript": "^5.6.3"
+  }
+}
