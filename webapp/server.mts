@@ -853,6 +853,15 @@ const server = http.createServer(async (req, res) => {
       const userFilter = (url.searchParams.get('user') ?? '').trim();
       const q = (url.searchParams.get('q') ?? '').trim();
       const flaggedFilter = url.searchParams.get('flagged'); // '' | '1' (flagged, unresolved) | 'resolved'
+      // The client sends datetime-local values already converted to full ISO
+      // UTC strings (see app.js), matching how finished_at is stored — but
+      // validate here too rather than trusting the query string, since an
+      // unparseable value would otherwise become a silently-wrong string
+      // comparison in SQL instead of a no-op.
+      const dateFromRaw = url.searchParams.get('from');
+      const dateToRaw = url.searchParams.get('to');
+      const dateFrom = dateFromRaw && !Number.isNaN(Date.parse(dateFromRaw)) ? dateFromRaw : undefined;
+      const dateTo = dateToRaw && !Number.isNaN(Date.parse(dateToRaw)) ? dateToRaw : undefined;
       const page = Math.max(1, Math.trunc(Number(url.searchParams.get('page'))) || 1);
       const pageSize = Math.min(100, Math.max(1, Math.trunc(Number(url.searchParams.get('pageSize'))) || 25));
 
@@ -864,6 +873,8 @@ const server = http.createServer(async (req, res) => {
         startedBy: userFilter || undefined,
         q: q || undefined,
         flagMode: flaggedFilter === '1' || flaggedFilter === 'resolved' ? flaggedFilter : undefined,
+        dateFrom,
+        dateTo,
         page,
         pageSize,
       });

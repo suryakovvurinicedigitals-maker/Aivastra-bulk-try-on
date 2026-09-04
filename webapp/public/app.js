@@ -41,6 +41,8 @@ const filterCategoryEl = document.getElementById('filter-category');
 const filterStatusEl = document.getElementById('filter-status');
 const filterUserEl = document.getElementById('filter-user');
 const filterFlaggedEl = document.getElementById('filter-flagged');
+const filterFromEl = document.getElementById('filter-from');
+const filterToEl = document.getElementById('filter-to');
 const filterSearchEl = document.getElementById('filter-search');
 const filterApplyBtn = document.getElementById('filter-apply-btn');
 const filterClearBtn = document.getElementById('filter-clear-btn');
@@ -866,7 +868,17 @@ async function enterUploadView() {
 // tool still has no per-flag or per-credit tracking (no moderation, no
 // billing here), so those columns stay out; User comes from who was logged
 // in when the run was started (server.mts writes run-meta.json per run).
-let resultsState = { run: '', gender: '', category: '', status: '', user: '', q: '', flagged: '', page: 1 };
+let resultsState = { run: '', gender: '', category: '', status: '', user: '', q: '', flagged: '', from: '', to: '', page: 1 };
+
+/** `<input type="datetime-local">` gives back a value like "2026-09-04T10:30" with
+ * no timezone — the browser means it in local time. `new Date(...)` parses that as
+ * local time, and `.toISOString()` converts to the same UTC-string format finished_at
+ * is stored in (see batch.mts), so the two sides of the SQL comparison actually agree. */
+function datetimeLocalToIso(value) {
+  if (!value) return '';
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? '' : d.toISOString();
+}
 let resultsPollHandle = null;
 
 // ---------- fullscreen lightbox ----------
@@ -1039,6 +1051,8 @@ async function loadResults(resetPage) {
   if (resultsState.user) params.set('user', resultsState.user);
   if (resultsState.q) params.set('q', resultsState.q);
   if (resultsState.flagged) params.set('flagged', resultsState.flagged);
+  if (resultsState.from) params.set('from', datetimeLocalToIso(resultsState.from));
+  if (resultsState.to) params.set('to', datetimeLocalToIso(resultsState.to));
   params.set('page', String(resultsState.page));
   params.set('pageSize', '25');
 
@@ -1100,13 +1114,17 @@ filterApplyBtn.addEventListener('click', () => {
   resultsState.user = filterUserEl.value;
   resultsState.q = filterSearchEl.value.trim();
   resultsState.flagged = filterFlaggedEl.value;
+  resultsState.from = filterFromEl.value;
+  resultsState.to = filterToEl.value;
   loadResults(true);
 });
 filterClearBtn.addEventListener('click', () => {
   filterStatusEl.value = '';
   filterSearchEl.value = '';
   filterFlaggedEl.value = '';
-  resultsState = { run: '', gender: '', category: '', status: '', user: '', q: '', flagged: '', page: 1 };
+  filterFromEl.value = '';
+  filterToEl.value = '';
+  resultsState = { run: '', gender: '', category: '', status: '', user: '', q: '', flagged: '', from: '', to: '', page: 1 };
   loadResults(true);
 });
 filterSearchEl.addEventListener('keydown', (e) => {

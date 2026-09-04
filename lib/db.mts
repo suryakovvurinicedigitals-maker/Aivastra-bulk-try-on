@@ -365,6 +365,8 @@ export interface ResultFilters {
   startedBy?: string;
   q?: string;
   flagMode?: '1' | 'resolved'; // '1' = flagged and not yet resolved
+  dateFrom?: string; // ISO timestamp, inclusive lower bound on finished_at
+  dateTo?: string; // ISO timestamp, inclusive upper bound on finished_at
   page: number;
   pageSize: number;
 }
@@ -413,6 +415,17 @@ export function listResults(f: ResultFilters): ResultsPage {
   }
   if (f.flagMode === '1') where.push('(fl.result_id IS NOT NULL AND fl.resolved_at IS NULL)');
   else if (f.flagMode === 'resolved') where.push('fl.resolved_at IS NOT NULL');
+  // finished_at is stored as an ISO 8601 UTC string (see batch.mts's
+  // `new Date().toISOString()`), which sorts and compares correctly as plain
+  // text — no need to parse it back into a Date for range filtering.
+  if (f.dateFrom) {
+    where.push('jr.finished_at >= @dateFrom');
+    params.dateFrom = f.dateFrom;
+  }
+  if (f.dateTo) {
+    where.push('jr.finished_at <= @dateTo');
+    params.dateTo = f.dateTo;
+  }
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
 
   const fromSql = `

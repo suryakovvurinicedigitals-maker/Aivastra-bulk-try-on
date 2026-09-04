@@ -342,6 +342,36 @@ select:focus, .dropzone:focus-within { outline: 2px solid var(--pink); outline-o
   font-size: 0.9rem;
   width: 100%;
 }
+/* Date filter — one labeled group holding both the From and To pickers side
+   by side, so it reads as a single "Date" filter (like every other dropdown
+   in the bar) rather than two separate unlabeled-looking fields. */
+.filter-date-group { display: flex; flex-direction: column; gap: 5px; }
+.filter-date-group-label { font-size: 0.78rem; font-weight: 600; color: var(--muted); }
+.filter-date-range {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+}
+.filter-date-range input[type="datetime-local"] {
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 0.84rem;
+  padding: 6px 2px;
+  min-width: 0;
+}
+.filter-date-range input[type="datetime-local"]:focus { outline: none; }
+.filter-date-range:focus-within { outline: 2px solid var(--pink); outline-offset: 1px; }
+.filter-date-sep { color: var(--muted); font-size: 0.8rem; flex-shrink: 0; }
+@media (max-width: 640px) {
+  .filter-date-range { flex-direction: column; align-items: stretch; }
+  .filter-date-sep { display: none; }
+}
+
 .btn-small { padding: 9px 14px; font-size: 0.82rem; }
 
 .results-meta { font-size: 0.82rem; color: var(--muted); margin-bottom: 10px; }
