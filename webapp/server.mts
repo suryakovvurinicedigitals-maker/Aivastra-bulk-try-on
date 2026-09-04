@@ -380,6 +380,11 @@ interface QueuedRun {
 let queuedRuns: QueuedRun[] = [];
 let nextQueueId = 1;
 
+/** Distinct garment categories in a queued batch's selection, sorted — shown next to each queue entry so a wrong-category mistake (e.g. queued "lower" instead of "upper") is visible and cancellable before it ever starts running and spending credits. */
+function queuedCategories(selection: Selection): string[] {
+  return [...new Set(selection.garments.map((g) => g.category).filter((c): c is string => Boolean(c)))].sort();
+}
+
 /** Actually launches a batch — shared by "start now" and "queued batch's turn arrived". */
 function startRun(jobs: TryonJobSpec[], startedBy: string): { runId: string; total: number } {
   const runId = new Date().toISOString().replace(/[:.]/g, '-');
@@ -821,7 +826,13 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/api/run/status') {
       json(res, 200, {
         ...(currentRun ?? { status: 'idle' }),
-        queued: queuedRuns.map((q) => ({ id: q.id, total: q.confirmedTotal, queuedBy: q.queuedBy, queuedAt: q.queuedAt })),
+        queued: queuedRuns.map((q) => ({
+          id: q.id,
+          total: q.confirmedTotal,
+          queuedBy: q.queuedBy,
+          queuedAt: q.queuedAt,
+          categories: queuedCategories(q.selection),
+        })),
       });
       return;
     }
@@ -873,6 +884,7 @@ const server = http.createServer(async (req, res) => {
           status: r.status,
           error: r.error,
           finishedAt: r.finishedAt,
+          durationMs: r.durationMs ?? null,
           personThumb: personFile ? `/api/file?path=${encodeURIComponent(path.relative(INPUT_DIR, path.join(personDir, personFile)))}` : null,
           garmentThumb: garmentFile ? `/api/file?path=${encodeURIComponent(path.relative(INPUT_DIR, path.join(garmentDir, garmentFile)))}` : null,
           outputThumb: r.outputFile ? `/api/result-file?path=${encodeURIComponent(path.relative(OUTPUT_DIR, r.outputFile))}` : null,

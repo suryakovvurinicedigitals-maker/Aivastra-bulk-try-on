@@ -76,6 +76,19 @@ db.exec(`
   );
 `);
 
+// job_results predates the "how long did generation take?" requirement, so
+// existing DBs need this column added on top rather than via CREATE TABLE IF
+// NOT EXISTS (which only applies to brand-new tables). Guarded on PRAGMA
+// table_info so this is a fast no-op on every startup after the first.
+// Nullable: rows written before this migration (and legacy manifest.jsonl
+// rows, which never recorded timing) have no duration to backfill.
+{
+  const jobResultsCols = (db.prepare('PRAGMA table_info(job_results)').all() as { name: string }[]).map((c) => c.name);
+  if (!jobResultsCols.includes('duration_ms')) {
+    db.exec('ALTER TABLE job_results ADD COLUMN duration_ms INTEGER');
+  }
+}
+
 // ---- one-time migration of the pre-DB file-based state, if any is found ----
 // Both migrations are gated on "the destination table is still empty" so this
 // is safe to run on every startup: a second run against an already-migrated
@@ -141,8 +154,8 @@ function migrateLegacyRunHistory(): void {
 
   const insertRun = db.prepare('INSERT OR IGNORE INTO runs (run_id, started_by, started_at) VALUES (?, ?, ?)');
   const insertResult = db.prepare(`
-    INSERT INTO job_results (run_id, gender, person_name, category_slug, garment_name, job_id, status, error_code, error, output_file, finished_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO job_results (run_id, gender, person_name, category_slug, garment_name, job_id, status, error_code, error, output_file, finished_at, duration_ms)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   db.exec('BEGIN');
@@ -162,6 +175,7 @@ function migrateLegacyRunHistory(): void {
         r.error ?? null,
         r.outputFile ?? null,
         r.finishedAt,
+        null, // legacy manifest.jsonl rows never recorded timing
       );
     }
     db.exec('COMMIT');
@@ -249,6 +263,8 @@ export interface JobResultInput {
   error?: string;
   outputFile?: string;
   finishedAt: string;
+  /** Wall-clock time the job took to generate (create → poll → download), in milliseconds. Optional/nullable because rows from before this field existed (and migrated legacy manifest.jsonl rows) have no timing data. */
+  durationMs?: number;
 }
 
 export interface JobResultRow extends JobResultInput {
@@ -281,6 +297,7 @@ function rowToJobResult(r: Record<string, unknown>): JobResultRow {
     error: (r.error as string) ?? undefined,
     outputFile: (r.output_file as string) ?? undefined,
     finishedAt: String(r.finished_at),
+    durationMs: r.duration_ms != null ? Number(r.duration_ms) : undefined,
   };
 }
 
@@ -297,8 +314,8 @@ export function getRunMeta(runId: string): { startedBy?: string } {
 }
 
 const insertJobResultStmt = db.prepare(`
-  INSERT INTO job_results (run_id, gender, person_name, category_slug, garment_name, job_id, status, error_code, error, output_file, finished_at)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO job_results (run_id, gender, person_name, category_slug, garment_name, job_id, status, error_code, error, output_file, finished_at, duration_ms)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 export function insertJobResult(runId: string, r: JobResultInput): number {
   ensureRun(runId); // no-op if already inserted with a startedBy
@@ -314,6 +331,7 @@ export function insertJobResult(runId: string, r: JobResultInput): number {
     r.error ?? null,
     r.outputFile ?? null,
     r.finishedAt,
+    r.durationMs ?? null,
   );
   return Number(info.lastInsertRowid);
 }

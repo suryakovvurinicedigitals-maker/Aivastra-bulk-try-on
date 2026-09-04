@@ -691,6 +691,15 @@ wireFolderPicker(garmentFolderBtnEl, garmentFolderInputEl, (files) =>
 // it finishes, even if the user never leaves the Upload page.
 let pollHandle = null;
 
+// Renders a queued batch's garment categories as chips (same look as the
+// Results table's category column) so a wrong-category mistake is visible at
+// a glance — and cancellable — before the batch ever starts and spends
+// credits. '—' for the (unexpected) case of a queued batch with no garments.
+function queuedCategoriesHtml(categories) {
+  if (!categories || categories.length === 0) return '<span class="chip">—</span>';
+  return categories.map((c) => `<span class="chip">${c}</span>`).join(' ');
+}
+
 // Shows/hides the Upload page's own run banner — mirrors the Results page's
 // banner (loadResults, below) but also renders the queue (in order, each with
 // its own Cancel button), since Generate — where a user decides to queue
@@ -710,7 +719,7 @@ function renderUploadRunBanner(run, running) {
   const queuedLines = queuedList
     .map(
       (q, i) =>
-        `<div class="queued-line">🕒 Queued #${i + 1}: <b>${q.total} job(s)</b> (by ${q.queuedBy}) — will start automatically once its turn comes.${canCancel ? ` <button type="button" class="link-btn danger" data-cancel-queue-id="${q.id}">Cancel</button>` : ''}</div>`,
+        `<div class="queued-line">🕒 Queued #${i + 1}: <b>${q.total} job(s)</b> — ${queuedCategoriesHtml(q.categories)} (by ${q.queuedBy}) — will start automatically once its turn comes.${canCancel ? ` <button type="button" class="link-btn danger" data-cancel-queue-id="${q.id}">Cancel</button>` : ''}</div>`,
     )
     .join('');
   uploadRunBannerEl.innerHTML = runningLine + queuedLines;
@@ -923,10 +932,24 @@ function mediaBoxHtml(url, extraClass) {
     </div>`;
 }
 
+// Job duration as shown in the Results table: seconds under a minute (one
+// decimal, e.g. "12.4s"), minutes+seconds beyond that (e.g. "1m 03s"). Rows
+// with no recorded duration (pre-migration or migrated-legacy jobs) show "—"
+// rather than a misleading 0s.
+function formatDuration(durationMs) {
+  if (durationMs == null) return '—';
+  const totalSeconds = durationMs / 1000;
+  if (totalSeconds < 60) return `${totalSeconds.toFixed(1)}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = Math.round(totalSeconds % 60);
+  return `${minutes}m ${String(seconds).padStart(2, '0')}s`;
+}
+
 function resultRowHtml(row) {
   const statusClass = row.status === 'COMPLETED' ? 'ok' : 'err';
   const statusLabel = row.status === 'COMPLETED' ? 'Completed' : row.status === 'FAILED' ? 'Failed' : 'Error';
   const when = new Date(row.finishedAt).toLocaleString();
+  const duration = formatDuration(row.durationMs);
   const errTitle = row.error ? ` title="${row.error.replace(/"/g, '&quot;')}"` : '';
   const rowClass = row.flag?.resolvedAt ? 'resolved-row' : row.flag ? 'flagged-row' : '';
   return `
@@ -949,6 +972,7 @@ function resultRowHtml(row) {
       <td>${mediaBoxHtml(row.outputThumb, 'output-thumb-box')}</td>
       <td><span class="badge ${statusClass}"${errTitle}>${statusLabel}</span></td>
       <td class="cell-when">${when}</td>
+      <td class="cell-when">${duration}</td>
       <td class="cell-flag">${flagCellHtml(row)}</td>
     </tr>`;
 }
@@ -1028,7 +1052,7 @@ async function loadResults(resetPage) {
 
   resultsTbodyEl.innerHTML =
     data.rows.length === 0
-      ? '<tr><td colspan="9" class="empty">No results yet — run a batch from the Upload page.</td></tr>'
+      ? '<tr><td colspan="10" class="empty">No results yet — run a batch from the Upload page.</td></tr>'
       : data.rows.map(resultRowHtml).join('');
 
   resultsMetaEl.textContent = `${data.total.toLocaleString()} output(s) — page ${data.page} of ${data.totalPages}`;
@@ -1050,7 +1074,10 @@ async function loadResults(resetPage) {
     // Read-only here — cancelling a queued batch happens from the Upload
     // page's banner, where Generate/Queue is actually decided.
     const queuedLines = queuedList
-      .map((q, i) => `<div class="queued-line">🕒 Queued #${i + 1}: <b>${q.total} job(s)</b> (by ${q.queuedBy}) — will start automatically.</div>`)
+      .map(
+        (q, i) =>
+          `<div class="queued-line">🕒 Queued #${i + 1}: <b>${q.total} job(s)</b> — ${queuedCategoriesHtml(q.categories)} (by ${q.queuedBy}) — will start automatically.</div>`,
+      )
       .join('');
     runBannerEl.innerHTML = runningLine + queuedLines;
     if (!resultsPollHandle) resultsPollHandle = setInterval(() => loadResults(false), 3000);

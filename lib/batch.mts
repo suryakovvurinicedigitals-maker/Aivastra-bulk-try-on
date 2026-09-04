@@ -28,6 +28,8 @@ export interface JobResult {
   error?: string;
   outputFile?: string;
   finishedAt: string;
+  /** Wall-clock time from job start (before file reads/create-job call) to this result, in milliseconds — what the Results page shows as "Duration". */
+  durationMs: number;
 }
 
 export function keyOf(j: Pick<TryonJobSpec, 'gender' | 'personName' | 'categorySlug' | 'garmentName'>): string {
@@ -67,14 +69,20 @@ export async function runOneJob(
   job: TryonJobSpec,
   resultsDir: string,
   poll: PollOptions,
+  startedAt: number = Date.now(),
 ): Promise<JobResult> {
-  const base = {
+  // base() is called at each return point (not once up front) so finishedAt/
+  // durationMs reflect when *that* outcome actually happened, not when the
+  // job started — e.g. a FAILED result's duration includes the full poll
+  // loop, a COMPLETED one also includes the download.
+  const base = () => ({
     gender: job.gender,
     personName: job.personName,
     categorySlug: job.categorySlug,
     garmentName: job.garmentName,
     finishedAt: new Date().toISOString(),
-  };
+    durationMs: Date.now() - startedAt,
+  });
 
   const person = { buf: readFileSync(job.personFile), filename: path.basename(job.personFile), mime: mimeFor(job.personFile) };
   const garment = { buf: readFileSync(job.garmentFile), filename: path.basename(job.garmentFile), mime: mimeFor(job.garmentFile) };
@@ -83,12 +91,12 @@ export async function runOneJob(
   const outcome = await pollJob(cfg, created.jobId, poll);
 
   if (outcome.status === 'FAILED') {
-    return { ...base, jobId: created.jobId, status: 'FAILED', error: outcome.error };
+    return { ...base(), jobId: created.jobId, status: 'FAILED', error: outcome.error };
   }
 
   const imgRes = await fetch(outcome.imageUrl!);
   if (!imgRes.ok) {
-    return { ...base, jobId: created.jobId, status: 'ERROR', error: `failed to download result: HTTP ${imgRes.status}` };
+    return { ...base(), jobId: created.jobId, status: 'ERROR', error: `failed to download result: HTTP ${imgRes.status}` };
   }
   const bytes = Buffer.from(await imgRes.arrayBuffer());
 
@@ -97,15 +105,15 @@ export async function runOneJob(
   const outFile = path.join(outDir, `${job.garmentName}.jpg`);
   writeFileSync(outFile, bytes);
 
-  return { ...base, jobId: created.jobId, status: 'COMPLETED', outputFile: outFile };
+  return { ...base(), jobId: created.jobId, status: 'COMPLETED', outputFile: outFile };
 }
 
 export function writeSummaryCsv(runDir: string, runId: string) {
   const rows = getRunRows(runId);
-  const header = 'gender,personName,categorySlug,garmentName,status,jobId,outputFile,error';
+  const header = 'gender,personName,categorySlug,garmentName,status,jobId,outputFile,error,durationMs';
   const csvEscape = (v: string) => `"${v.replace(/"/g, '""')}"`;
   const body = rows.map((r) =>
-    [r.gender, r.personName, r.categorySlug, r.garmentName, r.status, r.jobId ?? '', r.outputFile ?? '', r.error ?? '']
+    [r.gender, r.personName, r.categorySlug, r.garmentName, r.status, r.jobId ?? '', r.outputFile ?? '', r.error ?? '', r.durationMs != null ? String(r.durationMs) : '']
       .map(csvEscape)
       .join(','),
   );
@@ -139,7 +147,8 @@ export async function runBatch(
     jobs.map((job) =>
       limit(async () => {
         if (creditsExhausted) return;
-        const result = await runOneJob(cfg, job, resultsDir, opts.poll).catch(
+        const startedAt = Date.now();
+        const result = await runOneJob(cfg, job, resultsDir, opts.poll, startedAt).catch(
           (err): JobResult => ({
             gender: job.gender,
             personName: job.personName,
@@ -149,6 +158,7 @@ export async function runBatch(
             errorCode: err instanceof DevApiError ? err.code : undefined,
             error: err instanceof Error ? err.message : String(err),
             finishedAt: new Date().toISOString(),
+            durationMs: Date.now() - startedAt,
           }),
         );
 
