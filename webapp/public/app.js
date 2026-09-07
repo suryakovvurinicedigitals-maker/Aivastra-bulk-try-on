@@ -306,12 +306,34 @@ let currentPlanTotal = 0;
 async function loadPlan() {
   selectionSummaryEl.textContent = `${selection.people.length} people, ${selection.garments.length} garment(s) selected`;
 
-  const res = await fetch('/api/plan', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ scope: 'selected', selection }),
-  });
-  const data = await res.json();
+  let data;
+  try {
+    const res = await fetch('/api/plan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scope: 'selected', selection }),
+    });
+    data = await res.json();
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  } catch (err) {
+    // /api/plan's job count depends on a live call to aivastra's dev API
+    // (computeJobs -> getCategories, server.mts) — a transient hiccup there
+    // (rate limit, timeout, network blip — more likely while a batch is
+    // already running and polling job statuses against the same API key)
+    // used to leave this function mid-throw *before* it reached the
+    // `generateBtn.disabled = ...` line below, stranding Generate in
+    // whatever disabled state it already had (HTML ships it `disabled` by
+    // default) until a page reload happened to land on a moment the API
+    // call succeeded — which read as "Generate doesn't work, needs several
+    // hard refreshes". Fail safe and visibly instead: never guess a stale
+    // total is still right, keep Generate disabled, and offer a one-click
+    // retry instead of a blind full-page reload.
+    planSummaryEl.innerHTML = `<div class="notes"><li>Could not load the plan: ${err instanceof Error ? err.message : String(err)} — <button type="button" class="link-btn" id="plan-retry-btn">Retry</button></li></div>`;
+    document.getElementById('plan-retry-btn')?.addEventListener('click', () => loadPlan());
+    currentPlanTotal = 0;
+    generateBtn.disabled = true;
+    return 0;
+  }
   const chips =
     Object.entries(data.byCategory)
       .map(([slug, n]) => `<span class="chip">${slug} · ${n}</span>`)
@@ -868,7 +890,38 @@ async function enterUploadView() {
 // tool still has no per-flag or per-credit tracking (no moderation, no
 // billing here), so those columns stay out; User comes from who was logged
 // in when the run was started (server.mts writes run-meta.json per run).
-let resultsState = { run: '', gender: '', category: '', status: '', user: '', q: '', flagged: '', from: '', to: '', page: 1 };
+// Persisted the same way `selection` is (see SELECTION_KEY above) — a plain
+// browser refresh used to always snap the Results page back to page 1 with
+// every filter cleared, which made it hard to get back to a specific result
+// you'd already filtered/paged down to. Restoring from localStorage means a
+// refresh (or reopening the tab later) lands back exactly where you left off.
+const RESULTS_STATE_KEY = 'bulkTryonResultsState';
+const DEFAULT_RESULTS_STATE = { run: '', gender: '', category: '', status: '', user: '', q: '', flagged: '', from: '', to: '', page: 1 };
+
+function loadResultsState() {
+  try {
+    const v = JSON.parse(localStorage.getItem(RESULTS_STATE_KEY));
+    if (v && typeof v === 'object') return { ...DEFAULT_RESULTS_STATE, ...v };
+  } catch {
+    /* corrupt/missing — start fresh */
+  }
+  return { ...DEFAULT_RESULTS_STATE };
+}
+function saveResultsState() {
+  localStorage.setItem(RESULTS_STATE_KEY, JSON.stringify(resultsState));
+}
+
+let resultsState = loadResultsState();
+// The Run/Gender/Category/User dropdowns get their restored value applied by
+// fillSelectPreserving (below) once /api/results returns the real option
+// lists — but the plain inputs (Status, Search, Flag, the two date pickers)
+// are never rebuilt, so nothing else would ever put the restored value back
+// into their DOM elements. Do that once, up front, before the first fetch.
+filterStatusEl.value = resultsState.status;
+filterSearchEl.value = resultsState.q;
+filterFlaggedEl.value = resultsState.flagged;
+filterFromEl.value = resultsState.from;
+filterToEl.value = resultsState.to;
 
 /** `<input type="datetime-local">` gives back a value like "2026-09-04T10:30" with
  * no timezone — the browser means it in local time. `new Date(...)` parses that as
@@ -926,9 +979,18 @@ function formatRunId(runId) {
 }
 
 function fillSelectPreserving(selectEl, values, current, allLabel, formatter) {
+  // Prefer whatever the user currently has picked in the dropdown itself over
+  // `current` (the last-*applied* filter value). Results poll on a 3s timer
+  // while a run is active/queued (see the setInterval below), and each poll
+  // used to force selectEl.value back to `current` — clobbering a selection
+  // the user had just made but not yet hit Apply on, which looked like the
+  // dropdown "reverting" a few seconds after clicking it. The Clear button
+  // resets these selects' .value directly before calling loadResults, so
+  // `current` and the live value already agree in that case.
+  const pending = selectEl.value;
   const opts = [`<option value="">${allLabel}</option>`, ...values.map((v) => `<option value="${v}">${formatter ? formatter(v) : v}</option>`)];
   selectEl.innerHTML = opts.join('');
-  selectEl.value = current;
+  selectEl.value = pending || current;
 }
 
 // A big clickable portrait thumbnail with a hover-revealed download button.
@@ -1043,6 +1105,11 @@ function renderPagination(page, totalPages) {
 
 async function loadResults(resetPage) {
   if (resetPage) resultsState.page = 1;
+  // Single choke point for every caller (Apply, Clear, Prev/Next, the
+  // in-progress-run poll) so a refresh always resumes at whatever filters/
+  // page were last actually in effect, not just whatever the Apply button
+  // happened to save.
+  saveResultsState();
   const params = new URLSearchParams();
   if (resultsState.run) params.set('run', resultsState.run);
   if (resultsState.gender) params.set('gender', resultsState.gender);
@@ -1119,7 +1186,15 @@ filterApplyBtn.addEventListener('click', () => {
   loadResults(true);
 });
 filterClearBtn.addEventListener('click', () => {
+  // Reset every filter control's live DOM value, not just the ones that
+  // don't get rebuilt by fillSelectPreserving — otherwise Run/Gender/
+  // Category/User would keep showing their last pending pick (see
+  // fillSelectPreserving's `pending || current` fallback above).
+  filterRunEl.value = '';
+  filterGenderEl.value = '';
+  filterCategoryEl.value = '';
   filterStatusEl.value = '';
+  filterUserEl.value = '';
   filterSearchEl.value = '';
   filterFlaggedEl.value = '';
   filterFromEl.value = '';
