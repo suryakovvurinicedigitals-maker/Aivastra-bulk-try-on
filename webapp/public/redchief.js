@@ -559,4 +559,47 @@ async function refreshRedchiefRowResult(rowId) {
   }
 }
 
+async function cancelRedchiefRow(rowId) {
+  const row = redchiefFindRow(rowId);
+  if (!row || row.status !== 'QUEUED') return;
+  try {
+    const res = await fetch(`/api/redchief/jobs/${row.jobId}/cancel`, { method: 'POST' });
+    const body = await res.json();
+    if (!res.ok) {
+      // 409 CONFLICT: the job moved past QUEUED between this click and the
+      // request landing — show that plainly rather than a generic failure,
+      // and stop offering Cancel (the next poll tick will move status on).
+      row.cancelNote = res.status === 409 ? 'Already processing — too late to cancel.' : `${body.error?.code ?? res.status}: ${body.error?.message ?? 'cancel failed'}`;
+      renderRedchiefRows();
+      return;
+    }
+    // Success — reset to fully editable/idle, keep the row's photos so it's
+    // instantly resubmittable. Bump pollToken so any in-flight poll
+    // continuation for the old jobId is discarded rather than reviving this row.
+    row.pollToken++;
+    if (row.pollTimer) clearTimeout(row.pollTimer);
+    row.pollTimer = null;
+    row.jobId = null;
+    row.status = 'idle';
+    row.error = null;
+    row.cancelNote = null;
+    renderRedchiefRows();
+  } catch (err) {
+    row.cancelNote = err instanceof Error ? err.message : String(err);
+    renderRedchiefRows();
+  }
+}
+
+function retryRedchiefRow(rowId) {
+  const row = redchiefFindRow(rowId);
+  if (!row || row.status !== 'FAILED') return;
+  row.pollToken++; // discard any stale continuation from the failed attempt
+  row.jobId = null;
+  row.error = null;
+  row.resultUrls = null;
+  row.status = 'submitting';
+  renderRedchiefRows();
+  submitRedchiefRow(row);
+}
+
 wireDropzone(redchiefFolderDropzoneEl, redchiefFolderInputEl, handleRedchiefFolderFiles, redchiefBulkStatusEl);
