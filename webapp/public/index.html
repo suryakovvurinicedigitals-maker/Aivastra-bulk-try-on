@@ -265,75 +265,54 @@
       <section class="view" data-view="redchief" hidden>
         <header class="view-header">
           <h1>RedChief</h1>
-          <p class="subtitle">Upload every view of one product and generate 4 AI images from the RedChief multi-view pipeline.</p>
+          <p class="subtitle">Test shoe (or any product) photos through the RedChief multi-view pipeline — one row per product, each tracked independently.</p>
         </header>
 
         <section class="panel" id="redchief-config-panel">
           <div id="redchief-config-loading">Loading RedChief configuration…</div>
           <div class="status err" id="redchief-config-error" hidden></div>
           <div id="redchief-config-body" hidden>
-            <div class="plan-head">
-              <div>
-                <h2>📦 Choose a workflow</h2>
-                <p class="hint">Costs <strong id="redchief-credit-cost">–</strong> credits per job, however many views you submit.</p>
+            <h2>📦 Choose a view count</h2>
+            <p class="hint">Costs <strong id="redchief-credit-cost">–</strong> credits per job, however many views you submit.</p>
+            <div class="redchief-workflow-picker" id="redchief-workflow-picker"></div>
+            <div class="confirm-panel" id="redchief-workflow-switch-confirm" hidden>
+              <p id="redchief-workflow-switch-text"></p>
+              <div class="confirm-actions">
+                <button type="button" id="redchief-workflow-switch-cancel-btn" class="btn-secondary">Cancel</button>
+                <button type="button" id="redchief-workflow-switch-confirm-btn" class="btn-danger">Yes, re-label rows</button>
               </div>
-              <label>Views
-                <select id="redchief-workflow-select"></select>
-              </label>
             </div>
           </div>
         </section>
 
-        <section class="panel" id="redchief-upload-panel" hidden>
-          <h2>🖼️ Upload views</h2>
-          <p class="hint">One photo per slot, in order — each slot is matched to a specific view of the item.</p>
+        <section class="panel" id="redchief-bulk-panel" hidden>
+          <h2>🖼️ Add products</h2>
+          <p class="hint">Drop many photos at once (grouped automatically by filename), choose a whole folder of subfolders (one per product), or add a row manually.</p>
           <div class="upload-row">
+            <div class="dropzone" id="redchief-bulk-dropzone" tabindex="0">
+              <input type="file" id="redchief-bulk-input" accept="image/*" multiple hidden />
+              <span class="icon">⬆</span>
+              <span>Drag many photos here, or click to choose — grouped into rows by filename (e.g. shoe-front-1.jpg, shoe-left-2.jpg → one row)</span>
+            </div>
             <div class="dropzone" id="redchief-folder-dropzone" tabindex="0">
               <input type="file" id="redchief-folder-input" webkitdirectory multiple hidden />
               <span class="icon">⬆</span>
-              <span>Drag a whole folder of this item's photos here, or click to choose one — views are matched to slots automatically by filename</span>
+              <span>Or choose a folder of subfolders — one subfolder per product</span>
             </div>
+            <button type="button" class="btn-secondary" id="redchief-add-row-btn">+ Add row</button>
           </div>
-          <div class="redchief-slots" id="redchief-slots"></div>
-          <div class="status" id="redchief-upload-status"></div>
-          <button id="redchief-generate-btn" class="btn-primary" disabled>Generate</button>
-          <div class="confirm-panel" id="redchief-confirm-panel" hidden>
-            <p id="redchief-confirm-text"></p>
-            <div class="confirm-actions">
-              <button type="button" id="redchief-confirm-cancel-btn" class="btn-secondary">Cancel</button>
-              <button type="button" id="redchief-confirm-run-btn" class="btn-danger">Yes, generate</button>
-            </div>
-          </div>
+          <div class="status" id="redchief-bulk-status"></div>
         </section>
 
-        <section class="panel" id="redchief-job-panel" hidden>
-          <h2>⏳ Current job</h2>
-          <div class="run-banner" id="redchief-job-banner"></div>
-          <div class="redchief-result-grid" id="redchief-result-grid" hidden></div>
+        <section class="panel" id="redchief-rows-panel" hidden>
+          <h2>🗂️ Products</h2>
+          <div class="redchief-rows" id="redchief-rows"></div>
         </section>
 
-        <section class="panel">
-          <div class="plan-head">
-            <h2>🗂️ Recent RedChief jobs</h2>
-            <button type="button" class="btn-secondary btn-small" id="redchief-jobs-refresh-btn">Refresh</button>
-          </div>
-          <div class="results-table-wrap">
-            <table class="results-table">
-              <thead>
-                <tr>
-                  <th>Job ID</th>
-                  <th>Status</th>
-                  <th>Credits</th>
-                  <th>Created</th>
-                  <th></th>
-                </tr>
-              </thead>
-              <tbody id="redchief-jobs-tbody">
-                <tr><td colspan="5" class="empty">Loading…</td></tr>
-              </tbody>
-            </table>
-          </div>
-        </section>
+        <div class="redchief-footer-bar" id="redchief-footer-bar" hidden>
+          <span id="redchief-row-count"></span>
+          <button type="button" class="btn-primary" id="redchief-submit-btn" disabled>Create job(s)</button>
+        </div>
       </section>
     </div>
   </div>
