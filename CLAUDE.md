@@ -11,6 +11,14 @@ client to aivastra's public dev API (`https://app.aivastra.com/v1/dev/*`),
 exactly like any external API consumer would be. Every job it creates spends
 **real production credits** on a real merchant account.
 
+The web panel now also has a **RedChief** tab (`webapp/public/redchief.js`,
+`lib/propicly-client.mts`) talking to a **second, separate** dev API — the
+propicly host, under `PROPICLY_API_KEY` — for a different merchant account
+entirely. The aivastra/`DEV_API_KEY` flow and the propicly/`PROPICLY_API_KEY`
+flow must never be conflated (separate configs, separate clients, separate
+credit balances); see `lib/propicly-client.mts`'s header comment for why it's
+a standalone file rather than an extension of `lib/api-client.mts`.
+
 Extracted from `aivastra/scripts/bulk-tryon` on 2026-09-03 with no git history
 of its own (that folder was never committed in the aivastra repo). If you need
 history predating the extraction, it doesn't exist anywhere — the folder was
@@ -83,6 +91,7 @@ necessary and low-cost) and report what actually happened.
 run.mts                  CLI entry point
 lib/
   api-client.mts          thin fetch-based client for aivastra's public dev API
+  propicly-client.mts      thin fetch-based client for propicly's RedChief dev API (separate merchant account)
   batch.mts                shared job-execution core (create → poll → download → record)
   concurrency.mts          hand-rolled semaphore/limiter
   db.mts                   SQLite store — schema, migration, full query surface
@@ -91,6 +100,7 @@ webapp/
   server.mts               web control panel — plain node:http, all routes
   auth.mts                 local login/session/user-CRUD, SQLite-backed
   public/                  static assets (index.html, app.js, style.css, login.*)
+    redchief.js             RedChief tab logic (config, upload slots, job polling, cancel)
 input/                    gitignored — uploaded person/garment photos
 output/                   gitignored — per-run results/ + summary.csv
 data/                     gitignored — bulk-tryon.db (+ -wal/-shm sidecars)

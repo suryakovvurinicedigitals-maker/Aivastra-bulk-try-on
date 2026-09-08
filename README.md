@@ -29,6 +29,8 @@ gitignored — nothing here gets committed by default.
 ```bash
 cp .env.example .env
 # fill in DEV_API_KEY (see .env.example for how to mint one)
+# fill in PROPICLY_API_KEY too if you want the RedChief tab to work — it's a
+# separate merchant account/API, see .env.example
 pnpm install
 ```
 
@@ -112,7 +114,7 @@ Gated by a login (`webapp/auth.mts`) — a bootstrapped super admin (from
 printed once on first run) who can create additional accounts from the Users
 page (admin-only, hidden from regular users).
 
-A local single-page app with two sections:
+A local single-page app with three sections:
 
 - **Upload** — drag-and-drop person/garment photos *or whole folders* (writes
   straight into `input/`, same layout as above; a folder drop is traversed
@@ -125,6 +127,12 @@ A local single-page app with two sections:
 - **Results** — a flat, filterable, paginated table across every run, with a
   QA flag workflow (reason + note, resolve, bundle download as a zip of
   inputs+output+metadata) mirroring aivastra's own `/results` review tool.
+- **RedChief** — a separate tab for the propicly dev API's multi-view
+  pipeline: pick a workflow, upload one photo per view slot, and Generate
+  creates a single job (with its own inline confirm step, like Upload's)
+  against a **different merchant account** than the aivastra flow above. Needs
+  `PROPICLY_API_KEY` set — the tab shows a clear "not configured" message
+  otherwise. See `lib/propicly-client.mts` and `webapp/public/redchief.js`.
 
 It's a plain `node:http` server with no framework — `tsx`/`typescript`/
 `@types/node` are the only npm dependencies anywhere in this project;
