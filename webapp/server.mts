@@ -26,6 +26,15 @@ import { runBatch } from '../lib/batch.mts';
 import { clearFlag, ensureRun, getFlag, getResultRow, listResults, resolveFlag, setFlag } from '../lib/db.mts';
 import { scanInput, type TryonJobSpec } from '../lib/scan-input.mts';
 import {
+  PropiclyApiError,
+  cancelJob as cancelPropiclyJob,
+  createRedchiefJob,
+  getJob as getPropiclyJob,
+  getRedchiefConfig,
+  listJobs as listPropiclyJobs,
+  type PropiclyApiConfig,
+} from '../lib/propicly-client.mts';
+import {
   createSession,
   createUser,
   deleteUser,
@@ -51,6 +60,13 @@ const cfg: DevApiConfig | undefined = API_KEY ? { baseUrl: BASE_URL, apiKey: API
 const CONCURRENCY = Number(process.env.CONCURRENCY ?? 2);
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? 4000);
 const POLL_TIMEOUT_MS = Number(process.env.POLL_TIMEOUT_MS ?? 5 * 60 * 1000);
+
+// RedChief tab (propicly API) — a separate merchant account/host from the
+// aivastra BASE_URL/API_KEY above. Never reuse those here: the two flows are
+// deliberately isolated so one tab's key/env changes can't affect the other.
+const PROPICLY_BASE_URL = (process.env.PROPICLY_API_BASE_URL ?? 'https://app.propicly.com').replace(/\/$/, '');
+const PROPICLY_API_KEY = process.env.PROPICLY_API_KEY;
+const propiclyCfg: PropiclyApiConfig | undefined = PROPICLY_API_KEY ? { baseUrl: PROPICLY_BASE_URL, apiKey: PROPICLY_API_KEY } : undefined;
 
 // Used only if the live dev API can't be reached — keeps the upload UI usable
 // (category dropdown, plan preview) even when DEV_API_KEY isn't set locally.
@@ -268,6 +284,15 @@ function json(res: http.ServerResponse, status: number, body: unknown) {
   const buf = Buffer.from(JSON.stringify(body));
   res.writeHead(status, { 'Content-Type': 'application/json', 'Content-Length': buf.length });
   res.end(buf);
+}
+
+/** Forwards a PropiclyApiError's real status/code/message; anything else becomes a 502 so a network blip to the propicly host never looks like this server's own bug. */
+function propiclyErrorResponse(res: http.ServerResponse, err: unknown) {
+  if (err instanceof PropiclyApiError) {
+    json(res, err.status, { error: { code: err.code, message: err.message } });
+    return;
+  }
+  json(res, 502, { error: { code: 'PROXY_ERROR', message: err instanceof Error ? err.message : String(err) } });
 }
 
 async function readBodyCapped(req: http.IncomingMessage, maxBytes: number): Promise<Buffer> {
@@ -1055,6 +1080,113 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // ---- RedChief (propicly API) — separate tab, separate merchant account ----
+    // Discovery probe, like /api/balance above: never throws past a 200, so
+    // the tab can show a clear "not configured"/"unreachable" state instead
+    // of a broken page when PROPICLY_API_KEY is unset or the host is down.
+    if (req.method === 'GET' && url.pathname === '/api/redchief/config') {
+      if (!propiclyCfg) {
+        json(res, 200, { available: false, error: 'PROPICLY_API_KEY is not set on the server.' });
+        return;
+      }
+      try {
+        const config = await getRedchiefConfig(propiclyCfg);
+        json(res, 200, { available: true, ...config });
+      } catch (err) {
+        json(res, 200, { available: false, error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/redchief') {
+      if (!propiclyCfg) {
+        json(res, 400, { error: { code: 'CONFIG_MISSING', message: 'PROPICLY_API_KEY is not set on the server.' } });
+        return;
+      }
+      let body: Buffer;
+      try {
+        // 6 views * 10MB * ~1.33 base64 inflation, capped comfortably under
+        // the upstream API's own 170MB limit for this endpoint.
+        body = await readBodyCapped(req, 90 * 1024 * 1024);
+      } catch {
+        json(res, 413, { error: { code: 'VALIDATION', message: 'request body too large' } });
+        return;
+      }
+      let parsed: any;
+      try {
+        parsed = JSON.parse(body.toString('utf8'));
+      } catch {
+        json(res, 400, { error: { code: 'VALIDATION', message: 'invalid JSON body' } });
+        return;
+      }
+      const views = parsed?.views;
+      if (!Array.isArray(views) || views.length < 1 || views.length > 6 || !views.every((v: unknown) => typeof v === 'string' && v.length > 0)) {
+        json(res, 400, { error: { code: 'VALIDATION', message: 'views must be an array of 1-6 base64/data-URI image strings' } });
+        return;
+      }
+      try {
+        const result = await createRedchiefJob(propiclyCfg, views);
+        json(res, 202, result);
+      } catch (err) {
+        propiclyErrorResponse(res, err);
+      }
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/redchief/jobs') {
+      if (!propiclyCfg) {
+        json(res, 400, { error: { code: 'CONFIG_MISSING', message: 'PROPICLY_API_KEY is not set on the server.' } });
+        return;
+      }
+      const page = Number(url.searchParams.get('page') ?? 1);
+      const pageSize = Number(url.searchParams.get('pageSize') ?? 25);
+      try {
+        const list = await listPropiclyJobs(propiclyCfg, page, pageSize);
+        json(res, 200, list);
+      } catch (err) {
+        propiclyErrorResponse(res, err);
+      }
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname.startsWith('/api/redchief/jobs/') && url.pathname.endsWith('/cancel')) {
+      if (!propiclyCfg) {
+        json(res, 400, { error: { code: 'CONFIG_MISSING', message: 'PROPICLY_API_KEY is not set on the server.' } });
+        return;
+      }
+      const jobId = decodeURIComponent(url.pathname.slice('/api/redchief/jobs/'.length, -'/cancel'.length));
+      if (!/^[\w-]{1,80}$/.test(jobId)) {
+        json(res, 400, { error: { code: 'VALIDATION', message: 'invalid job id' } });
+        return;
+      }
+      try {
+        const result = await cancelPropiclyJob(propiclyCfg, jobId);
+        json(res, 200, result);
+      } catch (err) {
+        propiclyErrorResponse(res, err);
+      }
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname.startsWith('/api/redchief/jobs/')) {
+      if (!propiclyCfg) {
+        json(res, 400, { error: { code: 'CONFIG_MISSING', message: 'PROPICLY_API_KEY is not set on the server.' } });
+        return;
+      }
+      const jobId = decodeURIComponent(url.pathname.slice('/api/redchief/jobs/'.length));
+      if (!/^[\w-]{1,80}$/.test(jobId)) {
+        json(res, 400, { error: { code: 'VALIDATION', message: 'invalid job id' } });
+        return;
+      }
+      try {
+        const job = await getPropiclyJob(propiclyCfg, jobId);
+        json(res, 200, job);
+      } catch (err) {
+        propiclyErrorResponse(res, err);
+      }
+      return;
+    }
+
     serveStatic(res, url.pathname);
   } catch (err) {
     json(res, 500, { error: err instanceof Error ? err.message : String(err) });
@@ -1068,4 +1200,5 @@ server.listen(PORT, () => {
   console.log(`Input:  ${INPUT_DIR}`);
   console.log(`Output: ${OUTPUT_DIR}`);
   if (!cfg) console.log('  (DEV_API_KEY not set — category list falls back to a hardcoded default, Generate disabled)');
+  if (!propiclyCfg) console.log('  (PROPICLY_API_KEY not set — RedChief tab disabled)');
 });
