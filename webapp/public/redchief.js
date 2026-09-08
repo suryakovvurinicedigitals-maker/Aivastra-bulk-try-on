@@ -190,3 +190,88 @@ function handleRedchiefBulkFiles(files) {
 }
 
 wireDropzone(redchiefBulkDropzoneEl, redchiefBulkInputEl, handleRedchiefBulkFiles, redchiefBulkStatusEl);
+
+// ---------- folder picker: group by subfolder, lenient filename matching ----------
+const redchiefFolderDropzoneEl = document.getElementById('redchief-folder-dropzone');
+const redchiefFolderInputEl = document.getElementById('redchief-folder-input');
+
+function redchiefNormalize(s) {
+  return s.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+// For each label, in order, claim the first not-yet-used file whose
+// normalized stem contains the normalized label or vice versa. A label with
+// no match leaves that slot null IN PLACE — array position is the view
+// identity used by the job-creation payload's order, so slots are never
+// compacted/reindexed.
+function redchiefMatchViewLabels(viewLabels, files) {
+  const used = new Set();
+  return viewLabels.map((label) => {
+    const normLabel = redchiefNormalize(label);
+    const match = files.find((f, i) => {
+      if (used.has(i)) return false;
+      const normStem = redchiefNormalize(f.name.replace(/\.[^.]+$/, ''));
+      return normStem.includes(normLabel) || normLabel.includes(normStem);
+    });
+    if (match) used.add(files.indexOf(match));
+    // `unmatched` (true only when this specific label found no file) is what
+    // Task 4's row-card rendering reads to show the danger-tinted "Missing:
+    // <label>" placeholder instead of a plain empty slot — a slot from a
+    // manually-added row or a bulk-prefix-grouped row is never `unmatched`
+    // (only this folder-matching path sets it), since those paths never
+    // attempted an automatic match in the first place.
+    return { id: redchiefUid('slot'), label, file: match ?? null, previewUrl: null, unmatched: !match };
+  });
+}
+
+function redchiefGroupByFolder(fileList) {
+  const files = filterImageFiles(fileList);
+  const withPaths = files.map((f) => ({ file: f, segments: (f.webkitRelativePath || f.name).split('/') }));
+  const hasSubfolders = withPaths.some((f) => f.segments.length >= 3);
+
+  if (!hasSubfolders) {
+    return [{ label: null, files: withPaths.map((f) => f.file) }];
+  }
+
+  const bySubfolder = new Map(); // subfolder name -> File[]
+  const rootLoose = [];
+  for (const { file, segments } of withPaths) {
+    if (segments.length >= 3) {
+      const subfolder = segments[1];
+      if (!bySubfolder.has(subfolder)) bySubfolder.set(subfolder, []);
+      bySubfolder.get(subfolder).push(file);
+    } else {
+      rootLoose.push(file);
+    }
+  }
+  const groups = [...bySubfolder.entries()].map(([label, files]) => ({ label, files }));
+  if (rootLoose.length > 0) groups.push({ label: 'Unmatched root files', files: rootLoose });
+  return groups;
+}
+
+function createRedchiefRowsFromFolderGroups(groups) {
+  const w = redchiefConfig.workflows[redchiefSelectedWorkflowIndex];
+  for (const group of groups) {
+    redchiefRows.push({
+      id: redchiefUid('row'),
+      label: group.label ?? `Item ${redchiefRowCounter + 1}`,
+      slots: redchiefMatchViewLabels(w.viewLabels, group.files),
+      jobId: null,
+      status: 'idle',
+      resultUrls: null,
+      error: null,
+      pollTimer: null,
+      pollToken: 0,
+    });
+    if (!group.label) redchiefRowCounter++;
+  }
+  renderRedchiefRows();
+}
+
+function handleRedchiefFolderFiles(files) {
+  if (redchiefSelectedWorkflowIndex === null) return;
+  const groups = redchiefGroupByFolder(files);
+  createRedchiefRowsFromFolderGroups(groups);
+}
+
+wireDropzone(redchiefFolderDropzoneEl, redchiefFolderInputEl, handleRedchiefFolderFiles, redchiefBulkStatusEl);
