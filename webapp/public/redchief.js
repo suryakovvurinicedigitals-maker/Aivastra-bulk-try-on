@@ -278,3 +278,47 @@ async function cancelRedchiefJob(jobId) {
     redchiefJobBannerEl.innerHTML += `<div class="status err">${err instanceof Error ? err.message : String(err)}</div>`;
   }
 }
+
+const redchiefJobsTbodyEl = document.getElementById('redchief-jobs-tbody');
+const redchiefJobsRefreshBtn = document.getElementById('redchief-jobs-refresh-btn');
+
+async function loadRedchiefJobs() {
+  redchiefJobsTbodyEl.innerHTML = '<tr><td colspan="5" class="empty">Loading…</td></tr>';
+  try {
+    const res = await fetch('/api/redchief/jobs?page=1&pageSize=25');
+    const body = await res.json();
+    if (!res.ok) throw new Error(`${body.error?.code ?? res.status}: ${body.error?.message ?? 'failed to load jobs'}`);
+    const rows = (body.jobs ?? []).filter((j) => j.kind === 'redchief');
+    redchiefJobsTbodyEl.innerHTML = rows.length
+      ? rows.map(redchiefJobRowHtml).join('')
+      : '<tr><td colspan="5" class="empty">No RedChief jobs yet.</td></tr>';
+    for (const btn of redchiefJobsTbodyEl.querySelectorAll('.redchief-view-btn')) {
+      btn.addEventListener('click', () => startRedchiefJob(btn.dataset.jobid));
+    }
+    for (const btn of redchiefJobsTbodyEl.querySelectorAll('.redchief-cancel-row-btn')) {
+      btn.addEventListener('click', () => cancelRedchiefJob(btn.dataset.jobid).then(loadRedchiefJobs));
+    }
+  } catch (err) {
+    redchiefJobsTbodyEl.innerHTML = `<tr><td colspan="5" class="empty">${err instanceof Error ? err.message : String(err)}</td></tr>`;
+  }
+}
+
+function redchiefJobRowHtml(j) {
+  const cancelBtn =
+    j.status === 'QUEUED'
+      ? `<button type="button" class="btn-danger btn-small redchief-cancel-row-btn" data-jobid="${j.jobId}">Cancel</button>`
+      : '';
+  return `
+    <tr>
+      <td><code>${j.jobId.slice(0, 8)}…</code></td>
+      <td>${j.status}</td>
+      <td>${j.creditsCharged}</td>
+      <td>${new Date(j.createdAt).toLocaleString()}</td>
+      <td>
+        <button type="button" class="btn-secondary btn-small redchief-view-btn" data-jobid="${j.jobId}">View result</button>
+        ${cancelBtn}
+      </td>
+    </tr>`;
+}
+
+redchiefJobsRefreshBtn.addEventListener('click', loadRedchiefJobs);
