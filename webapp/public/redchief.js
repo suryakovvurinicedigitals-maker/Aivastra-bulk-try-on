@@ -134,21 +134,26 @@ function renderRedchiefRows() {
 const redchiefBulkDropzoneEl = document.getElementById('redchief-bulk-dropzone');
 const redchiefBulkInputEl = document.getElementById('redchief-bulk-input');
 
-const REDCHIEF_SUFFIX_RE = /^(.+?)[-_](?:view)?(\d+)$/i;
-
 function redchiefGroupByPrefix(files) {
   const groups = new Map(); // prefix -> [{file, order}]
   for (const file of files) {
     const stem = file.name.replace(/\.[^.]+$/, '');
-    const m = stem.match(REDCHIEF_SUFFIX_RE);
-    if (m) {
-      const key = m[1].toLowerCase();
-      const order = Number(m[2]);
-      if (!groups.has(key)) groups.set(key, []);
-      groups.get(key).push({ file, order });
+    const sepIndex = stem.search(/[-_]/);
+    const hasTrailingNumber = /\d+$/.test(stem);
+    if (sepIndex > 0 && hasTrailingNumber) {
+      // Everything before the FIRST separator is the group key — e.g.
+      // "shoe-front-1"/"shoe-left-2"/"shoe-sole-3" all key "shoe"; the
+      // trailing number anywhere in the remainder decides sort order.
+      const prefix = stem.slice(0, sepIndex).toLowerCase();
+      const rest = stem.slice(sepIndex + 1);
+      const numMatch = rest.match(/(\d+)$/);
+      const order = numMatch ? Number(numMatch[1]) : 0;
+      if (!groups.has(prefix)) groups.set(prefix, []);
+      groups.get(prefix).push({ file, order });
     } else {
-      // No trailing number — its own singleton group, keyed uniquely so it
-      // never accidentally merges with another unsuffixed file of the same name.
+      // No separator, or no trailing digit at all — its own singleton
+      // group, keyed uniquely so it never accidentally merges with another
+      // such file of the same stem.
       groups.set(`${stem}-${redchiefUid('singleton')}`, [{ file, order: 0 }]);
     }
   }
