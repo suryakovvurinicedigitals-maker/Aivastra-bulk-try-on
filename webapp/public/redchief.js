@@ -200,11 +200,31 @@ function redchiefRowCardHtml(row) {
     </div>`;
 }
 
-// Placeholder — Task 5 replaces this with real status-badge/result/cancel/
-// retry markup. Kept as a safe no-op (renders nothing while row is idle) so
-// Task 4 is independently verifiable before Task 5 lands.
+const REDCHIEF_STATUS_LABEL = { QUEUED: 'Queued', RUNNING: 'Running', COMPLETED: 'Completed', FAILED: 'Failed', submitting: 'Submitting…' };
+const REDCHIEF_STATUS_CLASS = { QUEUED: 'warn', RUNNING: 'accent', COMPLETED: 'ok', FAILED: 'err', submitting: 'muted' };
+
 function redchiefRowStatusHtml(row) {
-  return row.status === 'idle' ? '' : `<div class="redchief-row-status">${row.status}</div>`;
+  if (row.status === 'idle') return '';
+  const cls = REDCHIEF_STATUS_CLASS[row.status] ?? 'muted';
+  const label = REDCHIEF_STATUS_LABEL[row.status] ?? row.status;
+  let body = `<span class="redchief-status-badge ${cls}">${label}</span>`;
+
+  if (row.status === 'QUEUED') {
+    body += ` <button type="button" class="link-btn danger redchief-row-cancel-btn">Cancel</button>`;
+  }
+  if (row.cancelNote) {
+    body += ` <span class="redchief-cancel-note">${row.cancelNote}</span>`;
+  }
+  if (row.status === 'FAILED') {
+    body += ` <span class="redchief-error-code">${row.error ?? 'unknown error'}</span>`;
+    body += ` <button type="button" class="btn-secondary btn-small redchief-row-retry-btn">Retry</button>`;
+  }
+  if (row.status === 'COMPLETED' && row.resultUrls) {
+    body += `<div class="redchief-result-grid">${row.resultUrls
+      .map((url) => `<div class="redchief-result-cell"><img src="${url}" data-row="${row.id}" /><a href="${url}" target="_blank" rel="noopener" class="link-btn">Open</a></div>`)
+      .join('')}</div>`;
+  }
+  return `<div class="redchief-row-status">${body}</div>`;
 }
 
 function renderRedchiefRows() {
@@ -256,6 +276,15 @@ function wireRedchiefRowEvents() {
         if (file) setRedchiefRowSlotFile(rowId, slotId, file);
         input.value = '';
       });
+    }
+
+    const cancelBtn = card.querySelector('.redchief-row-cancel-btn');
+    if (cancelBtn) cancelBtn.addEventListener('click', () => cancelRedchiefRow(rowId));
+    const retryBtn = card.querySelector('.redchief-row-retry-btn');
+    if (retryBtn) retryBtn.addEventListener('click', () => retryRedchiefRow(rowId));
+
+    for (const img of card.querySelectorAll('.redchief-result-cell img')) {
+      img.addEventListener('error', () => refreshRedchiefRowResult(img.dataset.row));
     }
   }
 }
@@ -436,6 +465,98 @@ function handleRedchiefFolderFiles(files) {
   if (redchiefSelectedWorkflowIndex === null) return;
   const groups = redchiefGroupByFolder(files);
   createRedchiefRowsFromFolderGroups(groups);
+}
+
+// ---------- submission and per-row polling ----------
+function redchiefFileToDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
+}
+
+redchiefSubmitBtn.addEventListener('click', submitRedchiefRows);
+
+function submitRedchiefRows() {
+  const submittable = redchiefRows.filter((r) => r.status === 'idle' && redchiefRowUnfilledCount(r) === 0);
+  if (submittable.length === 0) return;
+  for (const row of submittable) row.status = 'submitting';
+  renderRedchiefRows();
+  Promise.allSettled(submittable.map(submitRedchiefRow));
+}
+
+async function submitRedchiefRow(row) {
+  try {
+    const views = await Promise.all(row.slots.map((s) => redchiefFileToDataUrl(s.file)));
+    const res = await fetch('/api/redchief', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ views }),
+    });
+    const body = await res.json();
+    if (!res.ok) throw new Error(`${body.error?.code ?? res.status}: ${body.error?.message ?? 'request failed'}`);
+    row.jobId = body.jobId;
+    row.status = 'QUEUED';
+    row.error = null;
+    pollRedchiefRow(row);
+  } catch (err) {
+    row.status = 'FAILED';
+    row.error = err instanceof Error ? err.message : String(err);
+  }
+  renderRedchiefRows();
+}
+
+function pollRedchiefRow(row, attempt = 0, delay = 2000) {
+  const maxAttempts = 20;
+  const maxDelay = 20000;
+  const token = row.pollToken;
+
+  fetch(`/api/redchief/jobs/${row.jobId}`)
+    .then((res) => res.json().then((body) => ({ ok: res.ok, body })))
+    .then(({ ok, body }) => {
+      if (token !== row.pollToken) return; // superseded by a cancel/retry — discard
+      if (!ok) throw new Error(`${body.error?.code ?? 'ERROR'}: ${body.error?.message ?? 'poll failed'}`);
+
+      if (body.status === 'COMPLETED') {
+        row.status = 'COMPLETED';
+        row.resultUrls = body.imageUrls ?? (body.imageUrl ? [body.imageUrl] : []);
+        renderRedchiefRows();
+        return;
+      }
+      if (body.status === 'FAILED') {
+        row.status = 'FAILED';
+        row.error = body.error ?? 'unknown error';
+        renderRedchiefRows();
+        return;
+      }
+      row.status = body.status; // QUEUED or RUNNING
+      renderRedchiefRows();
+      if (attempt >= maxAttempts) return; // give up quietly — row stays QUEUED/RUNNING, tester can check back
+      row.pollTimer = setTimeout(() => pollRedchiefRow(row, attempt + 1, Math.min(delay * 1.5, maxDelay)), delay);
+    })
+    .catch((err) => {
+      if (token !== row.pollToken) return;
+      row.status = 'FAILED';
+      row.error = err instanceof Error ? err.message : String(err);
+      renderRedchiefRows();
+    });
+}
+
+async function refreshRedchiefRowResult(rowId) {
+  const row = redchiefFindRow(rowId);
+  if (!row || row.status !== 'COMPLETED') return;
+  try {
+    const res = await fetch(`/api/redchief/jobs/${row.jobId}`);
+    const body = await res.json();
+    if (res.ok && body.status === 'COMPLETED') {
+      row.resultUrls = body.imageUrls ?? (body.imageUrl ? [body.imageUrl] : []);
+      renderRedchiefRows();
+    }
+  } catch {
+    // best-effort — leave the broken thumbnail if this also fails
+  }
 }
 
 wireDropzone(redchiefFolderDropzoneEl, redchiefFolderInputEl, handleRedchiefFolderFiles, redchiefBulkStatusEl);
