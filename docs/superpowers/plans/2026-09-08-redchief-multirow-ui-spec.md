@@ -99,12 +99,53 @@ page-level toast.
 
 ## Filename-prefix grouping (bulk dropzone)
 
-Strip a trailing `-N`/`_N`/`-viewN`/`_viewN` suffix (case-insensitive) from the filename stem
-(extension removed first) via `/^(.+?)[-_](?:view)?(\d+)$/i`. Files sharing the same stripped
-prefix become one row, sorted by the captured trailing number before filling slots in order.
-A file with no match for that regex (no trailing number) becomes its own singleton row. Cap
-each group at the chosen workflow's `inputCount` — extra files beyond that are dropped from the
-group (not silently placed in a new row, not merged into another group).
+**Ruling (controller, during Task 2 implementation):** the user's originally-pasted regex
+(`/^(.+?)[-_](?:view)?(\d+)$/i`, applied to the whole stem) does not produce the grouping the
+user's own worked example claims. Verified independently: against `shoe-front-1.jpg`,
+`shoe-left-2.jpg`, `shoe-sole-3.jpg`, that regex's lazy `.+?` only strips the *last*
+hyphen-digit segment, yielding three different prefixes (`shoe-front`, `shoe-left`,
+`shoe-sole`) — not one shared `shoe` group as the prose explicitly states these three files
+should produce. The Task 2 implementer caught this via their own manual trace, correctly did
+not deviate on their own initiative, and flagged it as `DONE_WITH_CONCERNS`.
+
+**Corrected algorithm** (split on the *first* separator instead of matching a suffix pattern —
+verified to reproduce the user's exact stated example outcome):
+
+```js
+function redchiefGroupByPrefix(files) {
+  const groups = new Map(); // prefix -> [{file, order}]
+  for (const file of files) {
+    const stem = file.name.replace(/\.[^.]+$/, '');
+    const sepIndex = stem.search(/[-_]/);
+    const hasTrailingNumber = /\d+$/.test(stem);
+    if (sepIndex > 0 && hasTrailingNumber) {
+      const prefix = stem.slice(0, sepIndex).toLowerCase();
+      const rest = stem.slice(sepIndex + 1);
+      const numMatch = rest.match(/(\d+)$/);
+      const order = numMatch ? Number(numMatch[1]) : 0;
+      if (!groups.has(prefix)) groups.set(prefix, []);
+      groups.get(prefix).push({ file, order });
+    } else {
+      // No separator, or no trailing number at all — its own singleton
+      // group, keyed uniquely so it never accidentally merges with another
+      // such file of the same stem.
+      groups.set(`${stem}-${redchiefUid('singleton')}`, [{ file, order: 0 }]);
+    }
+  }
+  return [...groups.values()].map((entries) => entries.sort((a, b) => a.order - b.order).map((e) => e.file));
+}
+```
+
+Everything before the first `-`/`_` becomes the group key (case-insensitive); the trailing
+number anywhere in the remainder decides sort order within the group. `shoe-front-1.jpg` /
+`shoe-left-2.jpg` / `shoe-sole-3.jpg` → all key `shoe`, sorted 1/2/3. `redchief-4.jpg` (no
+other file shares its prefix `redchief`) → its own singleton row, matching the spec's stated
+"no shared prefix becomes its own singleton row" outcome without special-casing it. A file
+with no separator or no trailing digit (e.g. `random.jpg`) also becomes its own singleton via
+the `else` branch. Files sharing a prefix are sorted by the captured trailing number before
+filling slots in order. Cap each group at the chosen workflow's `inputCount` — extra files
+beyond that are dropped from the group (not silently placed in a new row, not merged into
+another group).
 
 ## Folder-picker grouping
 

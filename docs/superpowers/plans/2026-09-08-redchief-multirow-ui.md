@@ -263,26 +263,39 @@ git commit -m "feat: RedChief multi-row UI — markup shell, config load, workfl
 
 - [ ] **Step 1: Append the prefix-grouping logic**
 
+**Ruling (controller, superseding the plan's originally-drafted regex — see the spec doc's
+"Filename-prefix grouping" section for the full trace):** the originally-specified
+`/^(.+?)[-_](?:view)?(\d+)$/i` does not reproduce the worked example's own stated outcome
+(verified independently: it splits `shoe-front-1`/`shoe-left-2`/`shoe-sole-3` into three
+different prefixes — `shoe-front`/`shoe-left`/`shoe-sole` — not one shared `shoe` group). Use
+this corrected, verified algorithm instead — split on the *first* separator rather than
+pattern-matching a suffix:
+
 ```js
 // ---------- bulk dropzone: group flat files by filename prefix ----------
 const redchiefBulkDropzoneEl = document.getElementById('redchief-bulk-dropzone');
 const redchiefBulkInputEl = document.getElementById('redchief-bulk-input');
 
-const REDCHIEF_SUFFIX_RE = /^(.+?)[-_](?:view)?(\d+)$/i;
-
 function redchiefGroupByPrefix(files) {
   const groups = new Map(); // prefix -> [{file, order}]
   for (const file of files) {
     const stem = file.name.replace(/\.[^.]+$/, '');
-    const m = stem.match(REDCHIEF_SUFFIX_RE);
-    if (m) {
-      const key = m[1].toLowerCase();
-      const order = Number(m[2]);
-      if (!groups.has(key)) groups.set(key, []);
-      groups.get(key).push({ file, order });
+    const sepIndex = stem.search(/[-_]/);
+    const hasTrailingNumber = /\d+$/.test(stem);
+    if (sepIndex > 0 && hasTrailingNumber) {
+      // Everything before the FIRST separator is the group key — e.g.
+      // "shoe-front-1"/"shoe-left-2"/"shoe-sole-3" all key "shoe"; the
+      // trailing number anywhere in the remainder decides sort order.
+      const prefix = stem.slice(0, sepIndex).toLowerCase();
+      const rest = stem.slice(sepIndex + 1);
+      const numMatch = rest.match(/(\d+)$/);
+      const order = numMatch ? Number(numMatch[1]) : 0;
+      if (!groups.has(prefix)) groups.set(prefix, []);
+      groups.get(prefix).push({ file, order });
     } else {
-      // No trailing number — its own singleton group, keyed uniquely so it
-      // never accidentally merges with another unsuffixed file of the same name.
+      // No separator, or no trailing digit at all — its own singleton
+      // group, keyed uniquely so it never accidentally merges with another
+      // such file of the same stem.
       groups.set(`${stem}-${redchiefUid('singleton')}`, [{ file, order: 0 }]);
     }
   }
@@ -325,7 +338,7 @@ Note: `redchiefBulkStatusEl` (already added to the markup in Task 1's Step 1 —
 
 - [ ] **Step 2: Verify**
 
-`node --check webapp/public/redchief.js`. Manually trace `redchiefGroupByPrefix` against the spec's own example: filenames `shoe-front-1.jpg`, `shoe-left-2.jpg`, `shoe-sole-3.jpg` (all match the regex with prefix `shoe`, orders 1/2/3) plus `redchief-4.jpg` (matches regex too — prefix `redchief`, order 4 — this is INTENTIONALLY still grouped by prefix if it matches the pattern; the spec's own wording "a b redchief-4.jpg with no shared prefix becomes its own singleton row" describes a file whose prefix doesn't match any OTHER file's prefix, which naturally produces a singleton group of one — confirm your trace produces 2 groups: `["shoe-front-1.jpg","shoe-left-2.jpg","shoe-sole-3.jpg"]` sorted by order, and `["redchief-4.jpg"]` alone). Also trace a filename with no trailing number at all (e.g. `random.jpg`) and confirm it becomes its own singleton group via the `else` branch.
+`node --check webapp/public/redchief.js`. Manually trace `redchiefGroupByPrefix` against the corrected example above: filenames `shoe-front-1.jpg`, `shoe-left-2.jpg`, `shoe-sole-3.jpg` (all key `shoe` — first-separator-split — sorted by order 1/2/3 into ONE group) plus `redchief-4.jpg` (keys `redchief` — no other file shares that prefix, so it naturally lands in its own singleton group of one) plus `random.jpg` (no separator at all, so `sepIndex <= 0` — falls to the `else` branch, its own uniquely-keyed singleton). Confirm your trace produces exactly 3 groups total: `["shoe-front-1.jpg","shoe-left-2.jpg","shoe-sole-3.jpg"]`, `["redchief-4.jpg"]`, `["random.jpg"]`.
 
 - [ ] **Step 3: Commit**
 
