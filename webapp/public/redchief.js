@@ -121,13 +121,177 @@ function applyRedchiefWorkflowSelection(index) {
   renderRedchiefRows();
 }
 
-// Forward declaration — Task 4 provides the real implementation (row-card
-// rendering). Defined here as a safe no-op so Tasks 1-3 are independently
-// runnable/verifiable without a ReferenceError.
+// ---------- add-row button ----------
+const redchiefAddRowBtn = document.getElementById('redchief-add-row-btn');
+redchiefAddRowBtn.addEventListener('click', () => {
+  if (redchiefSelectedWorkflowIndex === null) return; // button is only enabled once a workflow is chosen (see render below)
+  const w = redchiefConfig.workflows[redchiefSelectedWorkflowIndex];
+  redchiefRows.push({
+    id: redchiefUid('row'),
+    label: `Item ${++redchiefRowCounter}`,
+    slots: w.viewLabels.map((label) => ({ id: redchiefUid('slot'), label, file: null, previewUrl: null })),
+    jobId: null,
+    status: 'idle',
+    resultUrls: null,
+    error: null,
+    pollTimer: null,
+    pollToken: 0,
+  });
+  renderRedchiefRows();
+});
+
+const REDCHIEF_ACCEPTED_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
+const REDCHIEF_MAX_MB = 10;
+
+function redchiefFindRow(rowId) {
+  return redchiefRows.find((r) => r.id === rowId);
+}
+
+function redchiefRowUnfilledCount(row) {
+  return row.slots.filter((s) => !s.file).length;
+}
+
+function redchiefRowSlotHtml(row, slot) {
+  const previewSrc = slot.previewUrl ?? '';
+  if (slot.file) {
+    return `
+      <div class="redchief-slot" data-row="${row.id}" data-slot="${slot.id}">
+        <div class="redchief-slot-label">${slot.label}</div>
+        <div class="dropzone redchief-dropzone redchief-slot-filled">
+          <img class="redchief-slot-preview" src="${previewSrc}" />
+          <button type="button" class="redchief-slot-clear" title="Clear">×</button>
+        </div>
+      </div>`;
+  }
+  // slot.unmatched (set only by folder-grouping when a label had no lenient
+  // match) renders a visibly different, danger-tinted placeholder per spec —
+  // still clickable to fill that exact slot in place. Base `.dropzone` class
+  // is required here (not just `.redchief-dropzone`) — that's what actually
+  // supplies the dashed border/cursor/hover styling; `.redchief-dropzone`
+  // alone only carries the size/layout tweaks, exactly like the single-row
+  // UI's own per-slot dropzones always paired the two classes together.
+  const cls = slot.unmatched
+    ? 'dropzone redchief-dropzone redchief-slot-empty redchief-slot-unmatched'
+    : 'dropzone redchief-dropzone redchief-slot-empty';
+  return `
+    <div class="redchief-slot" data-row="${row.id}" data-slot="${slot.id}">
+      <div class="redchief-slot-label">${slot.label}</div>
+      <div class="${cls}" tabindex="0">
+        <input type="file" class="redchief-slot-input" accept="image/*" hidden />
+        <span class="icon">⬆</span>
+        <span>${slot.unmatched ? `Missing: ${slot.label}` : 'Choose image'}</span>
+      </div>
+    </div>`;
+}
+
+function redchiefRowCardHtml(row) {
+  const unfilled = redchiefRowUnfilledCount(row);
+  const invalid = unfilled > 0;
+  return `
+    <div class="redchief-row-card${invalid ? ' invalid' : ''}" data-row="${row.id}">
+      <div class="redchief-row-header">
+        <span class="redchief-row-index">Row</span>
+        <input type="text" class="redchief-row-label-input" value="${row.label}" />
+        <button type="button" class="link-btn danger redchief-row-remove-btn" title="Remove row">×</button>
+      </div>
+      <div class="redchief-row-slots">${row.slots.map((s) => redchiefRowSlotHtml(row, s)).join('')}</div>
+      ${invalid ? `<p class="redchief-validation-msg">${unfilled} view(s) still need an image — click the dashed slot(s) above to fill them in</p>` : ''}
+      ${redchiefRowStatusHtml(row)}
+    </div>`;
+}
+
+// Placeholder — Task 5 replaces this with real status-badge/result/cancel/
+// retry markup. Kept as a safe no-op (renders nothing while row is idle) so
+// Task 4 is independently verifiable before Task 5 lands.
+function redchiefRowStatusHtml(row) {
+  return row.status === 'idle' ? '' : `<div class="redchief-row-status">${row.status}</div>`;
+}
+
 function renderRedchiefRows() {
+  redchiefRowsEl.innerHTML = redchiefRows.map(redchiefRowCardHtml).join('');
+  wireRedchiefRowEvents();
+  redchiefAddRowBtn.disabled = redchiefSelectedWorkflowIndex === null;
+  redchiefAddRowBtn.title = redchiefSelectedWorkflowIndex === null ? 'Choose a view count above first' : '';
   redchiefRowsPanelEl.hidden = redchiefRows.length === 0;
   redchiefFooterBarEl.hidden = redchiefRows.length === 0;
   if (redchiefRows.length > 0) redchiefRowCountEl.textContent = `${redchiefRows.length} row${redchiefRows.length === 1 ? '' : 's'}`;
+  updateRedchiefSubmitEnabled();
+}
+
+function wireRedchiefRowEvents() {
+  for (const card of redchiefRowsEl.querySelectorAll('.redchief-row-card')) {
+    const rowId = card.dataset.row;
+    card.querySelector('.redchief-row-label-input').addEventListener('change', (e) => {
+      const row = redchiefFindRow(rowId);
+      const value = e.target.value.trim();
+      row.label = value || row.label; // never blank — revert if cleared
+      e.target.value = row.label;
+    });
+    card.querySelector('.redchief-row-remove-btn').addEventListener('click', () => removeRedchiefRow(rowId));
+
+    for (const slotEl of card.querySelectorAll('.redchief-slot')) {
+      const slotId = slotEl.dataset.slot;
+      const dz = slotEl.querySelector('.redchief-dropzone');
+      const clearBtn = slotEl.querySelector('.redchief-slot-clear');
+      if (clearBtn) {
+        clearBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          clearRedchiefRowSlotFile(rowId, slotId);
+        });
+        continue; // filled slots don't need click-to-browse wiring
+      }
+      const input = slotEl.querySelector('.redchief-slot-input');
+      dz.addEventListener('click', () => input.click());
+      dz.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') input.click();
+      });
+      dz.addEventListener('dragover', (e) => e.preventDefault());
+      dz.addEventListener('drop', (e) => {
+        e.preventDefault();
+        const file = e.dataTransfer.files[0];
+        if (file) setRedchiefRowSlotFile(rowId, slotId, file);
+      });
+      input.addEventListener('change', () => {
+        const file = input.files[0];
+        if (file) setRedchiefRowSlotFile(rowId, slotId, file);
+        input.value = '';
+      });
+    }
+  }
+}
+
+function setRedchiefRowSlotFile(rowId, slotId, file) {
+  const row = redchiefFindRow(rowId);
+  const slot = row.slots.find((s) => s.id === slotId);
+  if (!REDCHIEF_ACCEPTED_TYPES.has(file.type) || file.size > REDCHIEF_MAX_MB * 1024 * 1024) {
+    // Warn-only, matching the single-row UI's earlier established rule —
+    // the server is the final authority on type/size, this is informational.
+    console.warn(`${file.name}: outside the usual JPEG/PNG/WebP, ${REDCHIEF_MAX_MB}MB guideline — the server may reject this.`);
+  }
+  slot.file = file;
+  slot.unmatched = false;
+  slot.previewUrl = URL.createObjectURL(file);
+  renderRedchiefRows();
+}
+
+function clearRedchiefRowSlotFile(rowId, slotId) {
+  const row = redchiefFindRow(rowId);
+  const slot = row.slots.find((s) => s.id === slotId);
+  slot.file = null;
+  slot.previewUrl = null;
+  renderRedchiefRows();
+}
+
+function removeRedchiefRow(rowId) {
+  const row = redchiefFindRow(rowId);
+  if (row && row.pollTimer) clearTimeout(row.pollTimer);
+  redchiefRows = redchiefRows.filter((r) => r.id !== rowId);
+  renderRedchiefRows();
+}
+
+function updateRedchiefSubmitEnabled() {
+  const anySubmittable = redchiefRows.some((r) => r.status === 'idle' && redchiefRowUnfilledCount(r) === 0);
+  redchiefSubmitBtn.disabled = redchiefSelectedWorkflowIndex === null || redchiefRows.length === 0 || !anySubmittable;
 }
 
 // ---------- bulk dropzone: group flat files by filename prefix ----------
