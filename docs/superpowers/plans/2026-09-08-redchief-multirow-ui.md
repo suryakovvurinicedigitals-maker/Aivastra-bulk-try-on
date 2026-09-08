@@ -923,13 +923,15 @@ In the `@media (prefers-color-scheme: dark)` block, right after `--err: #ff6b6b;
 
 - [ ] **Step 2: Remove dead single-row-only rules**
 
-Delete these three existing rules entirely:
+**Ruling (controller, found during Task 7 implementation — a real gap in this plan's original 3-item deletion list):** a fourth existing rule, `.redchief-slot-preview` (the single-row-era version: `height: 120px`, includes a `border`), was missed from the original deletion list. Step 3 below adds a NEW `.redchief-slot-preview` rule (`height: 100px`, no border) for the multi-row card design — without deleting the old one first, the file ends up with the same selector defined twice. Cascade order means the new sizing wins for `height`, but the old rule's `border: 1px solid var(--border)` is never overridden (CSS doesn't merge same-property declarations across duplicate selectors the way JS object spread would — the old rule's `border` simply isn't touched by the new rule since the new rule doesn't set `border` at all), so every slot thumbnail would get an unintended border. Delete FOUR rules, not three:
+
 ```css
 .redchief-slots { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 16px; margin-top: 10px; }
 .redchief-slot { display: flex; flex-direction: column; gap: 8px; align-items: center; }
 .redchief-slot-label { font-size: 0.82rem; font-weight: 650; color: var(--muted); }
+.redchief-slot-preview { width: 100%; height: 120px; object-fit: cover; border-radius: 10px; border: 1px solid var(--border); }
 ```
-`.redchief-slots` (plural, the old grid container) has no replacement — the new row-level grid container is a differently-named class (`.redchief-row-slots`, added in Step 3). `.redchief-slot` and `.redchief-slot-label` (singular) ARE reused by the new per-row markup, but with different rule bodies (no `align-items: center`, different gap) — Step 3 below adds complete replacement rules for both under the same selector names, so deleting the old bodies here (rather than leaving them to be silently shadowed by cascade order) avoids two conflicting definitions for the same selector sitting in the file at once. Confirm via grep that no other markup depends on the exact old rule body before deleting (it shouldn't — this class is RedChief-only).
+`.redchief-slots` (plural, the old grid container) has no replacement — the new row-level grid container is a differently-named class (`.redchief-row-slots`, added in Step 3). `.redchief-slot`, `.redchief-slot-label`, and `.redchief-slot-preview` ARE reused by the new per-row markup, but each with a different rule body — Step 3 below adds complete replacement rules for all three under the same selector names, so deleting the old bodies here (rather than leaving them to be silently shadowed/partially-merged by cascade order) avoids conflicting/overlapping definitions for the same selector sitting in the file at once. Confirm via grep that no other markup depends on the exact old rule body before deleting (it shouldn't — these classes are RedChief-only).
 
 - [ ] **Step 3: Add the new rules**
 
