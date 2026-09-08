@@ -118,6 +118,7 @@ function setView(name) {
   if (target === 'results') loadResults(false);
   else stopResultsPolling();
   if (target === 'users') loadUsers();
+  if (target === 'redchief') window.enterRedchiefView?.();
 }
 window.addEventListener('hashchange', () => setView(location.hash.slice(1)));
 

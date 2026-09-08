@@ -20,6 +20,7 @@
       <nav class="nav">
         <a href="#upload" class="nav-link" data-view="upload"><span class="nav-icon">⬆</span>Upload</a>
         <a href="#results" class="nav-link" data-view="results"><span class="nav-icon">📁</span>Results</a>
+        <a href="#redchief" class="nav-link" data-view="redchief"><span class="nav-icon">📦</span>RedChief</a>
         <a href="#users" class="nav-link" data-view="users" id="nav-users-link" hidden><span class="nav-icon">👥</span>Users</a>
       </nav>
 
@@ -259,6 +260,67 @@
           </div>
         </section>
       </section>
+
+      <!-- ============ REDCHIEF VIEW ============ -->
+      <section class="view" data-view="redchief" hidden>
+        <header class="view-header">
+          <h1>RedChief</h1>
+          <p class="subtitle">Upload every view of one product and generate 4 AI images from the RedChief multi-view pipeline.</p>
+        </header>
+
+        <section class="panel" id="redchief-config-panel">
+          <div id="redchief-config-loading">Loading RedChief configuration…</div>
+          <div class="status err" id="redchief-config-error" hidden></div>
+          <div id="redchief-config-body" hidden>
+            <div class="plan-head">
+              <div>
+                <h2>📦 Choose a workflow</h2>
+                <p class="hint">Costs <strong id="redchief-credit-cost">–</strong> credits per job, however many views you submit.</p>
+              </div>
+              <label>Views
+                <select id="redchief-workflow-select"></select>
+              </label>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel" id="redchief-upload-panel" hidden>
+          <h2>🖼️ Upload views</h2>
+          <p class="hint">One photo per slot, in order — each slot is matched to a specific view of the item.</p>
+          <div class="redchief-slots" id="redchief-slots"></div>
+          <div class="status" id="redchief-upload-status"></div>
+          <button id="redchief-generate-btn" class="btn-primary" disabled>Generate</button>
+        </section>
+
+        <section class="panel" id="redchief-job-panel" hidden>
+          <h2>⏳ Current job</h2>
+          <div class="run-banner" id="redchief-job-banner"></div>
+          <div class="redchief-result-grid" id="redchief-result-grid" hidden></div>
+        </section>
+
+        <section class="panel">
+          <div class="plan-head">
+            <h2>🗂️ Recent RedChief jobs</h2>
+            <button type="button" class="btn-secondary btn-small" id="redchief-jobs-refresh-btn">Refresh</button>
+          </div>
+          <div class="results-table-wrap">
+            <table class="results-table">
+              <thead>
+                <tr>
+                  <th>Job ID</th>
+                  <th>Status</th>
+                  <th>Credits</th>
+                  <th>Created</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="redchief-jobs-tbody">
+                <tr><td colspan="5" class="empty">Loading…</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </section>
     </div>
   </div>
 
@@ -290,5 +352,6 @@
   </div>
 
   <script src="/app.js"></script>
+  <script src="/redchief.js"></script>
 </body>
 </html>
