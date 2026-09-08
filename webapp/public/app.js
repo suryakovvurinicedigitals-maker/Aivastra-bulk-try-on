@@ -500,7 +500,15 @@ async function collectFilesFromEntry(entry, out, skipped) {
   if (entry.isFile) {
     try {
       const file = await fileFromEntry(entry);
-      if (isImageFile(file)) out.push(file);
+      if (isImageFile(file)) {
+        // Stash the FileSystemEntry's full path — unlike a directory <input>'s
+        // File objects, a drag-and-dropped file carries no webkitRelativePath
+        // at all — so folder-aware consumers (e.g. the RedChief tab's
+        // group-by-subfolder logic) can recover directory structure from a
+        // drop the same way they already can from the click-to-pick path.
+        file.relPath = (entry.fullPath || '').replace(/^\//, '');
+        out.push(file);
+      }
     } catch (err) {
       skipped.push({ name: entry.fullPath || entry.name, error: err });
       console.error('Could not read file from dropped folder', entry.fullPath || entry.name, err);
