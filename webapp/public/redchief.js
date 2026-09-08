@@ -11,6 +11,10 @@ const redchiefGenerateBtn = document.getElementById('redchief-generate-btn');
 const redchiefJobPanelEl = document.getElementById('redchief-job-panel');
 const redchiefJobBannerEl = document.getElementById('redchief-job-banner');
 const redchiefResultGridEl = document.getElementById('redchief-result-grid');
+const redchiefConfirmPanelEl = document.getElementById('redchief-confirm-panel');
+const redchiefConfirmTextEl = document.getElementById('redchief-confirm-text');
+const redchiefConfirmCancelBtn = document.getElementById('redchief-confirm-cancel-btn');
+const redchiefConfirmRunBtn = document.getElementById('redchief-confirm-run-btn');
 
 let redchiefWorkflows = [];
 let redchiefCreditCost = 0;
@@ -22,9 +26,7 @@ const REDCHIEF_ACCEPTED_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp'
 
 window.enterRedchiefView = async function enterRedchiefView() {
   if (!redchiefLoaded) await loadRedchiefConfig();
-  // loadRedchiefJobs is added in Task 6; guard so this file runs standalone
-  // (same forward-reference shape as startRedchiefJob below) until it lands.
-  if (typeof loadRedchiefJobs === 'function') loadRedchiefJobs();
+  loadRedchiefJobs();
 };
 
 async function loadRedchiefConfig() {
@@ -68,7 +70,12 @@ redchiefWorkflowSelectEl.addEventListener('change', renderRedchiefSlots);
 function renderRedchiefSlots() {
   const workflow = redchiefWorkflows[Number(redchiefWorkflowSelectEl.value)];
   if (!workflow) return;
-  redchiefSlotFiles = new Array(workflow.inputCount).fill(null);
+  // Slots are rendered from viewLabels below, so viewLabels.length — not the
+  // separately-reported inputCount — is the single source of truth for slot
+  // count; if the two ever disagreed, sizing off inputCount would misalign
+  // slot indices against redchiefSlotFiles (finding #6).
+  redchiefSlotFiles = new Array(workflow.viewLabels.length).fill(null);
+  redchiefConfirmPanelEl.hidden = true;
   redchiefSlotsEl.innerHTML = workflow.viewLabels
     .map(
       (label, i) => `
@@ -127,6 +134,10 @@ function setRedchiefSlotFile(slot, file) {
   preview.src = URL.createObjectURL(file);
   preview.hidden = false;
   clearBtn.hidden = false;
+  // Slots changed after a confirm was already showing (e.g. tester swaps a
+  // photo mid-confirm) — force a fresh Generate click rather than let a stale
+  // confirm submit against the new file set.
+  redchiefConfirmPanelEl.hidden = true;
   updateRedchiefGenerateEnabled();
 }
 
@@ -137,11 +148,27 @@ function clearRedchiefSlot(slot) {
   preview.hidden = true;
   preview.src = '';
   clearBtn.hidden = true;
+  redchiefConfirmPanelEl.hidden = true;
   updateRedchiefGenerateEnabled();
 }
 
 function updateRedchiefGenerateEnabled() {
   redchiefGenerateBtn.disabled = redchiefSlotFiles.length === 0 || redchiefSlotFiles.some((f) => f === null);
+}
+
+/** Resets every slot back to empty after a successful submit, without a full
+ * re-render (which would tear down and re-wire the dropzone/input elements
+ * unnecessarily) — see finding #1: spent credits must require a deliberate
+ * re-select, even of the same files, before Generate can fire again. */
+function resetRedchiefSlots() {
+  redchiefSlotFiles = new Array(redchiefSlotFiles.length).fill(null);
+  for (const preview of redchiefSlotsEl.querySelectorAll('.redchief-slot-preview')) {
+    preview.hidden = true;
+    preview.src = '';
+  }
+  for (const btn of redchiefSlotsEl.querySelectorAll('.redchief-slot-clear')) {
+    btn.hidden = true;
+  }
 }
 
 function fileToDataUrl(file) {
@@ -153,8 +180,24 @@ function fileToDataUrl(file) {
   });
 }
 
-redchiefGenerateBtn.addEventListener('click', async () => {
+// Generate never submits directly — a single accidental click must not spend
+// credits (finding #1). Clicking it only opens an inline confirm panel
+// (matching the Upload tab's #confirm-panel pattern); the actual POST only
+// fires from redchief-confirm-run-btn below.
+redchiefGenerateBtn.addEventListener('click', () => {
+  redchiefConfirmTextEl.innerHTML = `You're about to submit a RedChief job — this spends <b>${redchiefCreditCost} credit(s)</b> against <b>PRODUCTION</b> and can't be undone.`;
+  redchiefConfirmPanelEl.hidden = false;
   redchiefGenerateBtn.disabled = true;
+});
+
+redchiefConfirmCancelBtn.addEventListener('click', () => {
+  redchiefConfirmPanelEl.hidden = true;
+  updateRedchiefGenerateEnabled();
+});
+
+redchiefConfirmRunBtn.addEventListener('click', async () => {
+  redchiefConfirmRunBtn.disabled = true;
+  redchiefConfirmCancelBtn.disabled = true;
   redchiefUploadStatusEl.textContent = 'Encoding images…';
   try {
     const views = await Promise.all(redchiefSlotFiles.map(fileToDataUrl));
@@ -169,25 +212,42 @@ redchiefGenerateBtn.addEventListener('click', async () => {
       throw new Error(`${body.error?.code ?? res.status}: ${body.error?.message ?? 'request failed'}`);
     }
     redchiefUploadStatusEl.textContent = '';
+    redchiefConfirmPanelEl.hidden = true;
+    // Credits are already spent — clear the slots so the tester must
+    // deliberately re-select files (even the same ones) before Generate can
+    // be clicked again, rather than the button silently re-arming on the
+    // same filled slots and risking a double charge.
+    resetRedchiefSlots();
     startRedchiefJob(body.jobId);
   } catch (err) {
     redchiefUploadStatusEl.textContent = err instanceof Error ? err.message : String(err);
+    redchiefConfirmPanelEl.hidden = true;
   } finally {
+    redchiefConfirmRunBtn.disabled = false;
+    redchiefConfirmCancelBtn.disabled = false;
     updateRedchiefGenerateEnabled();
   }
 });
 
 let redchiefPollTimer = null;
+// Monotonic token identifying "the job currently owning the panel". Every
+// poll continuation captures the token in force when it started and checks
+// it again after each await; if it no longer matches, a newer job (or a
+// cancel) has taken over and this continuation must not touch the DOM
+// (finding #4) — otherwise a stale poll for job A can overwrite job B's
+// banner/results, or clobber a cancel outcome that just got rendered.
+let redchiefPollToken = 0;
 const redchiefRetriedJobs = new Set(); // one auto-retry per job on an expired image URL, never a retry loop
 
 function startRedchiefJob(jobId) {
+  const token = ++redchiefPollToken;
   redchiefJobPanelEl.hidden = false;
   redchiefResultGridEl.hidden = true;
   redchiefResultGridEl.innerHTML = '';
   redchiefJobBannerEl.hidden = false;
   redchiefJobBannerEl.textContent = 'Loading job status…';
   clearTimeout(redchiefPollTimer);
-  pollRedchiefJob(jobId);
+  pollRedchiefJob(jobId, token);
 }
 
 function renderRedchiefJobBanner(job) {
@@ -198,9 +258,11 @@ function renderRedchiefJobBanner(job) {
   document.getElementById('redchief-cancel-btn')?.addEventListener('click', () => cancelRedchiefJob(job.jobId));
 }
 
-async function pollRedchiefJob(jobId, attempt = 0, delayMs = 2000) {
+async function pollRedchiefJob(jobId, token, attempt = 0, delayMs = 2000) {
   const maxAttempts = 20;
   const maxDelayMs = 20000;
+
+  if (token !== redchiefPollToken) return; // a newer job (or a cancel) has taken over
 
   let job;
   try {
@@ -208,22 +270,25 @@ async function pollRedchiefJob(jobId, attempt = 0, delayMs = 2000) {
     job = await res.json();
     if (!res.ok) throw new Error(`${job.error?.code ?? res.status}: ${job.error?.message ?? 'poll failed'}`);
   } catch (err) {
+    if (token !== redchiefPollToken) return;
     redchiefJobBannerEl.innerHTML = `<span>Job <code>${jobId}</code>: <strong>error polling status</strong> — ${
       err instanceof Error ? err.message : String(err)
     }</span>`;
     return;
   }
 
+  if (token !== redchiefPollToken) return;
+
   if (job.status === 'COMPLETED') {
     renderRedchiefJobBanner(job);
     renderRedchiefResult(job);
-    if (typeof loadRedchiefJobs === 'function') loadRedchiefJobs();
+    loadRedchiefJobs();
     return;
   }
   if (job.status === 'FAILED') {
     redchiefJobBannerEl.hidden = false;
     redchiefJobBannerEl.innerHTML = `<span>Job <code>${job.jobId}</code>: <strong>FAILED</strong> — ${job.error ?? 'unknown error'}</span>`;
-    if (typeof loadRedchiefJobs === 'function') loadRedchiefJobs();
+    loadRedchiefJobs();
     return;
   }
 
@@ -232,7 +297,7 @@ async function pollRedchiefJob(jobId, attempt = 0, delayMs = 2000) {
     redchiefJobBannerEl.innerHTML += ' <span class="hint">Still processing — check back later or refresh the jobs table below.</span>';
     return;
   }
-  redchiefPollTimer = setTimeout(() => pollRedchiefJob(jobId, attempt + 1, Math.min(delayMs * 1.5, maxDelayMs)), delayMs);
+  redchiefPollTimer = setTimeout(() => pollRedchiefJob(jobId, token, attempt + 1, Math.min(delayMs * 1.5, maxDelayMs)), delayMs);
 }
 
 function renderRedchiefResult(job) {
@@ -264,17 +329,40 @@ async function refreshExpiredRedchiefResult(jobId) {
   }
 }
 
-async function cancelRedchiefJob(jobId) {
+/**
+ * @param {string} jobId
+ * @param {{ fromRow?: boolean }} [opts] - fromRow: true when triggered from a
+ *   "Recent RedChief jobs" table row rather than the in-flight job panel's
+ *   own Cancel button. The job panel may be hidden, or showing a different
+ *   job, in that case — take it over (same as clicking "View result" on this
+ *   job) so the outcome is always visible, never written into a hidden panel
+ *   (finding #2).
+ */
+async function cancelRedchiefJob(jobId, opts = {}) {
+  const { fromRow = false } = opts;
+  // Bump the poll token first so a stale in-flight poll continuation (for
+  // this job or whatever job previously owned the panel) can't overwrite the
+  // cancel outcome rendered below (finding #4).
+  redchiefPollToken++;
+  clearTimeout(redchiefPollTimer);
+  if (fromRow) {
+    redchiefJobPanelEl.hidden = false;
+    redchiefResultGridEl.hidden = true;
+    redchiefResultGridEl.innerHTML = '';
+    redchiefJobBannerEl.hidden = false;
+    redchiefJobBannerEl.innerHTML = `<span>Job <code>${jobId}</code>: <strong>Cancelling…</strong></span>`;
+  }
   try {
     const res = await fetch(`/api/redchief/jobs/${jobId}/cancel`, { method: 'POST' });
     const body = await res.json();
     if (!res.ok) throw new Error(`${body.error?.code ?? res.status}: ${body.error?.message ?? 'cancel failed'}`);
-    clearTimeout(redchiefPollTimer);
+    redchiefJobBannerEl.hidden = false;
     redchiefJobBannerEl.innerHTML = `<span>Job <code>${jobId}</code>: <strong>CANCELLED</strong> — ${body.creditsRefunded} credit(s) refunded.</span>`;
-    if (typeof loadRedchiefJobs === 'function') loadRedchiefJobs();
+    loadRedchiefJobs();
   } catch (err) {
     // A 409 CONFLICT here means it's already RUNNING/COMPLETED/FAILED — show
     // that plainly rather than a generic failure (spec requirement).
+    redchiefJobBannerEl.hidden = false;
     redchiefJobBannerEl.innerHTML += `<div class="status err">${err instanceof Error ? err.message : String(err)}</div>`;
   }
 }
@@ -296,7 +384,10 @@ async function loadRedchiefJobs() {
       btn.addEventListener('click', () => startRedchiefJob(btn.dataset.jobid));
     }
     for (const btn of redchiefJobsTbodyEl.querySelectorAll('.redchief-cancel-row-btn')) {
-      btn.addEventListener('click', () => cancelRedchiefJob(btn.dataset.jobid).then(loadRedchiefJobs));
+      // cancelRedchiefJob already refreshes the table itself on success — no
+      // .then(loadRedchiefJobs) here, or a successful cancel double-fetches
+      // and a failed one refreshes for nothing (finding #11).
+      btn.addEventListener('click', () => cancelRedchiefJob(btn.dataset.jobid, { fromRow: true }));
     }
   } catch (err) {
     redchiefJobsTbodyEl.innerHTML = `<tr><td colspan="5" class="empty">${err instanceof Error ? err.message : String(err)}</td></tr>`;
