@@ -32,6 +32,10 @@ function redchiefUid(prefix) {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function redchiefEscapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
 window.enterRedchiefView = async function enterRedchiefView() {
   if (!redchiefLoaded) await loadRedchiefConfig();
 };
@@ -89,7 +93,7 @@ function selectRedchiefWorkflow(index) {
   const w = redchiefConfig.workflows[index];
   redchiefWorkflowSwitchTextEl.textContent =
     `Switching to ${w.inputCount} views will re-label every existing row's slots to match — ` +
-    `any photos already placed will be cleared. Continue?`;
+    `any photos already placed will be cleared, and any row with a job in progress or completed will be detached from it. Continue?`;
   redchiefWorkflowSwitchConfirmEl.hidden = false;
 }
 
@@ -110,11 +114,20 @@ function applyRedchiefWorkflowSelection(index) {
   const w = redchiefConfig.workflows[index];
   // Re-labeling an existing row means rebuilding its slots from scratch at
   // the new length/labels — partial preservation would misalign which
-  // photo was meant for which view, so a clean rebuild is the only safe move.
+  // photo was meant for which view, so a clean rebuild is the only safe
+  // move. Any in-flight or completed job for that row is also detached:
+  // its poll token is bumped so a stale continuation can't resurrect a row
+  // whose slots no longer correspond to what was actually submitted.
   for (const row of redchiefRows) {
-    for (const timer of [row.pollTimer]) if (timer) clearTimeout(timer);
+    row.pollToken++;
+    if (row.pollTimer) clearTimeout(row.pollTimer);
     row.pollTimer = null;
     row.slots = w.viewLabels.map((label) => ({ id: redchiefUid('slot'), label, file: null, previewUrl: null }));
+    row.status = 'idle';
+    row.jobId = null;
+    row.error = null;
+    row.resultUrls = null;
+    row.cancelNote = null;
   }
   renderRedchiefWorkflowPicker();
   redchiefBulkPanelEl.hidden = false;
@@ -191,7 +204,7 @@ function redchiefRowCardHtml(row) {
     <div class="redchief-row-card${invalid ? ' invalid' : ''}" data-row="${row.id}">
       <div class="redchief-row-header">
         <span class="redchief-row-index">Row</span>
-        <input type="text" class="redchief-row-label-input" value="${row.label}" />
+        <input type="text" class="redchief-row-label-input" value="${redchiefEscapeHtml(row.label)}" />
         <button type="button" class="link-btn danger redchief-row-remove-btn" title="Remove row">×</button>
       </div>
       <div class="redchief-row-slots">${row.slots.map((s) => redchiefRowSlotHtml(row, s)).join('')}</div>
@@ -213,10 +226,10 @@ function redchiefRowStatusHtml(row) {
     body += ` <button type="button" class="link-btn danger redchief-row-cancel-btn">Cancel</button>`;
   }
   if (row.cancelNote) {
-    body += ` <span class="redchief-cancel-note">${row.cancelNote}</span>`;
+    body += ` <span class="redchief-cancel-note">${redchiefEscapeHtml(row.cancelNote)}</span>`;
   }
   if (row.status === 'FAILED') {
-    body += ` <span class="redchief-error-code">${row.error ?? 'unknown error'}</span>`;
+    body += ` <span class="redchief-error-code">${redchiefEscapeHtml(row.error ?? 'unknown error')}</span>`;
     body += ` <button type="button" class="btn-secondary btn-small redchief-row-retry-btn">Retry</button>`;
   }
   if (row.status === 'COMPLETED' && row.resultUrls) {
@@ -228,6 +241,7 @@ function redchiefRowStatusHtml(row) {
 }
 
 function renderRedchiefRows() {
+  redchiefSubmitConfirmEl.hidden = true; // any row change invalidates a pending submit confirmation
   redchiefRowsEl.innerHTML = redchiefRows.map(redchiefRowCardHtml).join('');
   wireRedchiefRowEvents();
   redchiefAddRowBtn.disabled = redchiefSelectedWorkflowIndex === null;
@@ -313,14 +327,22 @@ function clearRedchiefRowSlotFile(rowId, slotId) {
 
 function removeRedchiefRow(rowId) {
   const row = redchiefFindRow(rowId);
-  if (row && row.pollTimer) clearTimeout(row.pollTimer);
+  if (row) {
+    row.pollToken++;
+    if (row.pollTimer) clearTimeout(row.pollTimer);
+  }
   redchiefRows = redchiefRows.filter((r) => r.id !== rowId);
   renderRedchiefRows();
 }
 
+function redchiefSubmittableRows() {
+  return redchiefRows.filter((r) => r.status === 'idle' && redchiefRowUnfilledCount(r) === 0);
+}
+
 function updateRedchiefSubmitEnabled() {
-  const anySubmittable = redchiefRows.some((r) => r.status === 'idle' && redchiefRowUnfilledCount(r) === 0);
-  redchiefSubmitBtn.disabled = redchiefSelectedWorkflowIndex === null || redchiefRows.length === 0 || !anySubmittable;
+  const submittable = redchiefSubmittableRows();
+  redchiefSubmitBtn.disabled = redchiefSelectedWorkflowIndex === null || redchiefRows.length === 0 || submittable.length === 0;
+  redchiefSubmitBtn.textContent = `Create ${submittable.length} job${submittable.length === 1 ? '' : 's'}`;
 }
 
 // ---------- bulk dropzone: group flat files by filename prefix ----------
@@ -419,7 +441,7 @@ function redchiefMatchViewLabels(viewLabels, files) {
 
 function redchiefGroupByFolder(fileList) {
   const files = filterImageFiles(fileList);
-  const withPaths = files.map((f) => ({ file: f, segments: (f.webkitRelativePath || f.name).split('/') }));
+  const withPaths = files.map((f) => ({ file: f, segments: (f.webkitRelativePath || f.relPath || f.name).split('/') }));
   const hasSubfolders = withPaths.some((f) => f.segments.length >= 3);
 
   if (!hasSubfolders) {
@@ -462,7 +484,7 @@ function createRedchiefRowsFromFolderGroups(groups) {
 }
 
 function handleRedchiefFolderFiles(files) {
-  if (redchiefSelectedWorkflowIndex === null) return;
+  if (redchiefSelectedWorkflowIndex === null || files.length === 0) return;
   const groups = redchiefGroupByFolder(files);
   createRedchiefRowsFromFolderGroups(groups);
 }
@@ -477,10 +499,31 @@ function redchiefFileToDataUrl(file) {
   });
 }
 
-redchiefSubmitBtn.addEventListener('click', submitRedchiefRows);
+const redchiefSubmitConfirmEl = document.getElementById('redchief-submit-confirm');
+const redchiefSubmitConfirmTextEl = document.getElementById('redchief-submit-confirm-text');
+const redchiefSubmitConfirmCancelBtn = document.getElementById('redchief-submit-confirm-cancel-btn');
+const redchiefSubmitConfirmBtn = document.getElementById('redchief-submit-confirm-btn');
+
+redchiefSubmitBtn.addEventListener('click', () => {
+  const submittable = redchiefSubmittableRows();
+  if (submittable.length === 0) return;
+  const totalCredits = submittable.length * redchiefConfig.creditCost;
+  redchiefSubmitConfirmTextEl.textContent =
+    `This will submit ${submittable.length} job${submittable.length === 1 ? '' : 's'} against PRODUCTION, spending ${totalCredits} credit(s) total. This can't be undone. Continue?`;
+  redchiefSubmitConfirmEl.hidden = false;
+});
+
+redchiefSubmitConfirmCancelBtn.addEventListener('click', () => {
+  redchiefSubmitConfirmEl.hidden = true;
+});
+
+redchiefSubmitConfirmBtn.addEventListener('click', () => {
+  redchiefSubmitConfirmEl.hidden = true;
+  submitRedchiefRows();
+});
 
 function submitRedchiefRows() {
-  const submittable = redchiefRows.filter((r) => r.status === 'idle' && redchiefRowUnfilledCount(r) === 0);
+  const submittable = redchiefSubmittableRows();
   if (submittable.length === 0) return;
   for (const row of submittable) row.status = 'submitting';
   renderRedchiefRows();
@@ -498,6 +541,7 @@ async function submitRedchiefRow(row) {
     const body = await res.json();
     if (!res.ok) throw new Error(`${body.error?.code ?? res.status}: ${body.error?.message ?? 'request failed'}`);
     row.jobId = body.jobId;
+    redchiefRefreshedRows.delete(row.id);
     row.status = 'QUEUED';
     row.error = null;
     pollRedchiefRow(row);
@@ -544,9 +588,13 @@ function pollRedchiefRow(row, attempt = 0, delay = 2000) {
     });
 }
 
+const redchiefRefreshedRows = new Set(); // one auto-retry per row per completed result, avoids a hot loop against a permanently-broken URL
+
 async function refreshRedchiefRowResult(rowId) {
   const row = redchiefFindRow(rowId);
   if (!row || row.status !== 'COMPLETED') return;
+  if (redchiefRefreshedRows.has(rowId)) return;
+  redchiefRefreshedRows.add(rowId);
   try {
     const res = await fetch(`/api/redchief/jobs/${row.jobId}`);
     const body = await res.json();
@@ -596,6 +644,7 @@ function retryRedchiefRow(rowId) {
   row.pollToken++; // discard any stale continuation from the failed attempt
   row.jobId = null;
   row.error = null;
+  row.cancelNote = null;
   row.resultUrls = null;
   row.status = 'submitting';
   renderRedchiefRows();
