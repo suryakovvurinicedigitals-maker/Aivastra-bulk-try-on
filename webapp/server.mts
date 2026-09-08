@@ -295,6 +295,20 @@ function propiclyErrorResponse(res: http.ServerResponse, err: unknown) {
   json(res, 502, { error: { code: 'PROXY_ERROR', message: err instanceof Error ? err.message : String(err) } });
 }
 
+/** Safe decodeURIComponent for a job-id path segment. A stray `%` (or any
+ * other malformed percent-encoding) makes the built-in throw a raw URIError,
+ * which would otherwise escape to the outer try/catch as a generic 500
+ * instead of the same 400 VALIDATION envelope the regex check right after
+ * this produces for every other kind of bad job id. Returns null on failure
+ * so callers can fold it into their existing validation branch. */
+function decodeJobIdParam(raw: string): string | null {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return null;
+  }
+}
+
 async function readBodyCapped(req: http.IncomingMessage, maxBytes: number): Promise<Buffer> {
   const chunks: Buffer[] = [];
   let total = 0;
@@ -1154,8 +1168,8 @@ const server = http.createServer(async (req, res) => {
         json(res, 400, { error: { code: 'CONFIG_MISSING', message: 'PROPICLY_API_KEY is not set on the server.' } });
         return;
       }
-      const jobId = decodeURIComponent(url.pathname.slice('/api/redchief/jobs/'.length, -'/cancel'.length));
-      if (!/^[\w-]{1,80}$/.test(jobId)) {
+      const jobId = decodeJobIdParam(url.pathname.slice('/api/redchief/jobs/'.length, -'/cancel'.length));
+      if (jobId === null || !/^[\w-]{1,80}$/.test(jobId)) {
         json(res, 400, { error: { code: 'VALIDATION', message: 'invalid job id' } });
         return;
       }
@@ -1173,8 +1187,8 @@ const server = http.createServer(async (req, res) => {
         json(res, 400, { error: { code: 'CONFIG_MISSING', message: 'PROPICLY_API_KEY is not set on the server.' } });
         return;
       }
-      const jobId = decodeURIComponent(url.pathname.slice('/api/redchief/jobs/'.length));
-      if (!/^[\w-]{1,80}$/.test(jobId)) {
+      const jobId = decodeJobIdParam(url.pathname.slice('/api/redchief/jobs/'.length));
+      if (jobId === null || !/^[\w-]{1,80}$/.test(jobId)) {
         json(res, 400, { error: { code: 'VALIDATION', message: 'invalid job id' } });
         return;
       }
