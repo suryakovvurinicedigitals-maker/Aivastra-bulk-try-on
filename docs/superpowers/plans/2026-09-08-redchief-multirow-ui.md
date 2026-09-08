@@ -224,7 +224,6 @@ function applyRedchiefWorkflowSelection(index) {
   }
   renderRedchiefWorkflowPicker();
   redchiefBulkPanelEl.hidden = false;
-  redchiefRowsPanelEl.hidden = false;
   renderRedchiefRows();
 }
 
@@ -232,6 +231,7 @@ function applyRedchiefWorkflowSelection(index) {
 // rendering). Defined here as a safe no-op so Tasks 1-3 are independently
 // runnable/verifiable without a ReferenceError.
 function renderRedchiefRows() {
+  redchiefRowsPanelEl.hidden = redchiefRows.length === 0;
   redchiefFooterBarEl.hidden = redchiefRows.length === 0;
   if (redchiefRows.length > 0) redchiefRowCountEl.textContent = `${redchiefRows.length} row${redchiefRows.length === 1 ? '' : 's'}`;
 }
@@ -371,7 +371,13 @@ function redchiefMatchViewLabels(viewLabels, files) {
       return normStem.includes(normLabel) || normLabel.includes(normStem);
     });
     if (match) used.add(files.indexOf(match));
-    return { id: redchiefUid('slot'), label, file: match ?? null, previewUrl: null };
+    // `unmatched` (true only when this specific label found no file) is what
+    // Task 4's row-card rendering reads to show the danger-tinted "Missing:
+    // <label>" placeholder instead of a plain empty slot — a slot from a
+    // manually-added row or a bulk-prefix-grouped row is never `unmatched`
+    // (only this folder-matching path sets it), since those paths never
+    // attempted an automatic match in the first place.
+    return { id: redchiefUid('slot'), label, file: match ?? null, previewUrl: null, unmatched: !match };
   });
 }
 
@@ -550,6 +556,7 @@ function renderRedchiefRows() {
   wireRedchiefRowEvents();
   redchiefAddRowBtn.disabled = redchiefSelectedWorkflowIndex === null;
   redchiefAddRowBtn.title = redchiefSelectedWorkflowIndex === null ? 'Choose a view count above first' : '';
+  redchiefRowsPanelEl.hidden = redchiefRows.length === 0;
   redchiefFooterBarEl.hidden = redchiefRows.length === 0;
   if (redchiefRows.length > 0) redchiefRowCountEl.textContent = `${redchiefRows.length} row${redchiefRows.length === 1 ? '' : 's'}`;
   updateRedchiefSubmitEnabled();
