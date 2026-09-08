@@ -177,13 +177,104 @@ redchiefGenerateBtn.addEventListener('click', async () => {
   }
 });
 
-// startRedchiefJob is completed in Task 5 (poll loop + result rendering).
-// Defined here as a forward reference so Task 4's Generate handler compiles
-// and runs standalone before Task 5 lands.
+let redchiefPollTimer = null;
+const redchiefRetriedJobs = new Set(); // one auto-retry per job on an expired image URL, never a retry loop
+
 function startRedchiefJob(jobId) {
   redchiefJobPanelEl.hidden = false;
   redchiefResultGridEl.hidden = true;
   redchiefResultGridEl.innerHTML = '';
   redchiefJobBannerEl.hidden = false;
-  redchiefJobBannerEl.textContent = `Job ${jobId}: QUEUED (polling not wired up yet — Task 5)`;
+  redchiefJobBannerEl.textContent = 'Loading job status…';
+  clearTimeout(redchiefPollTimer);
+  pollRedchiefJob(jobId);
+}
+
+function renderRedchiefJobBanner(job) {
+  const cancelBtn =
+    job.status === 'QUEUED' ? `<button type="button" class="btn-secondary btn-small" id="redchief-cancel-btn">Cancel</button>` : '';
+  redchiefJobBannerEl.hidden = false;
+  redchiefJobBannerEl.innerHTML = `<span>Job <code>${job.jobId}</code>: <strong>${job.status}</strong></span>${cancelBtn}`;
+  document.getElementById('redchief-cancel-btn')?.addEventListener('click', () => cancelRedchiefJob(job.jobId));
+}
+
+async function pollRedchiefJob(jobId, attempt = 0, delayMs = 2000) {
+  const maxAttempts = 20;
+  const maxDelayMs = 20000;
+
+  let job;
+  try {
+    const res = await fetch(`/api/redchief/jobs/${jobId}`);
+    job = await res.json();
+    if (!res.ok) throw new Error(`${job.error?.code ?? res.status}: ${job.error?.message ?? 'poll failed'}`);
+  } catch (err) {
+    redchiefJobBannerEl.innerHTML = `<span>Job <code>${jobId}</code>: <strong>error polling status</strong> — ${
+      err instanceof Error ? err.message : String(err)
+    }</span>`;
+    return;
+  }
+
+  if (job.status === 'COMPLETED') {
+    renderRedchiefJobBanner(job);
+    renderRedchiefResult(job);
+    if (typeof loadRedchiefJobs === 'function') loadRedchiefJobs();
+    return;
+  }
+  if (job.status === 'FAILED') {
+    redchiefJobBannerEl.hidden = false;
+    redchiefJobBannerEl.innerHTML = `<span>Job <code>${job.jobId}</code>: <strong>FAILED</strong> — ${job.error ?? 'unknown error'}</span>`;
+    if (typeof loadRedchiefJobs === 'function') loadRedchiefJobs();
+    return;
+  }
+
+  renderRedchiefJobBanner(job);
+  if (attempt >= maxAttempts) {
+    redchiefJobBannerEl.innerHTML += ' <span class="hint">Still processing — check back later or refresh the jobs table below.</span>';
+    return;
+  }
+  redchiefPollTimer = setTimeout(() => pollRedchiefJob(jobId, attempt + 1, Math.min(delayMs * 1.5, maxDelayMs)), delayMs);
+}
+
+function renderRedchiefResult(job) {
+  const urls = job.imageUrls ?? (job.imageUrl ? [job.imageUrl] : []);
+  redchiefResultGridEl.hidden = false;
+  redchiefResultGridEl.innerHTML = urls
+    .map(
+      (url, i) => `
+    <div class="redchief-result-cell">
+      <img src="${url}" alt="Result ${i + 1}" data-job="${job.jobId}" />
+      <a href="${url}" target="_blank" rel="noopener" class="link-btn">Open</a>
+    </div>`,
+    )
+    .join('');
+  for (const img of redchiefResultGridEl.querySelectorAll('img')) {
+    img.addEventListener('error', () => refreshExpiredRedchiefResult(img.dataset.job));
+  }
+}
+
+async function refreshExpiredRedchiefResult(jobId) {
+  if (redchiefRetriedJobs.has(jobId)) return;
+  redchiefRetriedJobs.add(jobId);
+  try {
+    const res = await fetch(`/api/redchief/jobs/${jobId}`);
+    const job = await res.json();
+    if (res.ok && job.status === 'COMPLETED') renderRedchiefResult(job);
+  } catch {
+    // best-effort — leave the broken thumbnail if this also fails
+  }
+}
+
+async function cancelRedchiefJob(jobId) {
+  try {
+    const res = await fetch(`/api/redchief/jobs/${jobId}/cancel`, { method: 'POST' });
+    const body = await res.json();
+    if (!res.ok) throw new Error(`${body.error?.code ?? res.status}: ${body.error?.message ?? 'cancel failed'}`);
+    clearTimeout(redchiefPollTimer);
+    redchiefJobBannerEl.innerHTML = `<span>Job <code>${jobId}</code>: <strong>CANCELLED</strong> — ${body.creditsRefunded} credit(s) refunded.</span>`;
+    if (typeof loadRedchiefJobs === 'function') loadRedchiefJobs();
+  } catch (err) {
+    // A 409 CONFLICT here means it's already RUNNING/COMPLETED/FAILED — show
+    // that plainly rather than a generic failure (spec requirement).
+    redchiefJobBannerEl.innerHTML += `<div class="status err">${err instanceof Error ? err.message : String(err)}</div>`;
+  }
 }
