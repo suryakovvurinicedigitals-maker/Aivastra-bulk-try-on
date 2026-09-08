@@ -22,7 +22,9 @@ const REDCHIEF_ACCEPTED_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp'
 
 window.enterRedchiefView = async function enterRedchiefView() {
   if (!redchiefLoaded) await loadRedchiefConfig();
-  loadRedchiefJobs();
+  // loadRedchiefJobs is added in Task 6; guard so this file runs standalone
+  // (same forward-reference shape as startRedchiefJob below) until it lands.
+  if (typeof loadRedchiefJobs === 'function') loadRedchiefJobs();
 };
 
 async function loadRedchiefConfig() {
@@ -114,12 +116,11 @@ function wireRedchiefSlotEvents() {
 }
 
 function setRedchiefSlotFile(slot, file) {
-  if (!REDCHIEF_ACCEPTED_TYPES.has(file.type)) {
-    redchiefUploadStatusEl.textContent = `${file.name}: only JPEG, PNG, or WebP images are accepted.`;
-    return;
-  }
-  redchiefUploadStatusEl.textContent =
-    file.size > REDCHIEF_MAX_MB * 1024 * 1024 ? `${file.name}: over ${REDCHIEF_MAX_MB}MB — the server may reject this, but you can still try.` : '';
+  redchiefUploadStatusEl.textContent = !REDCHIEF_ACCEPTED_TYPES.has(file.type)
+    ? `${file.name}: only JPEG, PNG, or WebP images are accepted — the server may reject this, but you can still try.`
+    : file.size > REDCHIEF_MAX_MB * 1024 * 1024
+      ? `${file.name}: over ${REDCHIEF_MAX_MB}MB — the server may reject this, but you can still try.`
+      : '';
   redchiefSlotFiles[slot] = file;
   const preview = redchiefSlotsEl.querySelector(`.redchief-slot-preview[data-slot="${slot}"]`);
   const clearBtn = redchiefSlotsEl.querySelector(`.redchief-slot-clear[data-slot="${slot}"]`);
