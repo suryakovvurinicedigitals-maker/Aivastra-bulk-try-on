@@ -287,6 +287,13 @@
         <section class="panel" id="redchief-upload-panel" hidden>
           <h2>🖼️ Upload views</h2>
           <p class="hint">One photo per slot, in order — each slot is matched to a specific view of the item.</p>
+          <div class="upload-row">
+            <div class="dropzone" id="redchief-folder-dropzone" tabindex="0">
+              <input type="file" id="redchief-folder-input" webkitdirectory multiple hidden />
+              <span class="icon">⬆</span>
+              <span>Drag a whole folder of this item's photos here, or click to choose one — views are matched to slots automatically by filename</span>
+            </div>
+          </div>
           <div class="redchief-slots" id="redchief-slots"></div>
           <div class="status" id="redchief-upload-status"></div>
           <button id="redchief-generate-btn" class="btn-primary" disabled>Generate</button>

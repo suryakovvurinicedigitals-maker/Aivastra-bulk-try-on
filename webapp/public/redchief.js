@@ -156,6 +156,94 @@ function updateRedchiefGenerateEnabled() {
   redchiefGenerateBtn.disabled = redchiefSlotFiles.length === 0 || redchiefSlotFiles.some((f) => f === null);
 }
 
+// ---------- folder upload with automatic view detection ----------
+const redchiefFolderDropzoneEl = document.getElementById('redchief-folder-dropzone');
+const redchiefFolderInputEl = document.getElementById('redchief-folder-input');
+
+// Stripped before matching so they never count as a "match" on their own —
+// every real viewLabel already ends in one of these (e.g. "Left Side View"),
+// so without stripping them a file named "photo.jpg" would spuriously score
+// against every label's "view" token at once.
+const REDCHIEF_GENERIC_WORDS = new Set(['view', 'side', 'photo', 'image', 'img']);
+
+function redchiefWords(s) {
+  return s
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .split(' ')
+    .filter((w) => w.length > 1 && !REDCHIEF_GENERIC_WORDS.has(w));
+}
+
+// Score = how many of the label's own significant words also appear, as
+// whole tokens, in the filename. E.g. label "Tip Front Side View" has
+// significant words ["tip","front"]: a file "tip-front-01.jpg" scores 2, a
+// file "front-only.jpg" scores 1, a file "left.jpg" scores 0.
+function redchiefMatchScore(label, filename) {
+  const labelWords = new Set(redchiefWords(label));
+  const fileWords = new Set(redchiefWords(filename.replace(/\.[^.]+$/, '')));
+  let score = 0;
+  for (const w of labelWords) if (fileWords.has(w)) score++;
+  return score;
+}
+
+// Greedy best-match assignment across every (slot, file) pair: score them
+// all, then repeatedly take the highest-scoring still-available pair. A
+// slot with no positive-scoring file is left null (never guess with zero
+// evidence — a wrong slot silently produces a bad paid job).
+function redchiefAutoMatchFiles(viewLabels, files) {
+  const pairs = [];
+  for (let slot = 0; slot < viewLabels.length; slot++) {
+    for (let f = 0; f < files.length; f++) {
+      const score = redchiefMatchScore(viewLabels[slot], files[f].name);
+      if (score > 0) pairs.push({ slot, f, score });
+    }
+  }
+  pairs.sort((a, b) => b.score - a.score);
+  const usedSlots = new Set();
+  const usedFiles = new Set();
+  const assignment = new Array(viewLabels.length).fill(null);
+  for (const { slot, f } of pairs) {
+    if (usedSlots.has(slot) || usedFiles.has(f)) continue;
+    assignment[slot] = files[f];
+    usedSlots.add(slot);
+    usedFiles.add(f);
+  }
+  return assignment;
+}
+
+function handleRedchiefFolderFiles(files) {
+  const workflow = redchiefWorkflows[Number(redchiefWorkflowSelectEl.value)];
+  if (!workflow) return;
+  if (files.length === 0) {
+    redchiefUploadStatusEl.textContent = 'No image files found in that folder (looked for .jpg/.jpeg/.png/.webp).';
+    redchiefUploadStatusEl.className = 'status err';
+    return;
+  }
+  // A folder drop represents "here is the complete set of views for this
+  // item" — start from a clean slate so a re-drop after fixing one photo
+  // can't leave a stale file sitting in some other slot.
+  for (let slot = 0; slot < redchiefSlotFiles.length; slot++) clearRedchiefSlot(slot);
+
+  const assignment = redchiefAutoMatchFiles(workflow.viewLabels, files);
+  let matched = 0;
+  for (let slot = 0; slot < assignment.length; slot++) {
+    if (assignment[slot]) {
+      setRedchiefSlotFile(slot, assignment[slot]);
+      matched++;
+    }
+  }
+  const unmatchedFiles = files.length - matched;
+  const unmatchedSlots = assignment.length - matched;
+  redchiefUploadStatusEl.className = 'status';
+  redchiefUploadStatusEl.textContent =
+    matched === assignment.length
+      ? `Matched all ${matched} views automatically from the folder.`
+      : `Matched ${matched} of ${assignment.length} views automatically from the folder. ${unmatchedSlots} slot(s) need a photo assigned manually` +
+        (unmatchedFiles > 0 ? `, and ${unmatchedFiles} file(s) from the folder didn't match any view label.` : '.');
+}
+
+wireDropzone(redchiefFolderDropzoneEl, redchiefFolderInputEl, handleRedchiefFolderFiles, redchiefUploadStatusEl);
+
 /** Resets every slot back to empty after a successful submit, without a full
  * re-render (which would tear down and re-wire the dropzone/input elements
  * unnecessarily) — see finding #1: spent credits must require a deliberate
