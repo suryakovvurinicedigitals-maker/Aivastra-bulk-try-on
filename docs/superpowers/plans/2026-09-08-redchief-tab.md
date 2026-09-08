@@ -1064,6 +1064,164 @@ No code changes in this task, so nothing to commit unless Step 2-4 surfaced a bu
 
 ---
 
+---
+
+## Addendum: Task 9 — Folder upload with automatic view detection
+
+Added after Tasks 1-8 shipped and were merged into review, per a direct user
+request: RedChief currently only supports one-file-per-slot manual upload;
+the tester should be able to drop/choose a whole folder of one item's photos
+and have them auto-assigned to the right slot by filename, the same way the
+existing Upload tab already supports whole-folder uploads for people/garments
+(see `webapp/public/app.js`'s `wireDropzone`/`wireFolderPicker`/
+`filesFromDataTransferItems`/`collectFilesFromEntry`/`isImageFile`/
+`filterImageFiles` — all global functions in that classic script, directly
+callable from `redchief.js` since both share one page-global scope).
+
+**Design decision (ruled by the controller, confirmed reasonable given no
+real example filenames were available to test against): a conservative,
+transparent match-or-leave-blank heuristic — never guess a slot assignment
+with zero evidence, since a wrong slot silently produces a bad paid job.**
+Score each (view label, filename) pair by counting how many of the label's
+own significant words (lowercased, non-alphanumeric-split, with generic
+words like "view"/"side" stripped) appear as whole tokens in the filename;
+greedily assign the highest-scoring pairs first; any slot with no
+positive-scoring file stays empty for the tester to fill by hand, and any
+leftover unmatched files are simply not used. Report the match count
+plainly so the tester knows what still needs manual attention before
+Generate is even enabled.
+
+### Task 9: Folder upload with automatic view detection
+
+**Files:**
+- Modify: `webapp/public/index.html` (new folder-dropzone markup inside `#redchief-upload-panel`)
+- Modify: `webapp/public/redchief.js` (new matching/wiring logic)
+
+**Interfaces:**
+- Consumes: `wireDropzone(dropzoneEl, inputEl, onFiles, statusEl)` and `filesFromDataTransferItems` (indirectly, via `wireDropzone`'s own drop handler) — both globals already defined in `webapp/public/app.js`, loaded before `redchief.js`. Also consumes existing RedChief module state/functions: `redchiefWorkflows`, `redchiefWorkflowSelectEl`, `redchiefSlotFiles`, `setRedchiefSlotFile(slot, file)`, `clearRedchiefSlot(slot)`, `redchiefUploadStatusEl`.
+- Produces: nothing new consumed by later tasks — this is the final addition to the feature.
+
+- [ ] **Step 1: Add the folder-dropzone markup**
+
+In `webapp/public/index.html`, inside `#redchief-upload-panel`, right after its `<p class="hint">` line and before `<div class="redchief-slots" id="redchief-slots"></div>`:
+
+```html
+          <div class="upload-row">
+            <div class="dropzone" id="redchief-folder-dropzone" tabindex="0">
+              <input type="file" id="redchief-folder-input" webkitdirectory multiple hidden />
+              <span class="icon">⬆</span>
+              <span>Drag a whole folder of this item's photos here, or click to choose one — views are matched to slots automatically by filename</span>
+            </div>
+          </div>
+```
+
+- [ ] **Step 2: Add the matching/wiring logic to `redchief.js`**
+
+Append this block right after the existing `updateRedchiefGenerateEnabled()` function definition (before the `resetRedchiefSlots`/confirm-panel code that follows it):
+
+```js
+// ---------- folder upload with automatic view detection ----------
+const redchiefFolderDropzoneEl = document.getElementById('redchief-folder-dropzone');
+const redchiefFolderInputEl = document.getElementById('redchief-folder-input');
+
+// Stripped before matching so they never count as a "match" on their own —
+// every real viewLabel already ends in one of these (e.g. "Left Side View"),
+// so without stripping them a file named "photo.jpg" would spuriously score
+// against every label's "view" token at once.
+const REDCHIEF_GENERIC_WORDS = new Set(['view', 'side', 'photo', 'image', 'img']);
+
+function redchiefWords(s) {
+  return s
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .split(' ')
+    .filter((w) => w.length > 1 && !REDCHIEF_GENERIC_WORDS.has(w));
+}
+
+// Score = how many of the label's own significant words also appear, as
+// whole tokens, in the filename. E.g. label "Tip Front Side View" has
+// significant words ["tip","front"]: a file "tip-front-01.jpg" scores 2, a
+// file "front-only.jpg" scores 1, a file "left.jpg" scores 0.
+function redchiefMatchScore(label, filename) {
+  const labelWords = new Set(redchiefWords(label));
+  const fileWords = new Set(redchiefWords(filename.replace(/\.[^.]+$/, '')));
+  let score = 0;
+  for (const w of labelWords) if (fileWords.has(w)) score++;
+  return score;
+}
+
+// Greedy best-match assignment across every (slot, file) pair: score them
+// all, then repeatedly take the highest-scoring still-available pair. A
+// slot with no positive-scoring file is left null (never guess with zero
+// evidence — a wrong slot silently produces a bad paid job).
+function redchiefAutoMatchFiles(viewLabels, files) {
+  const pairs = [];
+  for (let slot = 0; slot < viewLabels.length; slot++) {
+    for (let f = 0; f < files.length; f++) {
+      const score = redchiefMatchScore(viewLabels[slot], files[f].name);
+      if (score > 0) pairs.push({ slot, f, score });
+    }
+  }
+  pairs.sort((a, b) => b.score - a.score);
+  const usedSlots = new Set();
+  const usedFiles = new Set();
+  const assignment = new Array(viewLabels.length).fill(null);
+  for (const { slot, f } of pairs) {
+    if (usedSlots.has(slot) || usedFiles.has(f)) continue;
+    assignment[slot] = files[f];
+    usedSlots.add(slot);
+    usedFiles.add(f);
+  }
+  return assignment;
+}
+
+function handleRedchiefFolderFiles(files) {
+  const workflow = redchiefWorkflows[Number(redchiefWorkflowSelectEl.value)];
+  if (!workflow) return;
+  if (files.length === 0) {
+    redchiefUploadStatusEl.textContent = 'No image files found in that folder (looked for .jpg/.jpeg/.png/.webp).';
+    redchiefUploadStatusEl.className = 'status err';
+    return;
+  }
+  // A folder drop represents "here is the complete set of views for this
+  // item" — start from a clean slate so a re-drop after fixing one photo
+  // can't leave a stale file sitting in some other slot.
+  for (let slot = 0; slot < redchiefSlotFiles.length; slot++) clearRedchiefSlot(slot);
+
+  const assignment = redchiefAutoMatchFiles(workflow.viewLabels, files);
+  let matched = 0;
+  for (let slot = 0; slot < assignment.length; slot++) {
+    if (assignment[slot]) {
+      setRedchiefSlotFile(slot, assignment[slot]);
+      matched++;
+    }
+  }
+  const unmatchedFiles = files.length - matched;
+  const unmatchedSlots = assignment.length - matched;
+  redchiefUploadStatusEl.className = 'status';
+  redchiefUploadStatusEl.textContent =
+    matched === assignment.length
+      ? `Matched all ${matched} views automatically from the folder.`
+      : `Matched ${matched} of ${assignment.length} views automatically from the folder. ${unmatchedSlots} slot(s) need a photo assigned manually` +
+        (unmatchedFiles > 0 ? `, and ${unmatchedFiles} file(s) from the folder didn't match any view label.` : '.');
+}
+
+wireDropzone(redchiefFolderDropzoneEl, redchiefFolderInputEl, handleRedchiefFolderFiles, redchiefUploadStatusEl);
+```
+
+Note: `wireDropzone` is called exactly once here (not inside `renderRedchiefSlots`) because this dropzone's markup is static (written once in `index.html`, never regenerated via `innerHTML`) — unlike the per-slot dropzones, which `renderRedchiefSlots()` recreates on every workflow change and therefore must re-wire every time.
+
+- [ ] **Step 3: Verify**
+
+`node --check webapp/public/redchief.js`. Browser automation cannot reach `localhost` in this environment (confirmed throughout this feature's development) — verify via a manual trace of `redchiefAutoMatchFiles` against a few example label/filename sets (e.g. confirm labels `["Front","Left","Right","Sole"]` against filenames `["front.jpg","left-side.png","right_view.jpg","random.jpg"]` produce matches for slots 0-2 and leave slot 3 empty with `random.jpg` unused), and confirm every `getElementById` call resolves against the new markup from Step 1.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add webapp/public/index.html webapp/public/redchief.js
+git commit -m "feat: RedChief folder upload with automatic view detection by filename"
+```
+
 ## Self-Review Notes
 
 - **Spec coverage:** every numbered UI requirement (1-8) and every endpoint (1-5) in the spec doc maps to a task above — config load/error (Task 4), workflow selector + credit cost (Task 4), labeled slots + client-side checks (Task 4), Generate + job creation (Task 4), poll loop + result grid + expiry re-fetch (Task 5), FAILED display (Task 5), recent-jobs table + view/cancel (Task 6), visual match (Task 7), env isolation (Task 1-2 Global Constraints).
