@@ -94,6 +94,7 @@ function selectRedchiefWorkflow(index) {
   redchiefWorkflowSwitchTextEl.textContent =
     `Switching to ${w.inputCount} views will re-label every existing row's slots to match — ` +
     `any photos already placed will be cleared, and any row with a job in progress or completed will be detached from it. Continue?`;
+  redchiefSubmitConfirmEl.hidden = true; // never show both danger-confirm panels at once
   redchiefWorkflowSwitchConfirmEl.hidden = false;
 }
 
