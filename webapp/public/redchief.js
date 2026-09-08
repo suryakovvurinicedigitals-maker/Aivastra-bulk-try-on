@@ -129,3 +129,59 @@ function renderRedchiefRows() {
   redchiefFooterBarEl.hidden = redchiefRows.length === 0;
   if (redchiefRows.length > 0) redchiefRowCountEl.textContent = `${redchiefRows.length} row${redchiefRows.length === 1 ? '' : 's'}`;
 }
+
+// ---------- bulk dropzone: group flat files by filename prefix ----------
+const redchiefBulkDropzoneEl = document.getElementById('redchief-bulk-dropzone');
+const redchiefBulkInputEl = document.getElementById('redchief-bulk-input');
+
+const REDCHIEF_SUFFIX_RE = /^(.+?)[-_](?:view)?(\d+)$/i;
+
+function redchiefGroupByPrefix(files) {
+  const groups = new Map(); // prefix -> [{file, order}]
+  for (const file of files) {
+    const stem = file.name.replace(/\.[^.]+$/, '');
+    const m = stem.match(REDCHIEF_SUFFIX_RE);
+    if (m) {
+      const key = m[1].toLowerCase();
+      const order = Number(m[2]);
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push({ file, order });
+    } else {
+      // No trailing number — its own singleton group, keyed uniquely so it
+      // never accidentally merges with another unsuffixed file of the same name.
+      groups.set(`${stem}-${redchiefUid('singleton')}`, [{ file, order: 0 }]);
+    }
+  }
+  return [...groups.values()].map((entries) => entries.sort((a, b) => a.order - b.order).map((e) => e.file));
+}
+
+function createRedchiefRowsFromFileGroups(groups) {
+  const w = redchiefConfig.workflows[redchiefSelectedWorkflowIndex];
+  for (const files of groups) {
+    const slots = w.viewLabels.map((label, i) => ({
+      id: redchiefUid('slot'),
+      label,
+      file: files[i] ?? null, // extra files beyond inputCount are dropped, not placed elsewhere
+      previewUrl: null,
+    }));
+    redchiefRows.push({
+      id: redchiefUid('row'),
+      label: `Item ${++redchiefRowCounter}`,
+      slots,
+      jobId: null,
+      status: 'idle',
+      resultUrls: null,
+      error: null,
+      pollTimer: null,
+      pollToken: 0,
+    });
+  }
+  renderRedchiefRows();
+}
+
+function handleRedchiefBulkFiles(files) {
+  if (redchiefSelectedWorkflowIndex === null || files.length === 0) return;
+  createRedchiefRowsFromFileGroups(redchiefGroupByPrefix(files));
+}
+
+wireDropzone(redchiefBulkDropzoneEl, redchiefBulkInputEl, handleRedchiefBulkFiles, redchiefBulkStatusEl);
