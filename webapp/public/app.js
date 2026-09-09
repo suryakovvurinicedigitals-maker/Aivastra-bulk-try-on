@@ -81,6 +81,19 @@ const createUserBtn = document.getElementById('create-user-btn');
 const createUserStatusEl = document.getElementById('create-user-status');
 const usersTbodyEl = document.getElementById('users-tbody');
 const usersActionStatusEl = document.getElementById('users-action-status');
+const navSettingsLink = document.getElementById('nav-settings-link');
+const aivastraSettingsForm = document.getElementById('aivastra-settings-form');
+const aivastraBaseUrlEl = document.getElementById('aivastra-base-url');
+const aivastraApiKeyEl = document.getElementById('aivastra-api-key');
+const aivastraKeyStatusEl = document.getElementById('aivastra-key-status');
+const aivastraSettingsBtn = document.getElementById('aivastra-settings-btn');
+const aivastraSettingsStatusEl = document.getElementById('aivastra-settings-status');
+const propiclySettingsForm = document.getElementById('propicly-settings-form');
+const propiclyBaseUrlEl = document.getElementById('propicly-base-url');
+const propiclyApiKeyEl = document.getElementById('propicly-api-key');
+const propiclyKeyStatusEl = document.getElementById('propicly-key-status');
+const propiclySettingsBtn = document.getElementById('propicly-settings-btn');
+const propiclySettingsStatusEl = document.getElementById('propicly-settings-status');
 
 // ---------- auth ----------
 let currentUser = null;
@@ -96,6 +109,7 @@ async function loadCurrentUser() {
   sidebarUsernameEl.textContent = currentUser.username;
   sidebarRoleEl.textContent = currentUser.role === 'superadmin' ? 'super admin' : 'user';
   navUsersLink.hidden = currentUser.role !== 'superadmin';
+  navSettingsLink.hidden = currentUser.role !== 'superadmin';
   return true;
 }
 
@@ -110,7 +124,7 @@ function setView(name) {
   // directly — the nav link is hidden, but the hash itself is always
   // reachable, so this is the actual enforcement (the server-side 403 on
   // /api/admin/users is the real guard; this just avoids showing a broken page).
-  if (name === 'users' && currentUser?.role !== 'superadmin') name = 'upload';
+  if ((name === 'users' || name === 'settings') && currentUser?.role !== 'superadmin') name = 'upload';
   const target = views.some((v) => v.dataset.view === name) ? name : 'upload';
   for (const v of views) v.hidden = v.dataset.view !== target;
   for (const l of navLinks) l.classList.toggle('active', l.dataset.view === target);
@@ -118,6 +132,7 @@ function setView(name) {
   if (target === 'results') loadResults(false);
   else stopResultsPolling();
   if (target === 'users') loadUsers();
+  if (target === 'settings') loadApiSettings();
   if (target === 'redchief') window.enterRedchiefView?.();
 }
 window.addEventListener('hashchange', () => setView(location.hash.slice(1)));
@@ -224,6 +239,65 @@ createUserForm.addEventListener('submit', async (e) => {
   } finally {
     createUserBtn.disabled = false;
   }
+});
+
+// ---------- API Setup (super admin) ----------
+// Key inputs are always left blank on load/reload -- the server never sends
+// a key's plaintext back (see /api/admin/api-settings GET), only whether one
+// is set and how long it is. A blank key field on save means "keep it".
+function keyStatusText(key) {
+  return key.set ? `Key set (${key.length} characters). Leave the field blank to keep it.` : 'No key set yet.';
+}
+
+async function loadApiSettings() {
+  const res = await fetch('/api/admin/api-settings');
+  if (!res.ok) {
+    aivastraSettingsStatusEl.textContent = 'Could not load current settings.';
+    aivastraSettingsStatusEl.className = 'status err';
+    return;
+  }
+  const data = await res.json();
+  aivastraBaseUrlEl.value = data.aivastra.baseUrl;
+  aivastraKeyStatusEl.textContent = keyStatusText(data.aivastra.key);
+  propiclyBaseUrlEl.value = data.propicly.baseUrl;
+  propiclyKeyStatusEl.textContent = keyStatusText(data.propicly.key);
+}
+
+async function saveApiSettings(target, baseUrlEl, apiKeyEl, keyStatusEl, btn, statusEl) {
+  btn.disabled = true;
+  statusEl.className = 'status';
+  statusEl.textContent = '';
+  try {
+    const res = await fetch('/api/admin/api-settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target, baseUrl: baseUrlEl.value.trim(), apiKey: apiKeyEl.value.trim() }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      statusEl.textContent = data.error || 'Could not save these settings.';
+      statusEl.className = 'status err';
+      return;
+    }
+    apiKeyEl.value = '';
+    const saved = target === 'aivastra' ? data.aivastra : data.propicly;
+    baseUrlEl.value = saved.baseUrl;
+    keyStatusEl.textContent = keyStatusText(saved.key);
+    statusEl.textContent = 'Saved — applied immediately, no restart needed.';
+    statusEl.className = 'status ok';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+aivastraSettingsForm.addEventListener('submit', (e) => {
+  e.preventDefault();
+  saveApiSettings('aivastra', aivastraBaseUrlEl, aivastraApiKeyEl, aivastraKeyStatusEl, aivastraSettingsBtn, aivastraSettingsStatusEl);
+});
+
+propiclySettingsForm.addEventListener('submit', (e) => {
+  e.preventDefault();
+  saveApiSettings('propicly', propiclyBaseUrlEl, propiclyApiKeyEl, propiclyKeyStatusEl, propiclySettingsBtn, propiclySettingsStatusEl);
 });
 
 // ---------- selection ----------

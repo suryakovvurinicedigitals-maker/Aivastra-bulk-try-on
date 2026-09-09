@@ -22,6 +22,7 @@
         <a href="#results" class="nav-link" data-view="results"><span class="nav-icon">📁</span>Results</a>
         <a href="#redchief" class="nav-link" data-view="redchief"><span class="nav-icon">📦</span>RedChief</a>
         <a href="#users" class="nav-link" data-view="users" id="nav-users-link" hidden><span class="nav-icon">👥</span>Users</a>
+        <a href="#settings" class="nav-link" data-view="settings" id="nav-settings-link" hidden><span class="nav-icon">🔑</span>API Setup</a>
       </nav>
 
       <div class="sidebar-footer">
@@ -258,6 +259,45 @@
               </tbody>
             </table>
           </div>
+        </section>
+      </section>
+
+      <section class="view" data-view="settings" hidden>
+        <header class="view-header">
+          <h1>API Setup</h1>
+          <p class="subtitle">Two separate accounts, two separate keys — Try-On and RedChief never share credentials or credits. Changes here apply immediately, no restart needed.</p>
+        </header>
+
+        <section class="panel">
+          <h2>⬆ Try-On (aivastra)</h2>
+          <p class="hint">Used by the Upload/Generate tab. Key is minted from the aivastra merchant portal's API Keys page.</p>
+          <form class="settings-form" id="aivastra-settings-form">
+            <label>Base URL
+              <input type="text" id="aivastra-base-url" placeholder="https://app.aivastra.com" />
+            </label>
+            <label>API key
+              <input type="password" id="aivastra-api-key" autocomplete="off" placeholder="leave blank to keep the current key" />
+            </label>
+            <div class="hint" id="aivastra-key-status"></div>
+            <button type="submit" class="btn-primary" id="aivastra-settings-btn">Save</button>
+          </form>
+          <div class="status" id="aivastra-settings-status"></div>
+        </section>
+
+        <section class="panel">
+          <h2>📦 RedChief (propicly)</h2>
+          <p class="hint">Used only by the RedChief tab, a separate merchant account/credit balance from Try-On above. Key is minted from the propicly merchant portal's Developers page.</p>
+          <form class="settings-form" id="propicly-settings-form">
+            <label>Base URL
+              <input type="text" id="propicly-base-url" placeholder="https://app.propicly.com" />
+            </label>
+            <label>API key
+              <input type="password" id="propicly-api-key" autocomplete="off" placeholder="leave blank to keep the current key" />
+            </label>
+            <div class="hint" id="propicly-key-status"></div>
+            <button type="submit" class="btn-primary" id="propicly-settings-btn">Save</button>
+          </form>
+          <div class="status" id="propicly-settings-status"></div>
         </section>
       </section>
 

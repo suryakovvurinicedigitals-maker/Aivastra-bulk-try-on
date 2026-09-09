@@ -695,6 +695,19 @@ select:focus, .dropzone:focus-within { outline: 2px solid var(--pink); outline-o
   width: 150px;
 }
 
+/* ---------- API setup (super admin) page ---------- */
+.settings-form { display: flex; flex-direction: column; gap: 14px; max-width: 480px; }
+.settings-form input {
+  padding: 9px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  font-size: 0.92rem;
+  width: 100%;
+}
+.settings-form button { align-self: flex-start; }
+
 /* ---------- RedChief tab ---------- */
 .redchief-dropzone { width: 100%; min-height: 120px; flex-direction: column; }
 

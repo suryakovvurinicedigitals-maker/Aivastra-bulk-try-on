@@ -54,9 +54,15 @@ const INPUT_DIR = process.env.INPUT_DIR ? path.resolve(process.env.INPUT_DIR) : 
 const OUTPUT_DIR = process.env.OUTPUT_DIR ? path.resolve(process.env.OUTPUT_DIR) : path.join(BULK_TRYON_DIR, 'output');
 
 const PORT = Number(process.env.WEB_PORT ?? 5959);
-const BASE_URL = (process.env.DEV_API_BASE_URL ?? 'https://app.aivastra.com').replace(/\/$/, '');
-const API_KEY = process.env.DEV_API_KEY;
-const cfg: DevApiConfig | undefined = API_KEY ? { baseUrl: BASE_URL, apiKey: API_KEY } : undefined;
+// These six are `let`, not `const`: the API Setup page (super admin only,
+// see applyApiSettings below) updates them in place after a save so the
+// change takes effect on the very next request, with no server restart.
+// Every route below reads cfg/propiclyCfg fresh at request time (they're
+// plain module-scope bindings, not captured into a closure snapshot), so
+// reassigning here is sufficient — no getter indirection needed.
+let BASE_URL = (process.env.DEV_API_BASE_URL ?? 'https://app.aivastra.com').replace(/\/$/, '');
+let API_KEY = process.env.DEV_API_KEY;
+let cfg: DevApiConfig | undefined = API_KEY ? { baseUrl: BASE_URL, apiKey: API_KEY } : undefined;
 const CONCURRENCY = Number(process.env.CONCURRENCY ?? 2);
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? 4000);
 const POLL_TIMEOUT_MS = Number(process.env.POLL_TIMEOUT_MS ?? 5 * 60 * 1000);
@@ -64,9 +70,67 @@ const POLL_TIMEOUT_MS = Number(process.env.POLL_TIMEOUT_MS ?? 5 * 60 * 1000);
 // RedChief tab (propicly API) — a separate merchant account/host from the
 // aivastra BASE_URL/API_KEY above. Never reuse those here: the two flows are
 // deliberately isolated so one tab's key/env changes can't affect the other.
-const PROPICLY_BASE_URL = (process.env.PROPICLY_API_BASE_URL ?? 'https://app.propicly.com').replace(/\/$/, '');
-const PROPICLY_API_KEY = process.env.PROPICLY_API_KEY;
-const propiclyCfg: PropiclyApiConfig | undefined = PROPICLY_API_KEY ? { baseUrl: PROPICLY_BASE_URL, apiKey: PROPICLY_API_KEY } : undefined;
+let PROPICLY_BASE_URL = (process.env.PROPICLY_API_BASE_URL ?? 'https://app.propicly.com').replace(/\/$/, '');
+let PROPICLY_API_KEY = process.env.PROPICLY_API_KEY;
+let propiclyCfg: PropiclyApiConfig | undefined = PROPICLY_API_KEY ? { baseUrl: PROPICLY_BASE_URL, apiKey: PROPICLY_API_KEY } : undefined;
+
+// ---- API Setup page: persist key/base-URL edits to .env and apply live ----
+const ENV_PATH = path.join(BULK_TRYON_DIR, '.env');
+
+// Rewrites specific KEY=value lines in .env in place, leaving every other
+// line (comments, blank lines, unrelated vars) untouched. A key with no
+// existing uncommented line is appended at the end rather than silently
+// dropped — matches .env.example's documented keys exactly, so this only
+// ever fills in or replaces a line the file already anticipates.
+function updateEnvFile(updates: Record<string, string>) {
+  const raw = existsSync(ENV_PATH) ? readFileSync(ENV_PATH, 'utf8') : '';
+  const eol = raw.includes('\r\n') ? '\r\n' : '\n';
+  const lines = raw.split(/\r\n|\n/);
+  const remaining = new Map(Object.entries(updates));
+  for (let i = 0; i < lines.length; i++) {
+    const match = lines[i].match(/^([A-Z0-9_]+)=/);
+    if (match && remaining.has(match[1])) {
+      lines[i] = `${match[1]}=${remaining.get(match[1])}`;
+      remaining.delete(match[1]);
+    }
+  }
+  while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+  for (const [key, value] of remaining) lines.push(`${key}=${value}`);
+  writeFileSync(ENV_PATH, lines.join(eol) + eol, 'utf8');
+}
+
+function apiKeyStatus(key: string | undefined) {
+  return { set: Boolean(key), length: key?.length ?? 0 };
+}
+
+// target: which of the two fully-isolated flows to update. baseUrl/apiKey
+// are optional independently -- an empty/omitted field means "leave this
+// one as it is", so a base-URL-only change never forces re-entering the key.
+function applyApiSettings(target: 'aivastra' | 'propicly', baseUrl: string | undefined, apiKey: string | undefined) {
+  const envUpdates: Record<string, string> = {};
+  if (target === 'aivastra') {
+    if (baseUrl) {
+      BASE_URL = baseUrl.replace(/\/$/, '');
+      envUpdates.DEV_API_BASE_URL = BASE_URL;
+    }
+    if (apiKey) {
+      API_KEY = apiKey;
+      envUpdates.DEV_API_KEY = apiKey;
+    }
+    cfg = API_KEY ? { baseUrl: BASE_URL, apiKey: API_KEY } : undefined;
+  } else {
+    if (baseUrl) {
+      PROPICLY_BASE_URL = baseUrl.replace(/\/$/, '');
+      envUpdates.PROPICLY_API_BASE_URL = PROPICLY_BASE_URL;
+    }
+    if (apiKey) {
+      PROPICLY_API_KEY = apiKey;
+      envUpdates.PROPICLY_API_KEY = apiKey;
+    }
+    propiclyCfg = PROPICLY_API_KEY ? { baseUrl: PROPICLY_BASE_URL, apiKey: PROPICLY_API_KEY } : undefined;
+  }
+  if (Object.keys(envUpdates).length > 0) updateEnvFile(envUpdates);
+}
 
 // Used only if the live dev API can't be reached — keeps the upload UI usable
 // (category dropdown, plan preview) even when DEV_API_KEY isn't set locally.
@@ -650,6 +714,44 @@ const server = http.createServer(async (req, res) => {
       }
       json(res, 200, { deleted: true });
       return;
+    }
+
+    // ---- admin: API Setup page (super admin only) ----
+    // Never returns a key's plaintext, per CLAUDE.md's secrets discipline --
+    // presence + length only, same as every other "is this set" check here.
+    if (url.pathname === '/api/admin/api-settings') {
+      if (session!.role !== 'superadmin') {
+        json(res, 403, { error: 'Super admin only.' });
+        return;
+      }
+      if (req.method === 'GET') {
+        json(res, 200, {
+          aivastra: { baseUrl: BASE_URL, key: apiKeyStatus(API_KEY) },
+          propicly: { baseUrl: PROPICLY_BASE_URL, key: apiKeyStatus(PROPICLY_API_KEY) },
+        });
+        return;
+      }
+      if (req.method === 'POST') {
+        let body: any;
+        try {
+          body = (await readJsonBody(req)) ?? {};
+        } catch {
+          json(res, 400, { error: 'invalid request body' });
+          return;
+        }
+        if (body.target !== 'aivastra' && body.target !== 'propicly') {
+          json(res, 400, { error: 'target must be "aivastra" or "propicly"' });
+          return;
+        }
+        const baseUrl = typeof body.baseUrl === 'string' ? body.baseUrl.trim() : undefined;
+        const apiKey = typeof body.apiKey === 'string' ? body.apiKey.trim() : undefined;
+        applyApiSettings(body.target, baseUrl || undefined, apiKey || undefined);
+        json(res, 200, {
+          aivastra: { baseUrl: BASE_URL, key: apiKeyStatus(API_KEY) },
+          propicly: { baseUrl: PROPICLY_BASE_URL, key: apiKeyStatus(PROPICLY_API_KEY) },
+        });
+        return;
+      }
     }
 
     if (req.method === 'GET' && url.pathname === '/api/categories') {
