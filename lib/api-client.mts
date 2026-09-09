@@ -109,3 +109,104 @@ export async function getJob(
   const res = await request(cfg, `/v1/dev/jobs/${jobId}`);
   return parseOrThrow(res);
 }
+
+// ---------------------------------------------------------------------------
+// Catalog surface (apps/api/src/modules/dev/catalog.routes.ts) — for the
+// Catalog Batch tab. Still the SAME aivastra host and DEV_API_KEY as
+// everything else in this file (unlike lib/propicly-client.mts, which is a
+// genuinely separate host/merchant account) — these three routes require a
+// 'full'-scoped key, same as /v1/dev/tryon above, so no new config is needed
+// as long as the existing key already creates try-on jobs successfully.
+// Shapes hand-kept in sync with packages/types/src/dev.ts, same as the rest
+// of this file.
+
+export type CatalogGender = 'men' | 'women' | 'boys' | 'girls';
+
+export interface CatalogAsset {
+  slug: string;
+  label: string;
+  thumbnailUrl: string;
+}
+
+/** A pose asset additionally says whether it supports a separately-selected lower garment / shoe — some poses (e.g. a close-up) don't show feet or legs at all. */
+export interface CatalogPose extends CatalogAsset {
+  hasLower: boolean;
+  hasShoes: boolean;
+}
+
+export interface CatalogOptions {
+  garmentTypes: { slug: string; label: string }[];
+  faces: CatalogAsset[];
+  backgrounds: CatalogAsset[];
+  poses: CatalogPose[];
+  lowerItems: CatalogAsset[];
+  shoeItems: CatalogAsset[];
+}
+
+/**
+ * Lists the admin-curated assets selectable for a catalog generate call,
+ * scoped to `gender` and optionally narrowed further by `garmentType` (some
+ * poses/lower/shoe items aren't valid for every garment type — passing it
+ * here is what keeps the picker showing only slugs that will actually
+ * resolve on generateCatalog below, per the route's own doc comment).
+ */
+export async function getCatalogOptions(cfg: DevApiConfig, gender: CatalogGender, garmentType?: string): Promise<CatalogOptions> {
+  const params = new URLSearchParams({ gender });
+  if (garmentType) params.set('garmentType', garmentType);
+  return parseOrThrow(await request(cfg, `/v1/dev/catalog/options?${params}`));
+}
+
+export interface CatalogLook {
+  pose: string;
+  background: string;
+}
+
+export interface CatalogGenerateBody {
+  /** base64 or a `data:image/...;base64,...` URI — sent as JSON here (this tool has no incoming multipart parser), which the route documents as fully equivalent to a multipart upload. */
+  garment: string;
+  gender: CatalogGender;
+  face: string;
+  /** 1-12 pose+background pairs; each generate call becomes exactly this many job_results rows, each its own credit charge. */
+  looks: CatalogLook[];
+  garmentType?: string;
+  lower?: string;
+  shoe?: string;
+  aspectRatio: '1:1' | '2:3' | '3:4' | '4:5';
+  resolution: 'HD' | '2K' | '4K';
+}
+
+export interface CatalogGenerateResult {
+  catalogueId: string;
+  jobs: { jobId: string; pose: string; background: string }[];
+}
+
+export async function generateCatalog(cfg: DevApiConfig, body: CatalogGenerateBody): Promise<CatalogGenerateResult> {
+  return parseOrThrow(
+    await request(cfg, '/v1/dev/catalog/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+export type CatalogJobStatus = 'QUEUED' | 'RUNNING' | 'COMPLETED' | 'FAILED';
+
+export interface CatalogueJob {
+  jobId: string;
+  status: CatalogJobStatus;
+  /** present only when status === 'COMPLETED'; a 900s-TTL presigned URL, never plural — one job = one image. */
+  imageUrl?: string;
+  /** present only when status === 'FAILED'; a plain string code (e.g. "JOB_FAILED"/"JOB_CANCELLED"), not a {code,message} object. */
+  error?: string;
+}
+
+export interface CatalogueStatus {
+  catalogueId: string;
+  jobs: CatalogueJob[];
+}
+
+/** Status of every job created by one generateCatalog call — no pagination, always the full set (capped at 12 by the looks array). */
+export async function getCatalogueStatus(cfg: DevApiConfig, catalogueId: string): Promise<CatalogueStatus> {
+  return parseOrThrow(await request(cfg, `/v1/dev/catalogues/${catalogueId}`));
+}

@@ -572,6 +572,25 @@ async function submitRedchiefRow(row) {
   renderRedchiefRows();
 }
 
+const redchiefRecordedJobs = new Set(); // job ids already reported to /api/results/record — avoids re-recording on every poll tick or on a later thumbnail refresh
+
+/** Reports a row's terminal (COMPLETED/FAILED) job to the Results page's DB — see webapp/server.mts's POST /api/results/record for why this has to be client-driven: this file is the only place that knows the product/row label for a given jobId. One record per output image on success (RedChief can return several views from a single job), one record total on failure. Fire-and-forget — a failed recording doesn't affect the tester's own view of this row, which already shows its own status/thumbnails live regardless. */
+function recordRedchiefRowResult(row) {
+  if (row.status !== 'COMPLETED' && row.status !== 'FAILED') return;
+  if (redchiefRecordedJobs.has(row.jobId)) return;
+  redchiefRecordedJobs.add(row.jobId);
+  const base = { source: 'redchief', personName: row.label, categorySlug: 'redchief', jobId: row.jobId };
+  const post = (fields) =>
+    fetch('/api/results/record', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...base, ...fields }) }).catch(
+      () => {}, // best-effort
+    );
+  if (row.status === 'COMPLETED') {
+    (row.resultUrls ?? []).forEach((url, i) => post({ status: 'COMPLETED', garmentName: `Image ${i + 1}`, imageUrl: url }));
+  } else {
+    post({ status: 'FAILED', garmentName: 'RedChief job', error: row.error ?? 'unknown error' });
+  }
+}
+
 function pollRedchiefRow(row, attempt = 0, delay = 2000) {
   const maxAttempts = 20;
   const maxDelay = 20000;
@@ -586,12 +605,14 @@ function pollRedchiefRow(row, attempt = 0, delay = 2000) {
       if (body.status === 'COMPLETED') {
         row.status = 'COMPLETED';
         row.resultUrls = body.imageUrls ?? (body.imageUrl ? [body.imageUrl] : []);
+        recordRedchiefRowResult(row);
         renderRedchiefRows();
         return;
       }
       if (body.status === 'FAILED') {
         row.status = 'FAILED';
         row.error = body.error ?? 'unknown error';
+        recordRedchiefRowResult(row);
         renderRedchiefRows();
         return;
       }
