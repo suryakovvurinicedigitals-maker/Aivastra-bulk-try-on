@@ -44,6 +44,8 @@ const catalogAddRowBtn = document.getElementById('catalog-add-row-btn');
 const catalogConfigBodyEl = document.getElementById('catalog-config-body');
 const catalogRowsPanelEl = document.getElementById('catalog-rows-panel');
 const catalogRowsEl = document.getElementById('catalog-rows');
+const catalogResultsEl = document.getElementById('catalog-results');
+const catalogClearAllBtn = document.getElementById('catalog-clear-all-btn');
 const catalogFooterBarEl = document.getElementById('catalog-footer-bar');
 const catalogRowCountEl = document.getElementById('catalog-row-count');
 const catalogSubmitBtn = document.getElementById('catalog-submit-btn');
@@ -51,6 +53,42 @@ const catalogSubmitConfirmEl = document.getElementById('catalog-submit-confirm')
 const catalogSubmitConfirmTextEl = document.getElementById('catalog-submit-confirm-text');
 const catalogSubmitConfirmCancelBtn = document.getElementById('catalog-submit-confirm-cancel-btn');
 const catalogSubmitConfirmBtn = document.getElementById('catalog-submit-confirm-btn');
+
+// Asset modal picker elements (SelectGridModal style)
+const catalogModalOverlayEl = document.getElementById('catalog-modal-overlay');
+const catalogModalTitleEl = document.getElementById('catalog-modal-title');
+const catalogModalCounterEl = document.getElementById('catalog-modal-counter');
+const catalogModalCloseBtn = document.getElementById('catalog-modal-close-btn');
+const catalogModalToolbarEl = document.getElementById('catalog-modal-toolbar');
+const catalogModalFilterChipsEl = document.getElementById('catalog-modal-filter-chips');
+const catalogModalGridEl = document.getElementById('catalog-modal-grid');
+const catalogModalEmptyEl = document.getElementById('catalog-modal-empty');
+const catalogModalClearBtn = document.getElementById('catalog-modal-clear-btn');
+const catalogModalDoneBtn = document.getElementById('catalog-modal-done-btn');
+
+const CATALOG_VISIBLE_PAGE_CAP = 10;
+
+const CATALOG_ASSET_METADATA = {
+  face: { title: 'Faces (Models)', required: true, aspect: '3/4', optionsKey: 'faces', setKey: 'faces' },
+  lower: { title: 'Lower Garments', required: false, aspect: '1/1', optionsKey: 'lowerItems', setKey: 'lowers' },
+  shoe: { title: 'Footwear', required: false, aspect: '1/1', optionsKey: 'shoeItems', setKey: 'shoes' },
+  pose: { title: 'Poses', required: true, aspect: '3/4', optionsKey: 'poses', setKey: 'poses' },
+  background: { title: 'Backgrounds', required: true, aspect: '3/4', optionsKey: 'backgrounds', setKey: 'backgrounds' },
+};
+
+const CATALOG_FILTER_TAGS = {
+  background: ['All', 'Studio', 'Outdoor', 'Wall', 'Street', 'Room', 'Nature', 'Interior', 'Solid'],
+  pose: ['All', 'Front', 'Side', 'Pocket', 'Walking', 'Sitting', 'Standing'],
+  face: ['All'],
+  lower: ['All'],
+  shoe: ['All'],
+};
+
+let catalogModalState = {
+  isOpen: false,
+  kind: null,
+  activeFilter: 'All',
+};
 
 let catalogGarments = [];
 let catalogRowCounter = 0;
@@ -86,6 +124,7 @@ function catalogEscapeHtml(s) {
 }
 
 window.enterCatalogView = async function enterCatalogView() {
+  initCatalogModalEvents();
   if (catalogLoaded) return;
   catalogLoaded = true;
   await loadCatalogBatchOptions();
@@ -128,10 +167,16 @@ async function loadCatalogBatchOptions() {
   renderCatalog();
 }
 
+function catalogFileNameToLabel(file) {
+  if (!file || !file.name) return `Garment ${++catalogRowCounter}`;
+  const base = file.name.replace(/\.[^/.]+$/, '').trim();
+  return base || `Garment ${++catalogRowCounter}`;
+}
+
 function catalogNewGarment(file) {
   return {
     id: catalogUid('garment'),
-    label: `Garment ${++catalogRowCounter}`,
+    label: file ? catalogFileNameToLabel(file) : `Garment ${++catalogRowCounter}`,
     file: file ?? null,
     previewUrl: file ? URL.createObjectURL(file) : null,
     status: 'idle', // idle | submitting | RUNNING | COMPLETED | FAILED | PARTIAL
@@ -144,6 +189,14 @@ catalogAddRowBtn.addEventListener('click', () => {
   catalogGarments.push(catalogNewGarment(null));
   renderCatalog();
 });
+
+if (catalogClearAllBtn) {
+  catalogClearAllBtn.addEventListener('click', () => {
+    for (const g of catalogGarments) catalogClearGarmentRuns(g);
+    catalogGarments = [];
+    renderCatalog();
+  });
+}
 
 function handleCatalogBulkFiles(files) {
   const images = filterImageFiles(files);
@@ -159,8 +212,12 @@ function catalogFindGarment(garmentId) {
 
 function setCatalogGarmentFile(garmentId, file) {
   const garment = catalogFindGarment(garmentId);
+  if (!garment) return;
   garment.file = file;
   garment.previewUrl = URL.createObjectURL(file);
+  if (!garment.label || /^Garment\s+\d+$/i.test(garment.label)) {
+    garment.label = catalogFileNameToLabel(file);
+  }
   renderCatalog();
 }
 
@@ -245,29 +302,80 @@ function catalogBatchIsValid() {
   return Boolean(catalogBatch.options) && catalogBatch.faces.size > 0 && catalogBatch.poses.size > 0 && catalogBatch.backgrounds.size > 0;
 }
 
-function catalogGarmentSlotHtml(garment) {
-  if (garment.file) {
-    return `
-      <div class="dropzone redchief-dropzone redchief-slot-filled">
-        <img class="redchief-slot-preview" src="${garment.previewUrl ?? ''}" />
-        <button type="button" class="redchief-slot-clear" title="Clear">×</button>
-      </div>`;
-  }
+function catalogAssetTileHtml(kind, asset, selected, aspect = '3/4') {
+  const isSquare = aspect === '1/1';
   return `
-    <div class="dropzone redchief-dropzone redchief-slot-empty" tabindex="0">
-      <input type="file" class="catalog-garment-input" accept="image/*" hidden />
-      <span class="icon">⬆</span>
-      <span>Choose garment photo</span>
+    <div class="catalog-asset-card${selected ? ' selected' : ''}" data-kind="${kind}" data-slug="${catalogEscapeHtml(asset.slug)}" role="button" tabindex="0" title="${catalogEscapeHtml(asset.label)}">
+      <div class="catalog-asset-thumb-wrap${isSquare ? ' square' : ''}">
+        <img src="${asset.thumbnailUrl}" alt="${catalogEscapeHtml(asset.label)}" loading="lazy" />
+        <span class="catalog-asset-check" aria-hidden="true">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="20 6 9 17 4 12"/>
+          </svg>
+        </span>
+      </div>
     </div>`;
 }
 
-function catalogAssetTileHtml(kind, asset, selected) {
+function catalogAssetMoreTileHtml(kind, extraCount, aspect = '3/4') {
+  const isSquare = aspect === '1/1';
+  const meta = CATALOG_ASSET_METADATA[kind] || {};
   return `
-    <label class="catalog-asset-item${selected ? ' selected' : ''}" data-kind="${kind}" data-slug="${asset.slug}">
-      <input type="checkbox" hidden${selected ? ' checked' : ''} />
-      <img src="${asset.thumbnailUrl}" alt="" loading="lazy" />
-      <span>${catalogEscapeHtml(asset.label)}</span>
-    </label>`;
+    <button type="button" class="catalog-asset-more-card${isSquare ? ' square' : ''}" data-kind="${kind}" title="View all selected ${catalogEscapeHtml(meta.title || '')}">
+      <span class="catalog-asset-more-count">+${extraCount}</span>
+      <span class="catalog-asset-more-text">more</span>
+    </button>`;
+}
+
+function catalogAssetPickersHtml() {
+  const o = catalogBatch.options;
+  if (!o) return '';
+
+  const sections = ['face', 'lower', 'shoe', 'pose', 'background'];
+  return sections.map((kind) => {
+    const meta = CATALOG_ASSET_METADATA[kind];
+    const items = o[meta.optionsKey] ?? [];
+    if (items.length === 0 && !meta.required) return '';
+
+    const set = catalogBatch[meta.setKey];
+    const selectedItems = items.filter((i) => set.has(i.slug));
+    const unselectedItems = items.filter((i) => !set.has(i.slug));
+
+    let cardsHtml = '';
+    if (selectedItems.length <= CATALOG_VISIBLE_PAGE_CAP) {
+      const slotsLeft = CATALOG_VISIBLE_PAGE_CAP - selectedItems.length;
+      const visible = [...selectedItems, ...unselectedItems.slice(0, slotsLeft)];
+      cardsHtml = visible.map((item) => catalogAssetTileHtml(kind, item, set.has(item.slug), meta.aspect)).join('');
+    } else {
+      const visible = selectedItems.slice(0, CATALOG_VISIBLE_PAGE_CAP - 1);
+      const extraCount = selectedItems.length - (CATALOG_VISIBLE_PAGE_CAP - 1);
+      cardsHtml = visible.map((item) => catalogAssetTileHtml(kind, item, true, meta.aspect)).join('') +
+        catalogAssetMoreTileHtml(kind, extraCount, meta.aspect);
+    }
+
+    return `
+      <div class="catalog-asset-section" data-kind="${kind}">
+        <div class="catalog-asset-section-header">
+          <div class="catalog-asset-header-left">
+            <span class="catalog-asset-section-label">${meta.title}</span>
+            <span class="catalog-asset-req-badge">${meta.required ? '(required)' : '(optional)'}</span>
+            ${set.size > 0 ? `<span class="catalog-selected-badge">${set.size} selected</span>` : ''}
+          </div>
+          <div class="catalog-asset-header-right">
+            ${items.length > CATALOG_VISIBLE_PAGE_CAP ? `
+              <button type="button" class="catalog-view-more-btn" data-kind="${kind}" title="Browse all ${items.length} options">
+                <span>View all (${items.length})</span>
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <polyline points="9 18 15 12 9 6"/>
+                </svg>
+              </button>` : ''}
+          </div>
+        </div>
+        <div class="catalog-asset-grid">
+          ${cardsHtml || '<p class="hint">No items available.</p>'}
+        </div>
+      </div>`;
+  }).join('') + catalogLooksSummaryHtml();
 }
 
 function catalogLooksSummaryHtml() {
@@ -294,79 +402,82 @@ function catalogLooksSummaryHtml() {
 }
 
 function catalogConfigFieldsHtml() {
-  const garmentTypeOptions = (catalogBatch.options?.garmentTypes ?? [])
-    .map((t) => `<option value="${t.slug}"${catalogBatch.garmentType === t.slug ? ' selected' : ''}>${catalogEscapeHtml(t.label)}</option>`)
-    .join('');
+  const garmentTypes = catalogBatch.options?.garmentTypes ?? [];
   return `
-    <div class="catalog-row-fields">
-      <label>Gender
-        <select id="catalog-gender-select">
-          ${CATALOG_GENDERS.map((g) => `<option value="${g}"${catalogBatch.gender === g ? ' selected' : ''}>${CATALOG_GENDER_LABEL[g]}</option>`).join('')}
-        </select>
-      </label>
-      <label>Garment type <span class="hint">(optional)</span>
-        <select id="catalog-garment-type-select">
-          <option value=""${catalogBatch.garmentType ? '' : ' selected'}>— any —</option>
-          ${garmentTypeOptions}
-        </select>
-      </label>
-      <label>Aspect ratio
-        <select id="catalog-aspect-select">
-          ${CATALOG_ASPECT_RATIOS.map((a) => `<option value="${a}"${catalogBatch.aspectRatio === a ? ' selected' : ''}>${a}</option>`).join('')}
-        </select>
-      </label>
-      <label>Resolution
-        <select id="catalog-resolution-select">
-          ${CATALOG_RESOLUTIONS.map((r) => `<option value="${r}"${catalogBatch.resolution === r ? ' selected' : ''}>${r}</option>`).join('')}
-        </select>
-      </label>
+    <div class="catalog-controls-group">
+      <div class="control-row">
+        <span class="control-row-label">Gender</span>
+        <div class="segmented-control" id="catalog-gender-pills" role="tablist" aria-label="Gender">
+          ${CATALOG_GENDERS.map((g) => `
+            <button type="button" class="segmented-pill${catalogBatch.gender === g ? ' active' : ''}" data-value="${g}" role="tab" aria-selected="${catalogBatch.gender === g}">
+              ${CATALOG_GENDER_LABEL[g]}
+            </button>
+          `).join('')}
+        </div>
+      </div>
+      <div class="control-row control-row-top">
+        <span class="control-row-label">Garment type</span>
+        <div class="catalog-pill-cloud" id="catalog-garment-type-pills" role="tablist" aria-label="Garment type">
+          <button type="button" class="segmented-pill${!catalogBatch.garmentType ? ' active' : ''}" data-value="" role="tab" aria-selected="${!catalogBatch.garmentType}">
+            Any
+          </button>
+          ${garmentTypes.map((t) => `
+            <button type="button" class="segmented-pill${catalogBatch.garmentType === t.slug ? ' active' : ''}" data-value="${t.slug}" role="tab" aria-selected="${catalogBatch.garmentType === t.slug}">
+              ${catalogEscapeHtml(t.label)}
+            </button>
+          `).join('')}
+        </div>
+      </div>
+      <div class="control-row">
+        <span class="control-row-label">Aspect ratio</span>
+        <div class="segmented-control" id="catalog-aspect-pills" role="tablist" aria-label="Aspect ratio">
+          ${CATALOG_ASPECT_RATIOS.map((a) => `
+            <button type="button" class="segmented-pill${catalogBatch.aspectRatio === a ? ' active' : ''}" data-value="${a}" role="tab" aria-selected="${catalogBatch.aspectRatio === a}">
+              ${a}
+            </button>
+          `).join('')}
+        </div>
+      </div>
     </div>
     ${catalogBatch.optionsLoading ? '<p class="hint">Loading assets for this gender…</p>' : ''}
     ${catalogBatch.optionsError ? `<p class="redchief-validation-msg">${catalogEscapeHtml(catalogBatch.optionsError)}</p>` : ''}
     ${catalogBatch.options ? catalogAssetPickersHtml() : ''}`;
 }
 
-function catalogAssetPickersHtml() {
-  const o = catalogBatch.options;
-  return `
-    <div class="catalog-asset-section">
-      <div class="catalog-asset-section-label">Faces (select as many as you want to test — required)</div>
-      <div class="catalog-asset-grid">${o.faces.map((f) => catalogAssetTileHtml('face', f, catalogBatch.faces.has(f.slug))).join('')}</div>
-    </div>
-    <div class="catalog-asset-section">
-      <div class="catalog-asset-section-label">Lower <span class="hint">(optional — select any to test each, or leave empty for none)</span></div>
-      <div class="catalog-asset-grid">${o.lowerItems.map((l) => catalogAssetTileHtml('lower', l, catalogBatch.lowers.has(l.slug))).join('')}</div>
-    </div>
-    <div class="catalog-asset-section">
-      <div class="catalog-asset-section-label">Shoe <span class="hint">(optional — select any to test each, or leave empty for none)</span></div>
-      <div class="catalog-asset-grid">${o.shoeItems.map((s) => catalogAssetTileHtml('shoe', s, catalogBatch.shoes.has(s.slug))).join('')}</div>
-    </div>
-    <div class="catalog-asset-section">
-      <div class="catalog-asset-section-label">Poses (select at least one)</div>
-      <div class="catalog-asset-grid">${o.poses.map((p) => catalogAssetTileHtml('pose', p, catalogBatch.poses.has(p.slug))).join('')}</div>
-    </div>
-    <div class="catalog-asset-section">
-      <div class="catalog-asset-section-label">Backgrounds (select at least one)</div>
-      <div class="catalog-asset-grid">${o.backgrounds.map((b) => catalogAssetTileHtml('background', b, catalogBatch.backgrounds.has(b.slug))).join('')}</div>
-    </div>
-    ${catalogLooksSummaryHtml()}`;
-}
 
 function catalogGarmentCardHtml(garment) {
   const invalid = garment.status === 'idle' && !garment.file;
+  if (garment.previewUrl) {
+    const badgeHtml = garment.status !== 'idle'
+      ? `<span class="catalog-garment-badge redchief-status-badge ${CATALOG_STATUS_CLASS[garment.status] ?? 'muted'}">${CATALOG_STATUS_LABEL[garment.status] ?? garment.status}</span>`
+      : '';
+    return `
+      <div class="catalog-garment-card upload-thumb" data-row="${garment.id}">
+        <img src="${garment.previewUrl}" alt="${catalogEscapeHtml(garment.label)}" title="${catalogEscapeHtml(garment.label)}" />
+        <button type="button" class="thumb-remove catalog-garment-remove" title="Remove" aria-label="Remove">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="18" y1="6" x2="6" y2="18"/>
+            <line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+        ${badgeHtml}
+      </div>`;
+  }
   return `
-    <div class="redchief-row-card${invalid ? ' invalid' : ''}" data-row="${garment.id}">
-      <div class="redchief-row-header">
-        <span class="redchief-row-index">Garment</span>
-        <input type="text" class="redchief-row-label-input" value="${catalogEscapeHtml(garment.label)}" />
-        <button type="button" class="link-btn danger redchief-row-remove-btn" title="Remove">×</button>
+    <div class="catalog-garment-card upload-thumb catalog-garment-empty dropzone redchief-dropzone${invalid ? ' invalid' : ''}" data-row="${garment.id}" tabindex="0" title="Click or drop photo">
+      <input type="file" class="catalog-garment-input" accept="image/*" hidden />
+      <button type="button" class="thumb-remove catalog-garment-remove" title="Remove slot" aria-label="Remove slot">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="18" y1="6" x2="6" y2="18"/>
+          <line x1="6" y1="6" x2="18" y2="18"/>
+        </svg>
+      </button>
+      <div class="catalog-empty-placeholder">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+        </svg>
+        <span>Add photo</span>
       </div>
-      <div class="redchief-slot catalog-garment-slot">
-        <div class="redchief-slot-label">Garment photo</div>
-        ${catalogGarmentSlotHtml(garment)}
-      </div>
-      ${invalid ? '<p class="redchief-validation-msg">Still needs a garment photo.</p>' : ''}
-      ${catalogGarmentStatusHtml(garment)}
     </div>`;
 }
 
@@ -422,12 +533,44 @@ function catalogGarmentStatusHtml(garment) {
   if (garment.error) body += ` <span class="redchief-error-code">${catalogEscapeHtml(garment.error)}</span>`;
   if (garment.status === 'FAILED' || garment.status === 'PARTIAL') {
     const failedCount = garment.runs.filter((r) => r.status === 'FAILED').length;
-    body += ` <button type="button" class="btn-secondary btn-small catalog-row-retry-btn">Retry ${failedCount} failed combination${failedCount === 1 ? '' : 's'}</button>`;
+    body += ` <button type="button" class="btn-secondary btn-small catalog-row-retry-btn" data-row="${garment.id}">Retry ${failedCount} failed combination${failedCount === 1 ? '' : 's'}</button>`;
   }
   if (garment.runs.length > 0) {
     body += `<div class="catalog-runs">${garment.runs.map((r) => catalogRunStatusHtml(garment, r)).join('')}</div>`;
   }
   return `<div class="redchief-row-status">${body}</div>`;
+}
+
+function catalogResultsHtml() {
+  const withRuns = catalogGarments.filter((g) => g.status !== 'idle' && (g.runs.length > 0 || g.error));
+  if (withRuns.length === 0) return '';
+  return `
+    <div class="catalog-results-panel">
+      <h3 class="catalog-results-title">Generation Results</h3>
+      <div class="catalog-results-list">
+        ${withRuns.map((g) => {
+          const cls = CATALOG_STATUS_CLASS[g.status] ?? 'muted';
+          const label = CATALOG_STATUS_LABEL[g.status] ?? g.status;
+          const failedCount = g.runs.filter((r) => r.status === 'FAILED').length;
+          return `
+            <div class="catalog-result-row-card" data-row="${g.id}">
+              <div class="catalog-result-row-header">
+                ${g.previewUrl ? `<img class="catalog-result-row-thumb" src="${g.previewUrl}" alt="${catalogEscapeHtml(g.label)}" />` : ''}
+                <div class="catalog-result-row-info">
+                  <span class="catalog-result-row-name">${catalogEscapeHtml(g.label)}</span>
+                  <span class="redchief-status-badge ${cls}">${label}</span>
+                </div>
+                ${(g.status === 'FAILED' || g.status === 'PARTIAL') ? `
+                  <button type="button" class="btn-secondary btn-small catalog-row-retry-btn" data-row="${g.id}">
+                    Retry ${failedCount} failed combination${failedCount === 1 ? '' : 's'}
+                  </button>` : ''}
+              </div>
+              ${g.error ? `<p class="redchief-error-code">${catalogEscapeHtml(g.error)}</p>` : ''}
+              ${g.runs.length > 0 ? `<div class="catalog-runs">${g.runs.map((r) => catalogRunStatusHtml(g, r)).join('')}</div>` : ''}
+            </div>`;
+        }).join('')}
+      </div>
+    </div>`;
 }
 
 function catalogSubmittableGarments() {
@@ -455,6 +598,9 @@ function renderCatalog() {
   catalogConfigBodyEl.innerHTML = catalogConfigFieldsHtml();
   wireCatalogConfigEvents();
   catalogRowsEl.innerHTML = catalogGarments.map(catalogGarmentCardHtml).join('');
+  if (catalogResultsEl) {
+    catalogResultsEl.innerHTML = catalogResultsHtml();
+  }
   wireCatalogGarmentEvents();
   catalogRowsPanelEl.hidden = catalogGarments.length === 0;
   catalogFooterBarEl.hidden = catalogGarments.length === 0;
@@ -475,63 +621,211 @@ function catalogResetBatchSelections() {
 const CATALOG_ASSET_SET_KEY = { face: 'faces', lower: 'lowers', shoe: 'shoes', pose: 'poses', background: 'backgrounds' };
 
 function wireCatalogConfigEvents() {
-  document.getElementById('catalog-gender-select').addEventListener('change', (e) => {
-    catalogBatch.gender = e.target.value;
-    catalogBatch.garmentType = '';
-    catalogResetBatchSelections();
-    loadCatalogBatchOptions();
-  });
-  document.getElementById('catalog-garment-type-select').addEventListener('change', (e) => {
-    catalogBatch.garmentType = e.target.value;
-    catalogResetBatchSelections();
-    loadCatalogBatchOptions();
-  });
-  document.getElementById('catalog-aspect-select').addEventListener('change', (e) => {
-    catalogBatch.aspectRatio = e.target.value;
-  });
-  document.getElementById('catalog-resolution-select').addEventListener('change', (e) => {
-    catalogBatch.resolution = e.target.value;
-  });
+  for (const btn of catalogConfigBodyEl.querySelectorAll('#catalog-gender-pills .segmented-pill')) {
+    btn.addEventListener('click', () => {
+      const val = btn.dataset.value;
+      if (catalogBatch.gender === val) return;
+      catalogBatch.gender = val;
+      catalogBatch.garmentType = '';
+      catalogResetBatchSelections();
+      loadCatalogBatchOptions();
+    });
+  }
 
-  for (const tile of catalogConfigBodyEl.querySelectorAll('.catalog-asset-item')) {
-    tile.addEventListener('click', (e) => {
-      e.preventDefault(); // this is a <label>; default behavior would toggle the hidden checkbox redundantly with our own state
-      const set = catalogBatch[CATALOG_ASSET_SET_KEY[tile.dataset.kind]];
-      const slug = tile.dataset.slug;
+  for (const btn of catalogConfigBodyEl.querySelectorAll('#catalog-garment-type-pills .segmented-pill')) {
+    btn.addEventListener('click', () => {
+      const val = btn.dataset.value;
+      if (catalogBatch.garmentType === val) return;
+      catalogBatch.garmentType = val;
+      catalogResetBatchSelections();
+      loadCatalogBatchOptions();
+    });
+  }
+
+  for (const btn of catalogConfigBodyEl.querySelectorAll('#catalog-aspect-pills .segmented-pill')) {
+    btn.addEventListener('click', () => {
+      const val = btn.dataset.value;
+      if (catalogBatch.aspectRatio === val) return;
+      catalogBatch.aspectRatio = val;
+      renderCatalog();
+    });
+  }
+
+  for (const card of catalogConfigBodyEl.querySelectorAll('.catalog-asset-card')) {
+    card.addEventListener('click', () => {
+      const kind = card.dataset.kind;
+      const slug = card.dataset.slug;
+      const meta = CATALOG_ASSET_METADATA[kind];
+      if (!meta) return;
+      const set = catalogBatch[meta.setKey];
       if (set.has(slug)) set.delete(slug);
       else set.add(slug);
       renderCatalog(); // every asset axis affects validity and/or the combination/job-count summary
     });
   }
+
+  for (const btn of catalogConfigBodyEl.querySelectorAll('.catalog-view-more-btn, .catalog-asset-more-card')) {
+    btn.addEventListener('click', () => {
+      openCatalogAssetModal(btn.dataset.kind);
+    });
+  }
+}
+
+function openCatalogAssetModal(kind) {
+  const meta = CATALOG_ASSET_METADATA[kind];
+  if (!meta || !catalogBatch.options) return;
+
+  catalogModalState.isOpen = true;
+  catalogModalState.kind = kind;
+  catalogModalState.activeFilter = 'All';
+
+  catalogModalTitleEl.textContent = `Select ${meta.title}`;
+
+  const tags = CATALOG_FILTER_TAGS[kind] ?? ['All'];
+  if (tags.length > 1) {
+    catalogModalFilterChipsEl.innerHTML = tags.map((tag) => `
+      <button type="button" class="catalog-modal-chip${tag === 'All' ? ' active' : ''}" data-tag="${catalogEscapeHtml(tag)}">
+        ${catalogEscapeHtml(tag)}
+      </button>
+    `).join('');
+    if (catalogModalToolbarEl) catalogModalToolbarEl.hidden = false;
+  } else {
+    catalogModalFilterChipsEl.innerHTML = '';
+    if (catalogModalToolbarEl) catalogModalToolbarEl.hidden = true;
+  }
+
+  updateCatalogModalCounter();
+  renderCatalogModalGrid();
+
+  catalogModalOverlayEl.hidden = false;
+  document.body.style.overflow = 'hidden';
+}
+
+function closeCatalogAssetModal() {
+  if (!catalogModalState.isOpen) return;
+  catalogModalState.isOpen = false;
+  catalogModalState.kind = null;
+  catalogModalOverlayEl.hidden = true;
+  document.body.style.overflow = '';
+  renderCatalog();
+}
+
+function updateCatalogModalCounter() {
+  const kind = catalogModalState.kind;
+  if (!kind) return;
+  const setKey = CATALOG_ASSET_METADATA[kind].setKey;
+  const count = catalogBatch[setKey].size;
+  catalogModalCounterEl.textContent = `${count} selected`;
+  catalogModalClearBtn.disabled = count === 0;
+}
+
+function renderCatalogModalGrid() {
+  const kind = catalogModalState.kind;
+  if (!kind || !catalogBatch.options) return;
+
+  const meta = CATALOG_ASSET_METADATA[kind];
+  const allItems = catalogBatch.options[meta.optionsKey] ?? [];
+  const set = catalogBatch[meta.setKey];
+  const filterTag = catalogModalState.activeFilter;
+
+  const filtered = allItems.filter((item) => {
+    if (filterTag && filterTag !== 'All') {
+      const tagLower = filterTag.toLowerCase();
+      const matchLabel = item.label && item.label.toLowerCase().includes(tagLower);
+      const matchSlug = item.slug && item.slug.toLowerCase().includes(tagLower);
+      if (!matchLabel && !matchSlug) return false;
+    }
+    return true;
+  });
+
+  if (filtered.length === 0) {
+    catalogModalGridEl.innerHTML = '';
+    catalogModalEmptyEl.hidden = false;
+  } else {
+    catalogModalEmptyEl.hidden = true;
+    catalogModalGridEl.innerHTML = filtered.map((item) => {
+      const isSelected = set.has(item.slug);
+      return catalogAssetTileHtml(kind, item, isSelected, meta.aspect);
+    }).join('');
+  }
+}
+
+let catalogModalEventsInitialized = false;
+function initCatalogModalEvents() {
+  if (catalogModalEventsInitialized || !catalogModalOverlayEl) return;
+  catalogModalEventsInitialized = true;
+
+  catalogModalCloseBtn.addEventListener('click', closeCatalogAssetModal);
+  catalogModalDoneBtn.addEventListener('click', closeCatalogAssetModal);
+  catalogModalOverlayEl.addEventListener('click', (e) => {
+    if (e.target === catalogModalOverlayEl) closeCatalogAssetModal();
+  });
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && catalogModalState.isOpen) closeCatalogAssetModal();
+  });
+
+  catalogModalFilterChipsEl.addEventListener('click', (e) => {
+    const chip = e.target.closest('.catalog-modal-chip');
+    if (!chip) return;
+    const tag = chip.dataset.tag;
+    if (catalogModalState.activeFilter === tag) return;
+    catalogModalState.activeFilter = tag;
+    for (const c of catalogModalFilterChipsEl.querySelectorAll('.catalog-modal-chip')) {
+      c.classList.toggle('active', c.dataset.tag === tag);
+    }
+    renderCatalogModalGrid();
+  });
+
+  catalogModalGridEl.addEventListener('click', (e) => {
+    const card = e.target.closest('.catalog-asset-card');
+    if (!card) return;
+    const kind = card.dataset.kind;
+    const slug = card.dataset.slug;
+    const meta = CATALOG_ASSET_METADATA[kind];
+    if (!meta) return;
+    const set = catalogBatch[meta.setKey];
+
+    if (set.has(slug)) {
+      set.delete(slug);
+      card.classList.remove('selected');
+    } else {
+      set.add(slug);
+      card.classList.add('selected');
+    }
+    updateCatalogModalCounter();
+  });
+
+  catalogModalClearBtn.addEventListener('click', () => {
+    const kind = catalogModalState.kind;
+    if (!kind) return;
+    const setKey = CATALOG_ASSET_METADATA[kind].setKey;
+    catalogBatch[setKey].clear();
+    for (const card of catalogModalGridEl.querySelectorAll('.catalog-asset-card.selected')) {
+      card.classList.remove('selected');
+    }
+    updateCatalogModalCounter();
+  });
 }
 
 function wireCatalogGarmentEvents() {
-  for (const card of catalogRowsEl.querySelectorAll('.redchief-row-card')) {
+  for (const card of catalogRowsEl.querySelectorAll('.catalog-garment-card')) {
     const garmentId = card.dataset.row;
     const garment = catalogFindGarment(garmentId);
     if (!garment) continue;
 
-    card.querySelector('.redchief-row-label-input').addEventListener('change', (e) => {
-      const value = e.target.value.trim();
-      garment.label = value || garment.label; // never blank — revert if cleared
-      e.target.value = garment.label;
-    });
-    card.querySelector('.redchief-row-remove-btn').addEventListener('click', () => removeCatalogGarment(garmentId));
-
-    const clearBtn = card.querySelector('.redchief-slot-clear');
-    if (clearBtn) {
-      clearBtn.addEventListener('click', (e) => {
+    const removeBtn = card.querySelector('.catalog-garment-remove');
+    if (removeBtn) {
+      removeBtn.addEventListener('click', (e) => {
         e.stopPropagation();
-        clearCatalogGarmentFile(garmentId);
+        removeCatalogGarment(garmentId);
       });
-    } else {
-      const dz = card.querySelector('.catalog-garment-slot .redchief-dropzone');
+    }
+
+    const dz = card.querySelector('.catalog-garment-empty');
+    if (dz) {
       const input = card.querySelector('.catalog-garment-input');
       dz.addEventListener('click', (e) => {
-        // Same synthetic-click guard as app.js's wireDropzone / redchief.js's
-        // per-slot dropzones: input.click() re-dispatches a bubbling click on
-        // the (hidden) input itself, which would otherwise re-enter this
-        // handler and call input.click() again, forever.
+        if (e.target.closest('.catalog-garment-remove')) return;
         if (e.target.tagName === 'INPUT') return;
         input.click();
       });
@@ -550,11 +844,13 @@ function wireCatalogGarmentEvents() {
         input.value = '';
       });
     }
+  }
 
-    const retryBtn = card.querySelector('.catalog-row-retry-btn');
-    if (retryBtn) retryBtn.addEventListener('click', () => retryCatalogGarment(garmentId));
-
-    for (const img of card.querySelectorAll('.redchief-result-cell img')) {
+  if (catalogResultsEl) {
+    for (const retryBtn of catalogResultsEl.querySelectorAll('.catalog-row-retry-btn')) {
+      retryBtn.addEventListener('click', () => retryCatalogGarment(retryBtn.dataset.row));
+    }
+    for (const img of catalogResultsEl.querySelectorAll('.redchief-result-cell img')) {
       img.addEventListener('error', () => refreshCatalogGarmentRun(img.dataset.row, img.dataset.run, img.dataset.job));
     }
   }
@@ -795,3 +1091,6 @@ function retryCatalogGarment(garmentId) {
       renderCatalog();
     });
 }
+
+initCatalogModalEvents();
+

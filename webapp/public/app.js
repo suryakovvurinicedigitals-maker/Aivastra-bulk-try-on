@@ -25,7 +25,6 @@ const planSummaryEl = document.getElementById('plan-summary');
 const sidebarBalanceEl = document.getElementById('sidebar-balance');
 
 const selectionSummaryEl = document.getElementById('selection-summary');
-const clearSelectionBtn = document.getElementById('clear-selection-btn');
 
 const generateBtn = document.getElementById('generate-btn');
 const confirmPanelEl = document.getElementById('confirm-panel');
@@ -88,12 +87,15 @@ const aivastraBaseUrlEl = document.getElementById('aivastra-base-url');
 const aivastraApiKeyEl = document.getElementById('aivastra-api-key');
 const aivastraKeyStatusEl = document.getElementById('aivastra-key-status');
 const aivastraSettingsBtn = document.getElementById('aivastra-settings-btn');
+const aivastraTestBtn = document.getElementById('aivastra-test-btn');
 const aivastraSettingsStatusEl = document.getElementById('aivastra-settings-status');
+
 const propiclySettingsForm = document.getElementById('propicly-settings-form');
 const propiclyBaseUrlEl = document.getElementById('propicly-base-url');
 const propiclyApiKeyEl = document.getElementById('propicly-api-key');
 const propiclyKeyStatusEl = document.getElementById('propicly-key-status');
 const propiclySettingsBtn = document.getElementById('propicly-settings-btn');
+const propiclyTestBtn = document.getElementById('propicly-test-btn');
 const propiclySettingsStatusEl = document.getElementById('propicly-settings-status');
 
 // ---------- auth ----------
@@ -108,9 +110,12 @@ async function loadCurrentUser() {
   currentUser = await res.json();
   sidebarUserEl.hidden = false;
   sidebarUsernameEl.textContent = currentUser.username;
-  sidebarRoleEl.textContent = currentUser.role === 'superadmin' ? 'super admin' : 'user';
-  navUsersLink.hidden = currentUser.role !== 'superadmin';
-  navSettingsLink.hidden = currentUser.role !== 'superadmin';
+  const isAdmin = currentUser.role === 'superadmin' || currentUser.role === 'admin';
+  sidebarRoleEl.textContent = isAdmin ? 'admin' : 'user';
+  const avatarEl = document.getElementById('sidebar-avatar');
+  if (avatarEl) avatarEl.textContent = (currentUser.username || 'U').charAt(0).toUpperCase();
+  if (navUsersLink) navUsersLink.hidden = !isAdmin;
+  if (navSettingsLink) navSettingsLink.hidden = !isAdmin;
   return true;
 }
 
@@ -121,19 +126,22 @@ logoutBtn.addEventListener('click', async () => {
 
 // ---------- router ----------
 function setView(name) {
-  // A non-superadmin can't reach the Users page even by typing the hash
-  // directly — the nav link is hidden, but the hash itself is always
-  // reachable, so this is the actual enforcement (the server-side 403 on
-  // /api/admin/users is the real guard; this just avoids showing a broken page).
-  if ((name === 'users' || name === 'settings') && currentUser?.role !== 'superadmin') name = 'upload';
+  // Non-admin users cannot access the Users page or API Setup page
+  const isAdmin = currentUser?.role === 'superadmin' || currentUser?.role === 'admin';
+  if ((name === 'users' || name === 'settings') && !isAdmin) {
+    name = 'upload';
+    if (location.hash && location.hash !== '#upload') {
+      history.replaceState(null, '', '#upload');
+    }
+  }
   const target = views.some((v) => v.dataset.view === name) ? name : 'upload';
   for (const v of views) v.hidden = v.dataset.view !== target;
   for (const l of navLinks) l.classList.toggle('active', l.dataset.view === target);
   if (target === 'upload') enterUploadView();
   if (target === 'results') loadResults(false);
   else stopResultsPolling();
-  if (target === 'users') loadUsers();
-  if (target === 'settings') loadApiSettings();
+  if (target === 'users' && isAdmin) loadUsers();
+  if (target === 'settings' && isAdmin) loadApiSettings();
   if (target === 'redchief') window.enterRedchiefView?.();
   if (target === 'catalog') window.enterCatalogView?.();
 }
@@ -141,19 +149,28 @@ window.addEventListener('hashchange', () => setView(location.hash.slice(1)));
 
 // ---------- users (super admin) ----------
 function userRowHtml(u) {
-  const created = new Date(u.createdAt).toLocaleDateString();
+  const created = new Date(u.createdAt).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+  const isYou = u.username === currentUser?.username;
+  const isSuperadmin = u.role === 'superadmin';
+  const roleLabel = isSuperadmin ? 'Admin' : 'User';
   const removeBtn =
-    u.role === 'superadmin'
-      ? ''
-      : `<button type="button" class="btn-danger btn-small remove-user-btn" data-username="${u.username}">Remove</button>`;
+    isSuperadmin || isYou
+      ? '<span class="chip chip-muted">Protected</span>'
+      : `<button type="button" class="btn-ghost-danger btn-small remove-user-btn" data-username="${u.username}">Remove</button>`;
   return `
-    <tr>
-      <td>${u.username}${u.username === currentUser?.username ? ' <span class="empty">(you)</span>' : ''}</td>
-      <td><span class="role-badge ${u.role}">${u.role === 'superadmin' ? 'Super admin' : 'User'}</span></td>
-      <td>${created}</td>
+    <tr data-username="${u.username}">
+      <td>
+        <div class="user-cell">
+          <div class="user-avatar">${(u.username || 'U').charAt(0).toUpperCase()}</div>
+          <span class="user-name">${u.username}</span>
+          ${isYou ? '<span class="chip chip-accent">You</span>' : ''}
+        </div>
+      </td>
+      <td><span class="role-badge ${u.role}">${roleLabel}</span></td>
+      <td class="cell-when">${created}</td>
       <td>
         <div class="pw-reset-row">
-          <input type="text" class="pw-reset-input" data-username="${u.username}" placeholder="blank = auto-generate" />
+          <input type="text" class="pw-reset-input" data-username="${u.username}" placeholder="New password (optional)" autocomplete="off" />
           <button type="button" class="btn-secondary btn-small pw-reset-btn" data-username="${u.username}">Set password</button>
         </div>
       </td>
@@ -185,7 +202,7 @@ async function loadUsers() {
 async function resetPassword(username) {
   const inputEl = usersTbodyEl.querySelector(`.pw-reset-input[data-username="${CSS.escape(username)}"]`);
   const newPassword = inputEl?.value.trim() || undefined;
-  const action = newPassword ? 'change' : 'generate a new';
+  const action = newPassword ? 'set the new' : 'generate a temporary';
   if (!confirm(`This will ${action} password for "${username}" and log them out of any active session. Continue?`)) return;
 
   usersActionStatusEl.className = 'status';
@@ -202,7 +219,7 @@ async function resetPassword(username) {
     return;
   }
   if (inputEl) inputEl.value = '';
-  usersActionStatusEl.textContent = `New password for "${data.username}": ${data.password} — copy this and send it to them now, it will not be shown again.`;
+  usersActionStatusEl.innerHTML = `New password for <b>${data.username}</b>: <code>${data.password}</code> — copy and send it to the user now, it will not be shown again.`;
   usersActionStatusEl.className = 'status ok';
 }
 
@@ -234,7 +251,7 @@ createUserForm.addEventListener('submit', async (e) => {
       createUserStatusEl.className = 'status err';
       return;
     }
-    createUserStatusEl.textContent = `Created "${data.user.username}".`;
+    createUserStatusEl.textContent = `User "${data.user.username}" created successfully.`;
     createUserStatusEl.className = 'status ok';
     createUserForm.reset();
     await loadUsers();
@@ -247,14 +264,15 @@ createUserForm.addEventListener('submit', async (e) => {
 // Key inputs are always left blank on load/reload -- the server never sends
 // a key's plaintext back (see /api/admin/api-settings GET), only whether one
 // is set and how long it is. A blank key field on save means "keep it".
+// ---------- API Setup (super admin) ----------
 function keyStatusText(key) {
-  return key.set ? `Key set (${key.length} characters). Leave the field blank to keep it.` : 'No key set yet.';
+  return key && key.set ? `Key set (${key.length} characters). Leave blank to keep it.` : 'No key set yet.';
 }
 
 async function loadApiSettings() {
   const res = await fetch('/api/admin/api-settings');
   if (!res.ok) {
-    aivastraSettingsStatusEl.textContent = 'Could not load current settings.';
+    aivastraSettingsStatusEl.textContent = 'Could not load settings.';
     aivastraSettingsStatusEl.className = 'status err';
     return;
   }
@@ -277,7 +295,7 @@ async function saveApiSettings(target, baseUrlEl, apiKeyEl, keyStatusEl, btn, st
     });
     const data = await res.json();
     if (!res.ok) {
-      statusEl.textContent = data.error || 'Could not save these settings.';
+      statusEl.textContent = data.error || 'Could not save settings.';
       statusEl.className = 'status err';
       return;
     }
@@ -285,10 +303,47 @@ async function saveApiSettings(target, baseUrlEl, apiKeyEl, keyStatusEl, btn, st
     const saved = target === 'aivastra' ? data.aivastra : data.propicly;
     baseUrlEl.value = saved.baseUrl;
     keyStatusEl.textContent = keyStatusText(saved.key);
-    statusEl.textContent = 'Saved — applied immediately, no restart needed.';
+    statusEl.textContent = 'Saved.';
     statusEl.className = 'status ok';
   } finally {
     btn.disabled = false;
+  }
+}
+
+async function testApiConnection(target) {
+  const isAivastra = target === 'aivastra';
+  const testBtn = isAivastra ? aivastraTestBtn : propiclyTestBtn;
+  const statusEl = isAivastra ? aivastraSettingsStatusEl : propiclySettingsStatusEl;
+  const url = isAivastra ? '/api/balance' : '/api/redchief/config';
+
+  if (testBtn) testBtn.disabled = true;
+  statusEl.className = 'status';
+  statusEl.textContent = 'Testing connection…';
+
+  try {
+    const res = await fetch(url);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.available === false) {
+      const errMsg = data.error || (data.code ? `Error: ${data.code}` : 'Connection failed.');
+      statusEl.textContent = `Connection failed: ${errMsg}`;
+      statusEl.className = 'status err';
+      return;
+    }
+
+    if (isAivastra) {
+      const credits = typeof data.credits === 'number' ? data.credits : '–';
+      const tryOns = typeof data.tryOnsRemaining === 'number' ? data.tryOnsRemaining : '–';
+      statusEl.textContent = `Connected: ${credits} credits remaining (${tryOns} try-ons).`;
+    } else {
+      const cost = typeof data.creditCost === 'number' ? `${data.creditCost} credits/job` : 'ready';
+      statusEl.textContent = `Connected: ${cost}.`;
+    }
+    statusEl.className = 'status ok';
+  } catch (err) {
+    statusEl.textContent = `Connection error: ${err.message || String(err)}`;
+    statusEl.className = 'status err';
+  } finally {
+    if (testBtn) testBtn.disabled = false;
   }
 }
 
@@ -301,6 +356,14 @@ propiclySettingsForm.addEventListener('submit', (e) => {
   e.preventDefault();
   saveApiSettings('propicly', propiclyBaseUrlEl, propiclyApiKeyEl, propiclyKeyStatusEl, propiclySettingsBtn, propiclySettingsStatusEl);
 });
+
+if (aivastraTestBtn) {
+  aivastraTestBtn.addEventListener('click', () => testApiConnection('aivastra'));
+}
+
+if (propiclyTestBtn) {
+  propiclyTestBtn.addEventListener('click', () => testApiConnection('propicly'));
+}
 
 // ---------- selection ----------
 // What Generate actually runs against — always just the items that were
@@ -351,12 +414,15 @@ let currentBalance = null;
 async function loadBalance() {
   const res = await fetch('/api/balance');
   const data = await res.json();
+  const topbarCreditsEl = document.getElementById('topbar-credits-val');
   if (!data.available) {
     sidebarBalanceEl.innerHTML = `<b>—</b>DEV_API_KEY not set`;
+    if (topbarCreditsEl) topbarCreditsEl.textContent = '— Credits';
     currentBalance = null;
     return;
   }
   sidebarBalanceEl.innerHTML = `<b>${data.credits.toLocaleString()}</b>~${data.tryOnsRemaining.toLocaleString()} try-ons left`;
+  if (topbarCreditsEl) topbarCreditsEl.textContent = `${data.credits.toLocaleString()} Credits`;
   currentBalance = data;
 }
 
@@ -364,6 +430,19 @@ async function loadBalance() {
 // The <select> ships with a real, working default list in index.html so
 // uploads never depend on this fetch succeeding — this only refreshes it with
 // the live list when/if it can. A failure here is silently non-fatal.
+function renderGarmentCategoryPills(categories, activeValue) {
+  const container = document.getElementById('garment-category-pills');
+  if (!container || !categories || !categories.length) return;
+  const currentVal = (activeValue || (garmentCategoryEl ? garmentCategoryEl.value : 'upper') || '').toLowerCase();
+  container.innerHTML = categories
+    .map((c) => {
+      const label = c.charAt(0).toUpperCase() + c.slice(1);
+      const isActive = c.toLowerCase() === currentVal;
+      return `<button type="button" class="segmented-pill ${isActive ? 'active' : ''}" data-value="${c}" role="tab" aria-selected="${isActive ? 'true' : 'false'}">${label}</button>`;
+    })
+    .join('');
+}
+
 async function loadCategories() {
   try {
     const res = await fetch('/api/categories');
@@ -371,6 +450,8 @@ async function loadCategories() {
     const prevValue = garmentCategoryEl.value;
     garmentCategoryEl.innerHTML = data.categories.map((c) => `<option value="${c}">${c}</option>`).join('');
     if (data.categories.includes(prevValue)) garmentCategoryEl.value = prevValue;
+    renderGarmentCategoryPills(data.categories, garmentCategoryEl.value);
+    updateGarmentTagPrompt();
     garmentCategoryEl.title =
       data.source === 'fallback' ? 'Could not reach the live category list — showing a fixed default set.' : '';
   } catch (err) {
@@ -435,7 +516,17 @@ function inputFileUrl(kind, item) {
   return `/api/file?path=${encodeURIComponent(rel)}`;
 }
 
+function updateClearButtonsVisibility() {
+  if (personClearBtn) {
+    personClearBtn.hidden = selection.people.length === 0;
+  }
+  if (garmentClearBtn) {
+    garmentClearBtn.hidden = selection.garments.length === 0;
+  }
+}
+
 function renderUploadThumbs(kind) {
+  updateClearButtonsVisibility();
   const containerEl = kind === 'person' ? personThumbsEl : garmentThumbsEl;
   const items = selList(kind);
   if (items.length === 0) {
@@ -447,7 +538,9 @@ function renderUploadThumbs(kind) {
       (item, i) => `
       <div class="upload-thumb">
         <img src="${inputFileUrl(kind, item)}" loading="lazy" title="${item.filename}" />
-        <button type="button" class="thumb-remove" data-index="${i}" title="Remove ${item.filename}" aria-label="Remove ${item.filename}">×</button>
+        <button type="button" class="thumb-remove" data-index="${i}" title="Remove ${item.filename}" aria-label="Remove ${item.filename}">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
       </div>`,
     )
     .join('');
@@ -492,8 +585,8 @@ async function removeUploadedItem(kind, index) {
 async function clearUploadedKind(kind) {
   const items = selList(kind);
   if (items.length === 0) return;
-  const label = kind === 'person' ? 'person photo(s)' : 'garment photo(s)';
-  if (!confirm(`Delete all ${items.length} uploaded ${label} from disk and clear the selection? This cannot be undone.`)) return;
+  const label = kind === 'person' ? 'person model(s)' : 'garment(s)';
+  if (!confirm(`Delete all ${items.length} uploaded ${label} from disk? This cannot be undone.`)) return;
 
   const statusEl = kind === 'person' ? personStatusEl : garmentStatusEl;
   const toDelete = [...items];
@@ -792,6 +885,80 @@ wireFolderPicker(garmentFolderBtnEl, garmentFolderInputEl, (files) =>
   ),
 );
 
+// ---------- segmented gender & category pill tabs ----------
+const personGenderLabelEl = document.getElementById('person-gender-label');
+const garmentTagLabelEl = document.getElementById('garment-tag-label');
+
+function wireSegmentedPills(containerId, selectEl, onSelect) {
+  const container = document.getElementById(containerId);
+  if (!container || !selectEl) return;
+  container.addEventListener('click', (e) => {
+    const btn = e.target.closest('.segmented-pill');
+    if (!btn) return;
+    for (const b of container.querySelectorAll('.segmented-pill')) {
+      b.classList.remove('active');
+      b.setAttribute('aria-selected', 'false');
+    }
+    btn.classList.add('active');
+    btn.setAttribute('aria-selected', 'true');
+    selectEl.value = btn.dataset.value;
+    selectEl.dispatchEvent(new Event('change'));
+    if (onSelect) onSelect(btn.dataset.value);
+  });
+}
+
+function updatePersonGenderPrompt() {
+  if (!personGenderLabelEl || !personGenderEl) return;
+  const val = personGenderEl.value || 'men';
+  personGenderLabelEl.textContent = val.charAt(0).toUpperCase() + val.slice(1);
+}
+
+function updateGarmentTagPrompt() {
+  if (!garmentTagLabelEl || !garmentGenderEl || !garmentCategoryEl) return;
+  const g = (garmentGenderEl.value || 'men').charAt(0).toUpperCase() + (garmentGenderEl.value || 'men').slice(1);
+  const c = garmentCategoryEl.value || 'upper';
+  garmentTagLabelEl.innerHTML = `${g} &bull; ${c}`;
+}
+
+wireSegmentedPills('person-gender-pills', personGenderEl, () => {
+  updatePersonGenderPrompt();
+});
+
+wireSegmentedPills('garment-gender-pills', garmentGenderEl, () => {
+  updateGarmentTagPrompt();
+});
+
+wireSegmentedPills('garment-category-pills', garmentCategoryEl, () => {
+  updateGarmentTagPrompt();
+});
+
+if (garmentGenderEl) {
+  garmentGenderEl.addEventListener('change', () => {
+    const pills = document.querySelectorAll('#garment-gender-pills .segmented-pill');
+    for (const b of pills) {
+      const isMatch = b.dataset.value.toLowerCase() === (garmentGenderEl.value || '').toLowerCase();
+      b.classList.toggle('active', isMatch);
+      b.setAttribute('aria-selected', isMatch ? 'true' : 'false');
+    }
+    updateGarmentTagPrompt();
+  });
+}
+
+if (garmentCategoryEl) {
+  garmentCategoryEl.addEventListener('change', () => {
+    const pills = document.querySelectorAll('#garment-category-pills .segmented-pill');
+    for (const b of pills) {
+      const isMatch = b.dataset.value.toLowerCase() === (garmentCategoryEl.value || '').toLowerCase();
+      b.classList.toggle('active', isMatch);
+      b.setAttribute('aria-selected', isMatch ? 'true' : 'false');
+    }
+    updateGarmentTagPrompt();
+  });
+}
+
+updatePersonGenderPrompt();
+updateGarmentTagPrompt();
+
 // ---------- generate + run-status tracking ----------
 // The Upload page deliberately shows no progress bar or job log — that's
 // results content, and results live only on the Results page (which polls
@@ -822,13 +989,13 @@ function renderUploadRunBanner(run, running) {
   }
   uploadRunBannerEl.hidden = false;
   const runningLine = running
-    ? `<div>⏳ Run in progress: <b>${run.completed + run.failed} / ${run.total}</b> (${run.completed} completed${run.failed ? `, ${run.failed} failed` : ''})</div>`
+    ? `<div class="run-banner-item in-progress"><span class="run-spinner"></span><span>Run in progress: <b>${run.completed + run.failed} / ${run.total}</b> (${run.completed} completed${run.failed ? `, ${run.failed} failed` : ''})</span></div>`
     : '';
   const canCancel = currentUser?.role === 'superadmin';
   const queuedLines = queuedList
     .map(
       (q, i) =>
-        `<div class="queued-line">🕒 Queued #${i + 1}: <b>${q.total} job(s)</b> — ${queuedCategoriesHtml(q.categories)} (by ${q.queuedBy}) — will start automatically once its turn comes.${canCancel ? ` <button type="button" class="link-btn danger" data-cancel-queue-id="${q.id}">Cancel</button>` : ''}</div>`,
+        `<div class="run-banner-item queued-line"><span class="queue-badge">#${i + 1}</span><span>Queued: <b>${q.total} job(s)</b> — ${queuedCategoriesHtml(q.categories)} (by ${q.queuedBy}) — will start automatically once turn arrives.</span>${canCancel ? ` <button type="button" class="link-btn danger" data-cancel-queue-id="${q.id}">Cancel</button>` : ''}</div>`,
     )
     .join('');
   uploadRunBannerEl.innerHTML = runningLine + queuedLines;
@@ -899,15 +1066,8 @@ generateBtn.addEventListener('click', async () => {
   generateBtn.disabled = true;
 });
 
-clearSelectionBtn.addEventListener('click', () => {
-  clearSelection();
-  loadPlan();
-  renderUploadThumbs('person');
-  renderUploadThumbs('garment');
-});
-
-personClearBtn.addEventListener('click', () => clearUploadedKind('person'));
-garmentClearBtn.addEventListener('click', () => clearUploadedKind('garment'));
+personClearBtn?.addEventListener('click', () => clearUploadedKind('person'));
+garmentClearBtn?.addEventListener('click', () => clearUploadedKind('garment'));
 
 confirmCancelBtn.addEventListener('click', () => {
   confirmPanelEl.hidden = true;
@@ -1084,11 +1244,13 @@ function fillSelectPreserving(selectEl, values, current, allLabel, formatter) {
 // delegation on the table body, see wireResultsTable below); the download
 // button stops that click from bubbling so it can do its own thing.
 function mediaBoxHtml(url, extraClass) {
-  if (!url) return '<div class="thumb-missing">—</div>';
+  if (!url) return '<div class="thumb-missing">No image</div>';
   return `
     <div class="media-box${extraClass ? ` ${extraClass}` : ''}" data-full="${url}">
       <img src="${url}" loading="lazy" />
-      <a class="dl-btn" href="${url}" download title="Download">⬇</a>
+      <a class="dl-btn" href="${url}" download title="Download image" aria-label="Download image">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+      </a>
     </div>`;
 }
 
@@ -1150,20 +1312,24 @@ function flagReasonLabel(value) {
 // button; flagged rows get a reason badge (click to edit/unflag), an optional
 // note, a bundle-download link, and — while still unresolved — a Mark
 // resolved button.
+const FLAG_ICON_SVG = `<svg class="flag-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></svg>`;
+const CHECK_ICON_SVG = `<svg class="check-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>`;
+
 function flagCellHtml(row) {
   if (!row.flag) {
-    return `<button type="button" class="flag-btn" data-flag-btn="${row.id}">⚑ Flag</button>`;
+    return `<button type="button" class="flag-btn" data-flag-btn="${row.id}">${FLAG_ICON_SVG}<span>Flag</span></button>`;
   }
   const resolved = Boolean(row.flag.resolvedAt);
   const note = row.flag.note ? `<span class="flag-note">${row.flag.note.replace(/"/g, '&quot;')}</span>` : '';
   const resolvedNote = resolved && row.flag.resolvedNote
     ? `<span class="flag-note resolved-note">Resolved: ${row.flag.resolvedNote.replace(/"/g, '&quot;')}</span>`
     : '';
-  const resolveBtn = resolved ? '' : `<button type="button" class="flag-btn resolve-btn" data-resolve-btn="${row.id}">Mark resolved</button>`;
+  const resolveBtn = resolved ? '' : `<button type="button" class="flag-btn resolve-btn" data-resolve-btn="${row.id}">${CHECK_ICON_SVG}<span>Mark resolved</span></button>`;
   return `
     <div class="flag-cell">
       <button type="button" class="flag-btn ${resolved ? 'resolved-active' : 'active'}" data-flag-btn="${row.id}" data-flag-reason="${row.flag.reason}" data-flag-note="${row.flag.note || ''}">
-        ⚑ ${resolved ? 'Resolved' : 'Flagged'}
+        ${resolved ? CHECK_ICON_SVG : FLAG_ICON_SVG}
+        <span>${resolved ? 'Resolved' : 'Flagged'}</span>
       </button>
       <span class="flag-badge${resolved ? ' resolved' : ''}" title="${flagReasonLabel(row.flag.reason)}">${flagReasonLabel(row.flag.reason)}</span>
       ${note}
@@ -1241,14 +1407,14 @@ async function loadResults(resetPage) {
   if (running || queuedList.length > 0) {
     runBannerEl.hidden = false;
     const runningLine = running
-      ? `<div>⏳ Run in progress: <b>${status.completed + status.failed} / ${status.total}</b> (${status.completed} completed${status.failed ? `, ${status.failed} failed` : ''})</div>`
+      ? `<div class="run-banner-item in-progress"><span class="run-spinner"></span><span>Run in progress: <b>${status.completed + status.failed} / ${status.total}</b> (${status.completed} completed${status.failed ? `, ${status.failed} failed` : ''})</span></div>`
       : '';
     // Read-only here — cancelling a queued batch happens from the Upload
     // page's banner, where Generate/Queue is actually decided.
     const queuedLines = queuedList
       .map(
         (q, i) =>
-          `<div class="queued-line">🕒 Queued #${i + 1}: <b>${q.total} job(s)</b> — ${queuedCategoriesHtml(q.categories)} (by ${q.queuedBy}) — will start automatically.</div>`,
+          `<div class="run-banner-item queued-line"><span class="queue-badge">#${i + 1}</span><span>Queued: <b>${q.total} job(s)</b> — ${queuedCategoriesHtml(q.categories)} (by ${q.queuedBy}) — will start automatically.</span></div>`,
       )
       .join('');
     runBannerEl.innerHTML = runningLine + queuedLines;

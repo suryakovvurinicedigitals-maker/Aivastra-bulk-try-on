@@ -173,7 +173,9 @@ function redchiefRowSlotHtml(row, slot) {
         <div class="redchief-slot-label">${slot.label}</div>
         <div class="dropzone redchief-dropzone redchief-slot-filled">
           <img class="redchief-slot-preview" src="${previewSrc}" />
-          <button type="button" class="redchief-slot-clear" title="Clear">×</button>
+          <button type="button" class="redchief-slot-clear" title="Clear" aria-label="Clear slot">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
         </div>
       </div>`;
   }
@@ -192,7 +194,9 @@ function redchiefRowSlotHtml(row, slot) {
       <div class="redchief-slot-label">${slot.label}</div>
       <div class="${cls}" tabindex="0">
         <input type="file" class="redchief-slot-input" accept="image/*" hidden />
-        <span class="icon">⬆</span>
+        <span class="icon">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+        </span>
         <span>${slot.unmatched ? `Missing: ${slot.label}` : 'Choose image'}</span>
       </div>
     </div>`;
@@ -206,7 +210,10 @@ function redchiefRowCardHtml(row) {
       <div class="redchief-row-header">
         <span class="redchief-row-index">Row</span>
         <input type="text" class="redchief-row-label-input" value="${redchiefEscapeHtml(row.label)}" />
-        <button type="button" class="link-btn danger redchief-row-remove-btn" title="Remove row">×</button>
+        <button type="button" class="link-btn danger redchief-row-remove-btn" title="Remove row">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          <span>Remove</span>
+        </button>
       </div>
       <div class="redchief-row-slots">${row.slots.map((s) => redchiefRowSlotHtml(row, s)).join('')}</div>
       ${invalid ? `<p class="redchief-validation-msg">${unfilled} view(s) still need an image — click the dashed slot(s) above to fill them in</p>` : ''}
