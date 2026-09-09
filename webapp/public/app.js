@@ -460,8 +460,13 @@ async function loadCategories() {
 
 let currentPlanTotal = 0;
 
+function escapeHtml(str) {
+  return String(str ?? '').replace(/[&<>"']/g, (s) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[s]));
+}
+
 async function loadPlan() {
-  selectionSummaryEl.textContent = `${selection.people.length} people, ${selection.garments.length} garment(s) selected`;
+  const peopleCount = selection.people.length;
+  const garmentCount = selection.garments.length;
 
   let data;
   try {
@@ -473,39 +478,122 @@ async function loadPlan() {
     data = await res.json();
     if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
   } catch (err) {
-    // /api/plan's job count depends on a live call to aivastra's dev API
-    // (computeJobs -> getCategories, server.mts) — a transient hiccup there
-    // (rate limit, timeout, network blip — more likely while a batch is
-    // already running and polling job statuses against the same API key)
-    // used to leave this function mid-throw *before* it reached the
-    // `generateBtn.disabled = ...` line below, stranding Generate in
-    // whatever disabled state it already had (HTML ships it `disabled` by
-    // default) until a page reload happened to land on a moment the API
-    // call succeeded — which read as "Generate doesn't work, needs several
-    // hard refreshes". Fail safe and visibly instead: never guess a stale
-    // total is still right, keep Generate disabled, and offer a one-click
-    // retry instead of a blind full-page reload.
-    planSummaryEl.innerHTML = `<div class="notes"><li>Could not load the plan: ${err instanceof Error ? err.message : String(err)} — <button type="button" class="link-btn" id="plan-retry-btn">Retry</button></li></div>`;
+    planSummaryEl.innerHTML = `<div class="plan-err-note">Could not load plan: ${escapeHtml(err instanceof Error ? err.message : String(err))} — <button type="button" class="link-btn" id="plan-retry-btn">Retry</button></div>`;
     document.getElementById('plan-retry-btn')?.addEventListener('click', () => loadPlan());
     currentPlanTotal = 0;
     generateBtn.disabled = true;
+    if (selectionSummaryEl) selectionSummaryEl.textContent = '';
     return 0;
   }
-  const chips =
-    Object.entries(data.byCategory)
-      .map(([slug, n]) => `<span class="chip">${slug} · ${n}</span>`)
-      .join('') || `<span class="empty">Upload person and garment photos below to build a plan.</span>`;
-  const warnings = data.warnings.length
-    ? `<ul class="notes">${data.warnings.map((w) => `<li>${w}</li>`).join('')}</ul>`
-    : '';
-  planSummaryEl.innerHTML = `
-    <div class="total">${data.total}</div>
-    <div class="total-label">job(s) would run right now</div>
-    <div class="chips">${chips}</div>
-    ${warnings}
-  `;
+
+  // Filter out any internal disk-scan folder warnings
+  const warnings = (data.warnings || []).filter(
+    (w) => !w.includes('No folders found under') && !w.includes('README.md')
+  );
+
   currentPlanTotal = data.total;
   generateBtn.disabled = data.total === 0;
+
+  // Case 1: Nothing uploaded yet
+  if (peopleCount === 0 && garmentCount === 0) {
+    if (selectionSummaryEl) selectionSummaryEl.textContent = '';
+    planSummaryEl.innerHTML = `
+      <div class="plan-empty-note">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+        <span>Upload person model and garment photos below to build your execution plan.</span>
+      </div>
+    `;
+    generateBtn.innerHTML = `
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+      <span>Generate Batch</span>
+    `;
+    return 0;
+  }
+
+  // Case 2: Some files uploaded, but total jobs is 0 (mismatch or missing one side)
+  if (data.total === 0) {
+    if (selectionSummaryEl) {
+      selectionSummaryEl.textContent = `${peopleCount} model${peopleCount === 1 ? '' : 's'}, ${garmentCount} garment${garmentCount === 1 ? '' : 's'}`;
+    }
+    const missingMsg =
+      peopleCount === 0
+        ? 'Upload at least one person model photo below.'
+        : garmentCount === 0
+        ? 'Upload at least one garment photo below.'
+        : 'No matching gender pairs between selected models and garments.';
+
+    planSummaryEl.innerHTML = `
+      <div class="plan-card-active">
+        <div class="plan-stats-strip">
+          <div class="plan-stat">
+            <span class="plan-stat-val">${peopleCount}</span>
+            <span class="plan-stat-label">Model${peopleCount === 1 ? '' : 's'}</span>
+          </div>
+          <span class="plan-stat-sep">&times;</span>
+          <div class="plan-stat">
+            <span class="plan-stat-val">${garmentCount}</span>
+            <span class="plan-stat-label">Garment${garmentCount === 1 ? '' : 's'}</span>
+          </div>
+          <span class="plan-stat-sep">=</span>
+          <div class="plan-stat zero">
+            <span class="plan-stat-val">0</span>
+            <span class="plan-stat-label">Jobs</span>
+          </div>
+        </div>
+        <div class="plan-hint-note">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+          <span>${missingMsg}</span>
+        </div>
+      </div>
+    `;
+    generateBtn.innerHTML = `
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+      <span>Generate Batch</span>
+    `;
+    return 0;
+  }
+
+  // Case 3: Valid jobs ready to run
+  if (selectionSummaryEl) {
+    selectionSummaryEl.textContent = `${data.total} job${data.total === 1 ? '' : 's'} ready`;
+  }
+
+  const categoryChips = Object.entries(data.byCategory || {})
+    .map(([slug, n]) => `<span class="plan-chip">${escapeHtml(slug)} · ${n}</span>`)
+    .join('');
+
+  const warningList = warnings.length
+    ? `<ul class="plan-notes">${warnings.map((w) => `<li>${escapeHtml(w)}</li>`).join('')}</ul>`
+    : '';
+
+  planSummaryEl.innerHTML = `
+    <div class="plan-card-active">
+      <div class="plan-stats-strip">
+        <div class="plan-stat">
+          <span class="plan-stat-val">${peopleCount}</span>
+          <span class="plan-stat-label">Model${peopleCount === 1 ? '' : 's'}</span>
+        </div>
+        <span class="plan-stat-sep">&times;</span>
+        <div class="plan-stat">
+          <span class="plan-stat-val">${garmentCount}</span>
+          <span class="plan-stat-label">Garment${garmentCount === 1 ? '' : 's'}</span>
+        </div>
+        <span class="plan-stat-sep">=</span>
+        <div class="plan-stat accent">
+          <span class="plan-stat-val">${data.total}</span>
+          <span class="plan-stat-label">Job${data.total === 1 ? '' : 's'}</span>
+        </div>
+        ${categoryChips ? `<div class="plan-chips-wrap">${categoryChips}</div>` : ''}
+      </div>
+      ${warningList}
+    </div>
+  `;
+
+  generateBtn.innerHTML = `
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+    <span>Generate ${data.total} Job${data.total === 1 ? '' : 's'}</span>
+  `;
+
   return data.total;
 }
 
@@ -1184,13 +1272,17 @@ function setActiveSourceTab(source) {
     btn.classList.toggle('active', active);
     btn.setAttribute('aria-selected', String(active));
   }
-  // RedChief's result shape (N labeled inputs + N labeled outputs + a flat
-  // credit cost) and Catalog's (fixed face/garment/pose/background/shoe
-  // axes) each get their own column layout — see resultRowHtml below and
-  // the three <thead>s in index.html.
   resultsTheadDefaultEl.hidden = source === 'redchief' || source === 'catalog';
   resultsTheadRedchiefEl.hidden = source !== 'redchief';
   resultsTheadCatalogEl.hidden = source !== 'catalog';
+  if (filterCategoryEl) {
+    filterCategoryEl.hidden = source === 'redchief';
+    if (filterCategoryEl._customSelect) filterCategoryEl._customSelect.wrap.hidden = source === 'redchief';
+  }
+  if (filterGenderEl) {
+    filterGenderEl.hidden = source === 'redchief';
+    if (filterGenderEl._customSelect) filterGenderEl._customSelect.wrap.hidden = source === 'redchief';
+  }
 }
 setActiveSourceTab(resultsState.source); // reflect whatever was restored from localStorage before the first fetch
 for (const btn of sourceTabEls) {
@@ -1202,14 +1294,621 @@ for (const btn of sourceTabEls) {
   });
 }
 
-/** `<input type="datetime-local">` gives back a value like "2026-09-04T10:30" with
- * no timezone — the browser means it in local time. `new Date(...)` parses that as
- * local time, and `.toISOString()` converts to the same UTC-string format finished_at
- * is stored in (see batch.mts), so the two sides of the SQL comparison actually agree. */
-function datetimeLocalToIso(value) {
+// ============================================================================
+// Custom Select & Calendar Components
+// ============================================================================
+
+function closeAllPopups() {
+  document.querySelectorAll('.custom-select-wrap.open').forEach((w) => {
+    w.classList.remove('open');
+    const m = w.querySelector('.custom-select-menu');
+    if (m) m.hidden = true;
+    const t = w.querySelector('.custom-select-trigger');
+    if (t) t.setAttribute('aria-expanded', 'false');
+  });
+
+  const dateWrap = document.getElementById('results-datepicker-wrap');
+  if (dateWrap) {
+    dateWrap.classList.remove('open');
+    const popover = document.getElementById('custom-datepicker-popover');
+    if (popover) popover.hidden = true;
+    const trigger = document.getElementById('custom-date-trigger');
+    if (trigger) trigger.setAttribute('aria-expanded', 'false');
+  }
+}
+
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('.custom-select-wrap') && !e.target.closest('.custom-datepicker-wrap')) {
+    closeAllPopups();
+  }
+});
+
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    closeAllPopups();
+  }
+});
+
+function initCustomSelect(selectEl) {
+  if (!selectEl || selectEl.dataset.customSelectInit) return;
+  selectEl.dataset.customSelectInit = 'true';
+  selectEl.classList.add('custom-select-native');
+
+  const wrap = document.createElement('div');
+  wrap.className = 'custom-select-wrap';
+  if (selectEl.id) wrap.id = `${selectEl.id}-custom-wrap`;
+  if (selectEl.hidden) wrap.hidden = true;
+
+  const trigger = document.createElement('button');
+  trigger.type = 'button';
+  trigger.className = 'custom-select-trigger';
+  trigger.setAttribute('aria-haspopup', 'listbox');
+  trigger.setAttribute('aria-expanded', 'false');
+  if (selectEl.getAttribute('aria-label')) {
+    trigger.setAttribute('aria-label', selectEl.getAttribute('aria-label'));
+  }
+
+  const labelSpan = document.createElement('span');
+  labelSpan.className = 'custom-select-label';
+
+  const chevron = document.createElement('span');
+  chevron.className = 'custom-select-chevron-icon';
+  chevron.innerHTML = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>`;
+
+  trigger.appendChild(labelSpan);
+  trigger.appendChild(chevron);
+
+  const menu = document.createElement('div');
+  menu.className = 'custom-select-menu';
+  menu.setAttribute('role', 'listbox');
+  menu.hidden = true;
+
+  selectEl.parentNode.insertBefore(wrap, selectEl);
+  wrap.appendChild(trigger);
+  wrap.appendChild(menu);
+  wrap.appendChild(selectEl);
+
+  function syncOptions() {
+    menu.innerHTML = '';
+    const selectedOption = selectEl.options[selectEl.selectedIndex] || selectEl.options[0];
+    labelSpan.textContent = selectedOption ? selectedOption.textContent : (selectEl.getAttribute('aria-label') || 'Select');
+
+    for (let i = 0; i < selectEl.options.length; i++) {
+      const opt = selectEl.options[i];
+      const item = document.createElement('div');
+      item.className = 'custom-select-item';
+      item.tabIndex = -1;
+      if (opt.value === selectEl.value) {
+        item.classList.add('selected');
+        item.setAttribute('aria-selected', 'true');
+      }
+      item.dataset.value = opt.value;
+
+      const itemText = document.createElement('span');
+      itemText.className = 'custom-select-item-text';
+      itemText.textContent = opt.textContent;
+      item.appendChild(itemText);
+
+      const check = document.createElement('span');
+      check.className = 'custom-select-check';
+      check.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>`;
+      item.appendChild(check);
+
+      item.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const changed = selectEl.value !== opt.value;
+        selectEl.value = opt.value;
+        closeMenu();
+        syncOptions();
+        if (changed) {
+          selectEl.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      });
+
+      menu.appendChild(item);
+    }
+  }
+
+  function openMenu() {
+    const isCurrentlyOpen = wrap.classList.contains('open');
+    closeAllPopups();
+    if (isCurrentlyOpen) return;
+
+    menu.hidden = false;
+    wrap.classList.add('open');
+    trigger.setAttribute('aria-expanded', 'true');
+
+    // Prevent menu horizontal overflow
+    const rect = menu.getBoundingClientRect();
+    if (rect.right > window.innerWidth - 12) {
+      menu.style.left = 'auto';
+      menu.style.right = '0';
+    } else {
+      menu.style.left = '0';
+      menu.style.right = 'auto';
+    }
+
+    const selItem = menu.querySelector('.custom-select-item.selected');
+    if (selItem) selItem.scrollIntoView({ block: 'nearest' });
+  }
+
+  function closeMenu() {
+    menu.hidden = true;
+    wrap.classList.remove('open');
+    trigger.setAttribute('aria-expanded', 'false');
+  }
+
+  trigger.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (wrap.classList.contains('open')) {
+      closeMenu();
+    } else {
+      openMenu();
+    }
+  });
+
+  trigger.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      if (menu.hidden) {
+        openMenu();
+        const selItem = menu.querySelector('.custom-select-item.selected') || menu.querySelector('.custom-select-item');
+        if (selItem) selItem.focus();
+      }
+    }
+  });
+
+  menu.addEventListener('keydown', (e) => {
+    const items = [...menu.querySelectorAll('.custom-select-item')];
+    const currentIndex = items.indexOf(document.activeElement);
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      const nextIndex = (currentIndex + 1) % items.length;
+      items[nextIndex]?.focus();
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      const prevIndex = (currentIndex - 1 + items.length) % items.length;
+      items[prevIndex]?.focus();
+    } else if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      if (document.activeElement && document.activeElement.classList.contains('custom-select-item')) {
+        document.activeElement.click();
+        trigger.focus();
+      }
+    } else if (e.key === 'Escape' || e.key === 'Tab') {
+      closeMenu();
+      trigger.focus();
+    }
+  });
+
+  // Intercept value property updates on selectEl
+  const origDesc = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value');
+  if (origDesc) {
+    Object.defineProperty(selectEl, 'value', {
+      get() {
+        return origDesc.get.call(this);
+      },
+      set(v) {
+        origDesc.set.call(this, v);
+        syncOptions();
+      },
+      configurable: true,
+    });
+  }
+
+  selectEl.addEventListener('change', syncOptions);
+
+  const observer = new MutationObserver(() => {
+    wrap.hidden = selectEl.hidden;
+    syncOptions();
+  });
+  observer.observe(selectEl, { childList: true, attributes: true, attributeFilter: ['hidden'] });
+
+  syncOptions();
+
+  selectEl._customSelect = {
+    sync: syncOptions,
+    close: closeMenu,
+    wrap,
+  };
+}
+
+let customDatePicker = null;
+
+function initCustomDatePicker() {
+  const wrap = document.getElementById('results-datepicker-wrap');
+  const trigger = document.getElementById('custom-date-trigger');
+  const popover = document.getElementById('custom-datepicker-popover');
+  const label = document.getElementById('custom-date-label');
+  const clearBtn = document.getElementById('custom-date-clear-btn');
+  const monthTitle = document.getElementById('cal-month-title');
+  const daysGrid = document.getElementById('cal-days-grid');
+  const selectionDisplay = document.getElementById('cal-selection-display');
+  const prevBtn = document.getElementById('cal-prev-btn');
+  const nextBtn = document.getElementById('cal-next-btn');
+  const footerClearBtn = document.getElementById('cal-footer-clear');
+  const footerApplyBtn = document.getElementById('cal-footer-apply');
+  const presetBtns = wrap ? wrap.querySelectorAll('.datepicker-preset') : [];
+
+  if (!wrap || !trigger || !popover || !filterFromEl || !filterToEl) return;
+
+  const now = new Date();
+  let calState = {
+    start: filterFromEl.value || null,
+    end: filterToEl.value || null,
+    viewYear: now.getFullYear(),
+    viewMonth: now.getMonth(),
+    hoverDate: null,
+  };
+
+  if (calState.start) {
+    const [y, m] = calState.start.split('-').map(Number);
+    if (y && m) {
+      calState.viewYear = y;
+      calState.viewMonth = m - 1;
+    }
+  }
+
+  function toIsoDate(d) {
+    const year = d.getFullYear();
+    const month = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  }
+
+  function formatDisplayDate(dateStr, includeYear = true) {
+    if (!dateStr) return '';
+    const [y, m, d] = dateStr.split('-').map(Number);
+    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    return includeYear ? `${months[m - 1]} ${d}, ${y}` : `${months[m - 1]} ${d}`;
+  }
+
+  function updateTriggerLabel() {
+    if (!calState.start && !calState.end) {
+      label.textContent = 'Date range';
+      trigger.classList.remove('has-range');
+      clearBtn.hidden = true;
+      selectionDisplay.textContent = 'Select date or range';
+    } else if (calState.start && !calState.end) {
+      label.textContent = `From ${formatDisplayDate(calState.start)}`;
+      trigger.classList.add('has-range');
+      clearBtn.hidden = false;
+      selectionDisplay.textContent = `${formatDisplayDate(calState.start)} – Select end date`;
+    } else if (calState.start && calState.end) {
+      trigger.classList.add('has-range');
+      clearBtn.hidden = false;
+      if (calState.start === calState.end) {
+        const text = formatDisplayDate(calState.start);
+        label.textContent = text;
+        selectionDisplay.textContent = text;
+      } else {
+        const [y1] = calState.start.split('-');
+        const [y2] = calState.end.split('-');
+        const text = y1 === y2
+          ? `${formatDisplayDate(calState.start, false)} – ${formatDisplayDate(calState.end, true)}`
+          : `${formatDisplayDate(calState.start, true)} – ${formatDisplayDate(calState.end, true)}`;
+        label.textContent = text;
+        selectionDisplay.textContent = text;
+      }
+    }
+    updatePresetHighlight();
+  }
+
+  function updatePresetHighlight() {
+    const today = toIsoDate(new Date());
+    const yesterday = toIsoDate(new Date(Date.now() - 86400000));
+    const last7Start = toIsoDate(new Date(Date.now() - 6 * 86400000));
+    const last30Start = toIsoDate(new Date(Date.now() - 29 * 86400000));
+    const thisMonthStart = toIsoDate(new Date(now.getFullYear(), now.getMonth(), 1));
+
+    presetBtns.forEach((btn) => {
+      const p = btn.dataset.preset;
+      let active = false;
+      if (p === 'today' && calState.start === today && calState.end === today) active = true;
+      if (p === 'yesterday' && calState.start === yesterday && calState.end === yesterday) active = true;
+      if (p === 'last7' && calState.start === last7Start && calState.end === today) active = true;
+      if (p === 'last30' && calState.start === last30Start && calState.end === today) active = true;
+      if (p === 'thisMonth' && calState.start === thisMonthStart && calState.end === today) active = true;
+      btn.classList.toggle('active', active);
+    });
+  }
+
+  function renderCalendar() {
+    const monthNames = [
+      'January', 'February', 'March', 'April', 'May', 'June',
+      'July', 'August', 'September', 'October', 'November', 'December'
+    ];
+    monthTitle.textContent = `${monthNames[calState.viewMonth]} ${calState.viewYear}`;
+
+    daysGrid.innerHTML = '';
+
+    const firstDayIndex = new Date(calState.viewYear, calState.viewMonth, 1).getDay();
+    const daysInMonth = new Date(calState.viewYear, calState.viewMonth + 1, 0).getDate();
+    const prevDaysInMonth = new Date(calState.viewYear, calState.viewMonth, 0).getDate();
+
+    const todayStr = toIsoDate(new Date());
+
+    // Fill days from previous month
+    for (let i = firstDayIndex - 1; i >= 0; i--) {
+      const dayNum = prevDaysInMonth - i;
+      const prevMonth = calState.viewMonth === 0 ? 11 : calState.viewMonth - 1;
+      const prevYear = calState.viewMonth === 0 ? calState.viewYear - 1 : calState.viewYear;
+      const dateStr = `${prevYear}-${String(prevMonth + 1).padStart(2, '0')}-${String(dayNum).padStart(2, '0')}`;
+      createDayButton(dayNum, dateStr, true);
+    }
+
+    // Fill days of current month
+    for (let d = 1; d <= daysInMonth; d++) {
+      const dateStr = `${calState.viewYear}-${String(calState.viewMonth + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+      createDayButton(d, dateStr, false);
+    }
+
+    // Fill days into next month to complete the 7-col grid
+    const totalRendered = firstDayIndex + daysInMonth;
+    const remaining = (totalRendered % 7 === 0) ? 0 : 7 - (totalRendered % 7);
+    for (let n = 1; n <= remaining; n++) {
+      const nextMonth = calState.viewMonth === 11 ? 0 : calState.viewMonth + 1;
+      const nextYear = calState.viewMonth === 11 ? calState.viewYear + 1 : calState.viewYear;
+      const dateStr = `${nextYear}-${String(nextMonth + 1).padStart(2, '0')}-${String(n).padStart(2, '0')}`;
+      createDayButton(n, dateStr, true);
+    }
+
+    function createDayButton(dayNum, dateStr, isOutside) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'datepicker-day';
+      btn.textContent = String(dayNum);
+      btn.dataset.date = dateStr;
+
+      if (isOutside) btn.classList.add('outside-month');
+      if (dateStr === todayStr) btn.classList.add('is-today');
+
+      const isStart = calState.start && dateStr === calState.start;
+      const isEnd = calState.end && dateStr === calState.end;
+      const isSingleDay = calState.start && calState.end && calState.start === calState.end && isStart;
+
+      if (isSingleDay) {
+        btn.classList.add('single-day', 'range-start', 'range-end');
+      } else {
+        if (isStart) btn.classList.add('range-start');
+        if (isEnd) btn.classList.add('range-end');
+      }
+
+      if (calState.start && calState.end && dateStr > calState.start && dateStr < calState.end) {
+        btn.classList.add('in-range');
+      } else if (calState.start && !calState.end && calState.hoverDate && dateStr > calState.start && dateStr <= calState.hoverDate) {
+        btn.classList.add('in-range-preview');
+      }
+
+      btn.addEventListener('mouseenter', () => {
+        if (calState.start && !calState.end && dateStr >= calState.start) {
+          calState.hoverDate = dateStr;
+          daysGrid.querySelectorAll('.datepicker-day').forEach((dBtn) => {
+            const dStr = dBtn.dataset.date;
+            if (dStr && dStr > calState.start && dStr <= calState.hoverDate) {
+              dBtn.classList.add('in-range-preview');
+            } else {
+              dBtn.classList.remove('in-range-preview');
+            }
+          });
+        }
+      });
+
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (isOutside) {
+          const [y, m] = dateStr.split('-').map(Number);
+          calState.viewYear = y;
+          calState.viewMonth = m - 1;
+        }
+        handleDayClick(dateStr);
+      });
+
+      daysGrid.appendChild(btn);
+    }
+  }
+
+  function handleDayClick(dateStr) {
+    if (!calState.start || (calState.start && calState.end)) {
+      calState.start = dateStr;
+      calState.end = null;
+      calState.hoverDate = null;
+      updateTriggerLabel();
+      renderCalendar();
+    } else {
+      if (dateStr < calState.start) {
+        calState.start = dateStr;
+        calState.end = null;
+        calState.hoverDate = null;
+        updateTriggerLabel();
+        renderCalendar();
+      } else {
+        calState.end = dateStr;
+        calState.hoverDate = null;
+        commitRange(calState.start, calState.end);
+      }
+    }
+  }
+
+  function commitRange(start, end) {
+    calState.start = start;
+    calState.end = end;
+    filterFromEl.value = start || '';
+    filterToEl.value = end || '';
+    updateTriggerLabel();
+    closePopover();
+    applyResultsFilters();
+  }
+
+  function clearRange(triggerFetch = true) {
+    calState.start = null;
+    calState.end = null;
+    calState.hoverDate = null;
+    filterFromEl.value = '';
+    filterToEl.value = '';
+    updateTriggerLabel();
+    closePopover();
+    if (triggerFetch) {
+      applyResultsFilters();
+    }
+  }
+
+  function openPopover() {
+    const isCurrentlyOpen = wrap.classList.contains('open');
+    closeAllPopups();
+    if (isCurrentlyOpen) return;
+
+    if (calState.start) {
+      const [y, m] = calState.start.split('-').map(Number);
+      calState.viewYear = y;
+      calState.viewMonth = m - 1;
+    } else {
+      const n = new Date();
+      calState.viewYear = n.getFullYear();
+      calState.viewMonth = n.getMonth();
+    }
+
+    renderCalendar();
+    updateTriggerLabel();
+    popover.hidden = false;
+    wrap.classList.add('open');
+    trigger.setAttribute('aria-expanded', 'true');
+
+    const rect = popover.getBoundingClientRect();
+    if (rect.right > window.innerWidth - 12) {
+      popover.style.left = 'auto';
+      popover.style.right = '0';
+    } else {
+      popover.style.left = '0';
+      popover.style.right = 'auto';
+    }
+  }
+
+  function closePopover() {
+    popover.hidden = true;
+    wrap.classList.remove('open');
+    trigger.setAttribute('aria-expanded', 'false');
+  }
+
+  trigger.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (wrap.classList.contains('open')) {
+      closePopover();
+    } else {
+      openPopover();
+    }
+  });
+
+  clearBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    clearRange(true);
+  });
+
+  prevBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (calState.viewMonth === 0) {
+      calState.viewMonth = 11;
+      calState.viewYear -= 1;
+    } else {
+      calState.viewMonth -= 1;
+    }
+    renderCalendar();
+  });
+
+  nextBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (calState.viewMonth === 11) {
+      calState.viewMonth = 0;
+      calState.viewYear += 1;
+    } else {
+      calState.viewMonth += 1;
+    }
+    renderCalendar();
+  });
+
+  footerClearBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    clearRange(true);
+  });
+
+  footerApplyBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (calState.start) {
+      const end = calState.end || calState.start;
+      commitRange(calState.start, end);
+    } else {
+      closePopover();
+    }
+  });
+
+  presetBtns.forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const p = btn.dataset.preset;
+      const today = new Date();
+      let startStr = '';
+      let endStr = '';
+
+      if (p === 'today') {
+        startStr = toIsoDate(today);
+        endStr = startStr;
+      } else if (p === 'yesterday') {
+        const y = new Date(Date.now() - 86400000);
+        startStr = toIsoDate(y);
+        endStr = startStr;
+      } else if (p === 'last7') {
+        endStr = toIsoDate(today);
+        startStr = toIsoDate(new Date(Date.now() - 6 * 86400000));
+      } else if (p === 'last30') {
+        endStr = toIsoDate(today);
+        startStr = toIsoDate(new Date(Date.now() - 29 * 86400000));
+      } else if (p === 'thisMonth') {
+        startStr = toIsoDate(new Date(today.getFullYear(), today.getMonth(), 1));
+        endStr = toIsoDate(today);
+      }
+
+      if (startStr && endStr) {
+        const [y, m] = startStr.split('-').map(Number);
+        calState.viewYear = y;
+        calState.viewMonth = m - 1;
+        commitRange(startStr, endStr);
+      }
+    });
+  });
+
+  if (filterFromEl.value) calState.start = filterFromEl.value;
+  if (filterToEl.value) calState.end = filterToEl.value;
+  updateTriggerLabel();
+
+  customDatePicker = {
+    clear: clearRange,
+    setRange: commitRange,
+    syncFromInputs() {
+      calState.start = filterFromEl.value || null;
+      calState.end = filterToEl.value || null;
+      updateTriggerLabel();
+    },
+  };
+}
+
+// Initialize custom selects and datepicker on results page
+[filterStatusEl, filterRunEl, filterCategoryEl, filterFlaggedEl, filterGenderEl, filterUserEl, flagReasonEl].forEach((el) => {
+  if (el) initCustomSelect(el);
+});
+initCustomDatePicker();
+
+function dateToIso(value, isEndOfDay = false) {
   if (!value) return '';
-  const d = new Date(value);
-  return Number.isNaN(d.getTime()) ? '' : d.toISOString();
+  if (value.includes('T')) {
+    const d = new Date(value);
+    return Number.isNaN(d.getTime()) ? '' : d.toISOString();
+  }
+  const [y, m, d] = value.split('-').map(Number);
+  if (!y || !m || !d) return '';
+  const date = isEndOfDay
+    ? new Date(y, m - 1, d, 23, 59, 59, 999)
+    : new Date(y, m - 1, d, 0, 0, 0, 0);
+  return Number.isNaN(date.getTime()) ? '' : date.toISOString();
 }
 let resultsPollHandle = null;
 
@@ -1258,18 +1957,12 @@ function formatRunId(runId) {
 }
 
 function fillSelectPreserving(selectEl, values, current, allLabel, formatter) {
-  // Prefer whatever the user currently has picked in the dropdown itself over
-  // `current` (the last-*applied* filter value). Results poll on a 3s timer
-  // while a run is active/queued (see the setInterval below), and each poll
-  // used to force selectEl.value back to `current` — clobbering a selection
-  // the user had just made but not yet hit Apply on, which looked like the
-  // dropdown "reverting" a few seconds after clicking it. The Clear button
-  // resets these selects' .value directly before calling loadResults, so
-  // `current` and the live value already agree in that case.
+  if (!selectEl) return;
   const pending = selectEl.value;
   const opts = [`<option value="">${allLabel}</option>`, ...values.map((v) => `<option value="${v}">${formatter ? formatter(v) : v}</option>`)];
   selectEl.innerHTML = opts.join('');
   selectEl.value = pending || current;
+  if (selectEl._customSelect) selectEl._customSelect.sync();
 }
 
 // A big clickable portrait thumbnail with a hover-revealed download button.
@@ -1492,8 +2185,8 @@ async function loadResults(resetPage) {
   if (resultsState.user) params.set('user', resultsState.user);
   if (resultsState.q) params.set('q', resultsState.q);
   if (resultsState.flagged) params.set('flagged', resultsState.flagged);
-  if (resultsState.from) params.set('from', datetimeLocalToIso(resultsState.from));
-  if (resultsState.to) params.set('to', datetimeLocalToIso(resultsState.to));
+  if (resultsState.from) params.set('from', dateToIso(resultsState.from, false));
+  if (resultsState.to) params.set('to', dateToIso(resultsState.to, true));
   params.set('page', String(resultsState.page));
   params.set('pageSize', '25');
 
@@ -1501,9 +2194,9 @@ async function loadResults(resetPage) {
   const data = await res.json();
 
   fillSelectPreserving(filterRunEl, data.runs, resultsState.run, 'All runs', formatRunId);
-  fillSelectPreserving(filterGenderEl, data.genders, resultsState.gender, 'All');
-  fillSelectPreserving(filterCategoryEl, data.categories, resultsState.category, 'All');
-  fillSelectPreserving(filterUserEl, data.users, resultsState.user, 'All');
+  fillSelectPreserving(filterGenderEl, data.genders, resultsState.gender, 'All genders');
+  fillSelectPreserving(filterCategoryEl, data.categories, resultsState.category, 'All categories');
+  fillSelectPreserving(filterUserEl, data.users, resultsState.user, 'All users');
 
   const colCount = resultsState.source === 'redchief' ? 8 : resultsState.source === 'catalog' ? 12 : 11;
   resultsTbodyEl.innerHTML =
@@ -1548,41 +2241,59 @@ function stopResultsPolling() {
   resultsPollHandle = null;
 }
 
-filterApplyBtn.addEventListener('click', () => {
-  // Note: resultsState.source is intentionally NOT touched here — it's owned
-  // entirely by the source tabs above (see setActiveSourceTab), which apply
-  // immediately on click rather than waiting for this button.
+function applyResultsFilters() {
   resultsState.run = filterRunEl.value;
-  resultsState.gender = filterGenderEl.value;
-  resultsState.category = filterCategoryEl.value;
+  resultsState.gender = filterGenderEl ? filterGenderEl.value : '';
+  resultsState.category = filterCategoryEl ? filterCategoryEl.value : '';
   resultsState.status = filterStatusEl.value;
-  resultsState.user = filterUserEl.value;
+  resultsState.user = filterUserEl ? filterUserEl.value : '';
   resultsState.q = filterSearchEl.value.trim();
   resultsState.flagged = filterFlaggedEl.value;
   resultsState.from = filterFromEl.value;
   resultsState.to = filterToEl.value;
   loadResults(true);
+}
+
+// Auto-apply immediately when any dropdown or date filter changes
+filterRunEl.addEventListener('change', applyResultsFilters);
+filterGenderEl?.addEventListener('change', applyResultsFilters);
+filterCategoryEl?.addEventListener('change', applyResultsFilters);
+filterStatusEl.addEventListener('change', applyResultsFilters);
+filterUserEl?.addEventListener('change', applyResultsFilters);
+filterFlaggedEl.addEventListener('change', applyResultsFilters);
+filterFromEl.addEventListener('change', applyResultsFilters);
+filterToEl.addEventListener('change', applyResultsFilters);
+
+let searchDebounceTimer = null;
+filterSearchEl.addEventListener('input', () => {
+  clearTimeout(searchDebounceTimer);
+  searchDebounceTimer = setTimeout(applyResultsFilters, 300);
 });
+filterSearchEl.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    clearTimeout(searchDebounceTimer);
+    applyResultsFilters();
+  }
+});
+
+if (filterApplyBtn) filterApplyBtn.addEventListener('click', applyResultsFilters);
+
 filterClearBtn.addEventListener('click', () => {
-  // Reset every filter control's live DOM value, not just the ones that
-  // don't get rebuilt by fillSelectPreserving — otherwise Run/Gender/
-  // Category/User would keep showing their last pending pick (see
-  // fillSelectPreserving's `pending || current` fallback above).
   filterRunEl.value = '';
-  filterGenderEl.value = '';
-  filterCategoryEl.value = '';
+  if (filterGenderEl) filterGenderEl.value = '';
+  if (filterCategoryEl) filterCategoryEl.value = '';
   filterStatusEl.value = '';
-  filterUserEl.value = '';
+  if (filterUserEl) filterUserEl.value = '';
   filterSearchEl.value = '';
   filterFlaggedEl.value = '';
   filterFromEl.value = '';
   filterToEl.value = '';
-  resultsState = { run: '', source: '', gender: '', category: '', status: '', user: '', q: '', flagged: '', from: '', to: '', page: 1 };
-  setActiveSourceTab('');
+  if (customDatePicker) customDatePicker.clear(false);
+  [filterRunEl, filterGenderEl, filterCategoryEl, filterStatusEl, filterUserEl, filterFlaggedEl].forEach((el) => {
+    if (el && el._customSelect) el._customSelect.sync();
+  });
+  resultsState = { run: '', source: resultsState.source, gender: '', category: '', status: '', user: '', q: '', flagged: '', from: '', to: '', page: 1 };
   loadResults(true);
-});
-filterSearchEl.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') filterApplyBtn.click();
 });
 
 // ---------- flag modal ----------
@@ -1591,6 +2302,7 @@ async function loadFlagReasons() {
   const data = await res.json();
   flagReasons = data.reasons || [];
   flagReasonEl.innerHTML = flagReasons.map((r) => `<option value="${r.value}">${r.label}</option>`).join('');
+  if (flagReasonEl._customSelect) flagReasonEl._customSelect.sync();
 }
 
 function openFlagModal(rowId, currentReason, currentNote) {
@@ -1614,6 +2326,7 @@ function openFlagModal(rowId, currentReason, currentNote) {
     flagModalUnflagBtn.hidden = true;
     flagModalSubmitBtn.textContent = 'Flag job';
   }
+  if (flagReasonEl._customSelect) flagReasonEl._customSelect.sync();
   flagModalOverlayEl.hidden = false;
 }
 

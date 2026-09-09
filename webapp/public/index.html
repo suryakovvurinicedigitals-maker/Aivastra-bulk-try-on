@@ -74,16 +74,16 @@
 
         <section class="panel" id="plan-panel">
           <div class="plan-head">
-            <h2>Batch Execution Plan</h2>
+            <div class="plan-title-group">
+              <h2>Batch Execution Plan</h2>
+              <span class="selection-summary" id="selection-summary"></span>
+            </div>
             <button id="generate-btn" class="btn-primary" disabled>
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
               <span>Generate Batch</span>
             </button>
           </div>
-          <div class="scope-row">
-            <span class="selection-summary" id="selection-summary"></span>
-          </div>
-          <div id="plan-summary">Loading…</div>
+          <div id="plan-summary"></div>
           <div class="run-banner" id="upload-run-banner" hidden></div>
           <div class="confirm-panel" id="confirm-panel" hidden>
             <p id="confirm-text"></p>
@@ -212,64 +212,92 @@
                have quite different shapes (single person+garment vs.
                face/lower/shoe/pose/background vs. multi-angle inputs) and
                rarely make sense to browse mixed together. -->
-          <div class="results-source-tabs" role="tablist" aria-label="Filter results by source">
-            <button type="button" class="source-tab" data-source="" role="tab">All</button>
-            <button type="button" class="source-tab" data-source="tryon" role="tab">Try-On</button>
-            <button type="button" class="source-tab" data-source="redchief" role="tab">RedChief</button>
-            <button type="button" class="source-tab" data-source="catalog" role="tab">Catalog</button>
+          <div class="results-toolbar-top">
+            <div class="results-source-tabs" role="tablist" aria-label="Filter results by source">
+              <button type="button" class="source-tab" data-source="" role="tab">All</button>
+              <button type="button" class="source-tab" data-source="tryon" role="tab">Try-On</button>
+              <button type="button" class="source-tab" data-source="redchief" role="tab">RedChief</button>
+              <button type="button" class="source-tab" data-source="catalog" role="tab">Catalog</button>
+            </div>
+            <div class="results-search-wrap">
+              <svg class="search-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+              <input type="search" id="filter-search" placeholder="Search person, garment, or ID…" />
+            </div>
           </div>
 
           <div class="filter-bar">
-            <label class="filter-item">Run
-              <select id="filter-run"><option value="">All runs</option></select>
-            </label>
-            <label class="filter-item">Gender
-              <select id="filter-gender"><option value="">All genders</option></select>
-            </label>
-            <label class="filter-item">Category
-              <select id="filter-category"><option value="">All categories</option></select>
-            </label>
-            <label class="filter-item">Status
-              <select id="filter-status">
-                <option value="">All statuses</option>
-                <option value="COMPLETED">Completed</option>
-                <option value="FAILED">Failed</option>
-                <option value="ERROR">Error</option>
-              </select>
-            </label>
-            <label class="filter-item">User
-              <select id="filter-user"><option value="">All users</option></select>
-            </label>
-            <label class="filter-item">Flag
-              <select id="filter-flagged">
-                <option value="">All flags</option>
-                <option value="1">Flagged only</option>
-                <option value="resolved">Resolved only</option>
-              </select>
-            </label>
-            <div class="filter-date-group">
-              <span class="filter-date-group-label">Date Range</span>
-              <div class="filter-date-range">
-                <input type="datetime-local" id="filter-from" title="From" aria-label="From date and time" />
-                <span class="filter-date-sep">
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
-                </span>
-                <input type="datetime-local" id="filter-to" title="To" aria-label="To date and time" />
+            <select id="filter-status" aria-label="Status">
+              <option value="">All statuses</option>
+              <option value="COMPLETED">Completed</option>
+              <option value="FAILED">Failed</option>
+              <option value="ERROR">Error</option>
+            </select>
+            <select id="filter-run" aria-label="Run">
+              <option value="">All runs</option>
+            </select>
+            <select id="filter-category" aria-label="Category">
+              <option value="">All categories</option>
+            </select>
+            <select id="filter-flagged" aria-label="Flag">
+              <option value="">All flags</option>
+              <option value="1">Flagged only</option>
+              <option value="resolved">Resolved only</option>
+            </select>
+            <select id="filter-gender" aria-label="Gender">
+              <option value="">All genders</option>
+            </select>
+            <select id="filter-user" aria-label="User">
+              <option value="">All users</option>
+            </select>
+            <div class="custom-datepicker-wrap" id="results-datepicker-wrap">
+              <input type="hidden" id="filter-from" />
+              <input type="hidden" id="filter-to" />
+              <div class="custom-datepicker-trigger-group">
+                <button type="button" class="custom-datepicker-trigger" id="custom-date-trigger" aria-haspopup="dialog" aria-expanded="false" title="Filter by date range">
+                  <svg class="datepicker-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+                  <span class="datepicker-label" id="custom-date-label">Date range</span>
+                  <svg class="custom-select-chevron" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+                </button>
+                <button type="button" class="custom-date-clear-icon" id="custom-date-clear-btn" title="Clear date range" hidden aria-label="Clear date range">
+                  <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                </button>
+              </div>
+              <div class="custom-datepicker-popover" id="custom-datepicker-popover" hidden>
+                <div class="datepicker-presets">
+                  <button type="button" class="datepicker-preset" data-preset="today">Today</button>
+                  <button type="button" class="datepicker-preset" data-preset="yesterday">Yesterday</button>
+                  <button type="button" class="datepicker-preset" data-preset="last7">Last 7d</button>
+                  <button type="button" class="datepicker-preset" data-preset="last30">Last 30d</button>
+                  <button type="button" class="datepicker-preset" data-preset="thisMonth">This month</button>
+                </div>
+                <div class="datepicker-calendar-main">
+                  <div class="datepicker-cal-header">
+                    <button type="button" class="datepicker-nav-btn" id="cal-prev-btn" title="Previous month" aria-label="Previous month">
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 18 9 12 15 6"/></svg>
+                    </button>
+                    <span class="datepicker-month-title" id="cal-month-title">September 2026</span>
+                    <button type="button" class="datepicker-nav-btn" id="cal-next-btn" title="Next month" aria-label="Next month">
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="9 18 15 12 9 6"/></svg>
+                    </button>
+                  </div>
+                  <div class="datepicker-weekdays">
+                    <span>Su</span><span>Mo</span><span>Tu</span><span>We</span><span>Th</span><span>Fr</span><span>Sa</span>
+                  </div>
+                  <div class="datepicker-days-grid" id="cal-days-grid"></div>
+                </div>
+                <div class="datepicker-footer">
+                  <div class="datepicker-selection-display" id="cal-selection-display">Select range</div>
+                  <div class="datepicker-footer-actions">
+                    <button type="button" class="datepicker-btn-clear" id="cal-footer-clear">Clear</button>
+                    <button type="button" class="datepicker-btn-apply" id="cal-footer-apply">Apply</button>
+                  </div>
+                </div>
               </div>
             </div>
-            <label class="filter-search">Search
-              <div class="search-input-wrap">
-                <svg class="search-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-                <input type="search" id="filter-search" placeholder="Search person or garment name…" />
-              </div>
-            </label>
-            <div class="filter-actions">
-              <button id="filter-apply-btn" class="btn-primary btn-small">Apply Filters</button>
-              <button id="filter-clear-btn" class="btn-secondary btn-small">Reset</button>
-            </div>
+            <button type="button" class="btn-secondary btn-small" id="filter-clear-btn" title="Reset all filters">Reset</button>
+            <button id="filter-apply-btn" class="btn-primary btn-small" hidden>Apply</button>
+            <div class="results-meta" id="results-meta">Loading…</div>
           </div>
-
-          <div class="results-meta" id="results-meta">Loading…</div>
 
           <div class="results-table-wrap">
             <table class="results-table" id="results-table">

@@ -1199,7 +1199,8 @@ const server = http.createServer(async (req, res) => {
         json(res, 400, { error: 'invalid request body' });
         return;
       }
-      const { warnings } = scanInput(INPUT_DIR);
+      const rawWarnings = body.scope === 'selected' ? [] : scanInput(INPUT_DIR).warnings;
+      const warnings = rawWarnings.filter((w: string) => !w.includes('No folders found under'));
       const counted = cfg ? await computeJobs(cfg, body.scope, body.selection) : [];
       const byCategory: Record<string, number> = {};
       for (const j of counted) byCategory[j.categorySlug] = (byCategory[j.categorySlug] ?? 0) + 1;
