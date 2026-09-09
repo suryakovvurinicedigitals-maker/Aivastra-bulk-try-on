@@ -389,12 +389,15 @@ function redchiefGroupByPrefix(files) {
 function createRedchiefRowsFromFileGroups(groups) {
   const w = redchiefConfig.workflows[redchiefSelectedWorkflowIndex];
   for (const files of groups) {
-    const slots = w.viewLabels.map((label, i) => ({
-      id: redchiefUid('slot'),
-      label,
-      file: files[i] ?? null, // extra files beyond inputCount are dropped, not placed elsewhere
-      previewUrl: null,
-    }));
+    const slots = w.viewLabels.map((label, i) => {
+      const file = files[i] ?? null; // extra files beyond inputCount are dropped, not placed elsewhere
+      return {
+        id: redchiefUid('slot'),
+        label,
+        file,
+        previewUrl: file ? URL.createObjectURL(file) : null,
+      };
+    });
     redchiefRows.push({
       id: redchiefUid('row'),
       label: `Item ${++redchiefRowCounter}`,
@@ -446,7 +449,13 @@ function redchiefMatchViewLabels(viewLabels, files) {
     // manually-added row or a bulk-prefix-grouped row is never `unmatched`
     // (only this folder-matching path sets it), since those paths never
     // attempted an automatic match in the first place.
-    return { id: redchiefUid('slot'), label, file: match ?? null, previewUrl: null, unmatched: !match };
+    return {
+      id: redchiefUid('slot'),
+      label,
+      file: match ?? null,
+      previewUrl: match ? URL.createObjectURL(match) : null,
+      unmatched: !match,
+    };
   });
 }
 
