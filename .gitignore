@@ -18,6 +18,7 @@ Thumbs.db
 # accounts, all local state. -wal/-shm are SQLite's WAL sidecar files,
 # present whenever the DB has been opened since the last clean checkpoint.
 /data/
+*.sqlite*
 
 # Pre-DB local state, retired by lib/db.mts's one-time migration (renamed to
 # *.migrated instead of deleted — see db.mts) but still gitignored in case an
