@@ -74,6 +74,24 @@ db.exec(`
     resolved_note  TEXT,
     resolved_by    TEXT
   );
+
+  -- One row per input/output image belonging to a job_results row that has
+  -- more than the single person+garment→output shape the four base columns
+  -- assume — RedChief in particular, where a job takes 1-6 labeled view
+  -- images in and can return more than one output image. Try-On rows never
+  -- get any of these (their single input/output pair is already fully
+  -- represented by the base columns + INPUT_DIR lookup); Catalog rows don't
+  -- yet either, pending its own dedicated Results-page layout. See
+  -- webapp/server.mts's recordResult() — the only writer.
+  CREATE TABLE IF NOT EXISTS job_result_media (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    result_id   INTEGER NOT NULL REFERENCES job_results(id) ON DELETE CASCADE,
+    kind        TEXT NOT NULL, -- 'input' | 'output'
+    label       TEXT NOT NULL,
+    file_path   TEXT NOT NULL,
+    position    INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_job_result_media_result_id ON job_result_media(result_id);
 `);
 
 // job_results predates the "how long did generation take?" requirement, so
@@ -97,6 +115,25 @@ db.exec(`
   // exact per-source mapping.
   if (!jobResultsCols.includes('source')) {
     db.exec("ALTER TABLE job_results ADD COLUMN source TEXT NOT NULL DEFAULT 'tryon'");
+  }
+  // credits: only RedChief exposes a per-job credit cost today (propicly's
+  // GET /v1/dev/redchief/config) — nullable since Try-On/Catalog rows (and
+  // every row written before this migration) have no such figure to record.
+  if (!jobResultsCols.includes('credits')) {
+    db.exec('ALTER TABLE job_results ADD COLUMN credits INTEGER');
+  }
+  // started_by: who actually triggered THIS job. Try-On rows still get their
+  // attribution for free via runs.started_by (one batch = one person, so the
+  // per-run value is already correct — this column stays NULL for them and
+  // listResults falls back to the run's value). RedChief/Catalog rows share
+  // one synthetic pseudo-run per source ('redchief-batch'/'catalog-batch',
+  // see recordResult in webapp/server.mts) that could span many different
+  // people's submissions over the tool's lifetime, so only a per-ROW value
+  // can attribute them correctly — a per-run value would incorrectly show
+  // whoever happened to trigger that pseudo-run's first-ever job for every
+  // job after it.
+  if (!jobResultsCols.includes('started_by')) {
+    db.exec('ALTER TABLE job_results ADD COLUMN started_by TEXT');
   }
 }
 
@@ -291,12 +328,34 @@ export interface JobResultInput {
    * POST /api/results/record, the only inserter for the latter two.
    */
   source?: 'tryon' | 'redchief' | 'catalog';
+  /** Per-job credit cost, when the upstream API exposes one (RedChief's flat creditCost today). Undefined/null for Try-On and Catalog — neither surfaces a per-job figure this tool can read. */
+  credits?: number;
+  /** Who actually triggered this specific job — see the migration comment above (ALTER TABLE ... started_by) for why this has to be per-row rather than reusing the run-level attribution for RedChief/Catalog. Omit for Try-On, which still gets correct attribution for free via runs.started_by. */
+  startedBy?: string;
+  /**
+   * Extra labeled input/output images beyond the single person→garment→output
+   * shape the base columns assume — inserted into job_result_media in the
+   * same call. See that table's comment in the CREATE TABLE block. Kind
+   * 'input' entries are what the Results page's RedChief view renders as the
+   * "Inputs" column (one thumbnail per view, in submission order); 'output'
+   * entries render as "Output" (usually one, but a job can return several).
+   */
+  media?: { kind: 'input' | 'output'; label: string; filePath: string }[];
 }
 
 export interface JobResultRow extends JobResultInput {
   id: number;
   runId: string;
   source: 'tryon' | 'redchief' | 'catalog';
+}
+
+export interface JobResultMediaRow {
+  id: number;
+  resultId: number;
+  kind: 'input' | 'output';
+  label: string;
+  filePath: string;
+  position: number;
 }
 
 export interface FlagRow {
@@ -326,6 +385,19 @@ function rowToJobResult(r: Record<string, unknown>): JobResultRow {
     finishedAt: String(r.finished_at),
     durationMs: r.duration_ms != null ? Number(r.duration_ms) : undefined,
     source: (r.source as JobResultRow['source']) ?? 'tryon',
+    credits: r.credits != null ? Number(r.credits) : undefined,
+    startedBy: (r.started_by as string) ?? undefined,
+  };
+}
+
+function rowToJobResultMedia(r: Record<string, unknown>): JobResultMediaRow {
+  return {
+    id: Number(r.id),
+    resultId: Number(r.result_id),
+    kind: r.kind as JobResultMediaRow['kind'],
+    label: String(r.label),
+    filePath: String(r.file_path),
+    position: Number(r.position),
   };
 }
 
@@ -342,27 +414,67 @@ export function getRunMeta(runId: string): { startedBy?: string } {
 }
 
 const insertJobResultStmt = db.prepare(`
-  INSERT INTO job_results (run_id, gender, person_name, category_slug, garment_name, job_id, status, error_code, error, output_file, finished_at, duration_ms, source)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO job_results (run_id, gender, person_name, category_slug, garment_name, job_id, status, error_code, error, output_file, finished_at, duration_ms, source, credits, started_by)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`);
+const insertJobResultMediaStmt = db.prepare(`
+  INSERT INTO job_result_media (result_id, kind, label, file_path, position)
+  VALUES (?, ?, ?, ?, ?)
 `);
 export function insertJobResult(runId: string, r: JobResultInput): number {
   ensureRun(runId); // no-op if already inserted with a startedBy
-  const info = insertJobResultStmt.run(
-    runId,
-    r.gender,
-    r.personName,
-    r.categorySlug,
-    r.garmentName,
-    r.jobId ?? null,
-    r.status,
-    r.errorCode ?? null,
-    r.error ?? null,
-    r.outputFile ?? null,
-    r.finishedAt,
-    r.durationMs ?? null,
-    r.source ?? 'tryon',
-  );
-  return Number(info.lastInsertRowid);
+  // Wrapped in a transaction so a job's row and its media rows (if any) never
+  // end up split across a crash — either both land or neither does.
+  db.exec('BEGIN');
+  let resultId: number;
+  try {
+    const info = insertJobResultStmt.run(
+      runId,
+      r.gender,
+      r.personName,
+      r.categorySlug,
+      r.garmentName,
+      r.jobId ?? null,
+      r.status,
+      r.errorCode ?? null,
+      r.error ?? null,
+      r.outputFile ?? null,
+      r.finishedAt,
+      r.durationMs ?? null,
+      r.source ?? 'tryon',
+      r.credits ?? null,
+      r.startedBy ?? null,
+    );
+    resultId = Number(info.lastInsertRowid);
+    r.media?.forEach((m, i) => insertJobResultMediaStmt.run(resultId, m.kind, m.label, m.filePath, i));
+    db.exec('COMMIT');
+  } catch (err) {
+    db.exec('ROLLBACK');
+    throw err;
+  }
+  return resultId;
+}
+
+const mediaForResultStmt = db.prepare('SELECT * FROM job_result_media WHERE result_id = ? ORDER BY kind, position');
+export function getResultMedia(resultId: number): JobResultMediaRow[] {
+  return (mediaForResultStmt.all(resultId) as Record<string, unknown>[]).map(rowToJobResultMedia);
+}
+
+/** Batched equivalent of getResultMedia for a page of results — one query keyed by result_id rather than N. */
+export function getMediaForResultIds(resultIds: number[]): Map<number, JobResultMediaRow[]> {
+  const byId = new Map<number, JobResultMediaRow[]>();
+  if (resultIds.length === 0) return byId;
+  const placeholders = resultIds.map(() => '?').join(',');
+  const rows = db
+    .prepare(`SELECT * FROM job_result_media WHERE result_id IN (${placeholders}) ORDER BY result_id, kind, position`)
+    .all(...resultIds) as Record<string, unknown>[];
+  for (const r of rows) {
+    const m = rowToJobResultMedia(r);
+    const list = byId.get(m.resultId);
+    if (list) list.push(m);
+    else byId.set(m.resultId, [m]);
+  }
+  return byId;
 }
 
 const completedKeysForRunStmt = db.prepare(
@@ -402,8 +514,13 @@ export interface ResultFilters {
 }
 
 export interface ResultRowWithFlag extends JobResultRow {
-  startedBy: string | null;
+  // Already optional on JobResultRow (via JobResultInput) — re-declared here
+  // only as documentation that by this point it's the fully-resolved value
+  // (this row's own started_by if it has one, else its run's), never the
+  // raw per-row column alone.
+  startedBy?: string;
   flag: FlagRow | null;
+  media: JobResultMediaRow[];
 }
 
 export interface ResultsPage {
@@ -441,7 +558,10 @@ export function listResults(f: ResultFilters): ResultsPage {
     params.status = f.status;
   }
   if (f.startedBy) {
-    where.push('r.started_by = @startedBy');
+    // COALESCE so this matches whichever level actually carries attribution
+    // for a given row — the row's own started_by for RedChief/Catalog (see
+    // the migration comment on job_results.started_by), the run's for Try-On.
+    where.push('COALESCE(jr.started_by, r.started_by) = @startedBy');
     params.startedBy = f.startedBy;
   }
   if (f.q) {
@@ -476,7 +596,7 @@ export function listResults(f: ResultFilters): ResultsPage {
   const rows = db
     .prepare(
       `
-      SELECT jr.*, r.started_by AS started_by,
+      SELECT jr.*, r.started_by AS run_started_by,
         fl.reason AS flag_reason, fl.note AS flag_note, fl.flagged_by AS flag_flagged_by, fl.flagged_at AS flag_flagged_at,
         fl.resolved_at AS flag_resolved_at, fl.resolved_note AS flag_resolved_note, fl.resolved_by AS flag_resolved_by
       ${fromSql}
@@ -486,9 +606,20 @@ export function listResults(f: ResultFilters): ResultsPage {
     )
     .all(pageParams) as Record<string, unknown>[];
 
+  // Batched, not per-row — one IN(...) query for the whole page rather than
+  // N queries. Empty for every Try-On/Catalog row (no media rows exist for
+  // those sources yet); populated for RedChief.
+  const mediaByResult = getMediaForResultIds(rows.map((r) => Number(r.id)));
+
   const resultRows: ResultRowWithFlag[] = rows.map((r) => ({
     ...rowToJobResult(r),
-    startedBy: (r.started_by as string) ?? null,
+    // jr.started_by (this row's own attribution, if it has one — RedChief/
+    // Catalog) wins; run_started_by (Try-On's batch-level attribution) is
+    // the fallback. rowToJobResult already read r.started_by as the row's
+    // own value (see its `started_by: (r.started_by as string) ?? undefined`
+    // line) — re-stated explicitly here since this is the one place both
+    // levels are actually in scope together.
+    startedBy: (r.started_by as string) ?? (r.run_started_by as string) ?? undefined,
     flag: r.flag_reason
       ? {
           resultId: Number(r.id),
@@ -501,6 +632,7 @@ export function listResults(f: ResultFilters): ResultsPage {
           resolvedBy: (r.flag_resolved_by as string) ?? undefined,
         }
       : null,
+    media: mediaByResult.get(Number(r.id)) ?? [],
   }));
 
   // Filter-dropdown universes are drawn from the whole table, not the current
@@ -511,9 +643,19 @@ export function listResults(f: ResultFilters): ResultsPage {
   const categories = (db.prepare('SELECT DISTINCT category_slug FROM job_results').all() as { category_slug: string }[])
     .map((r) => r.category_slug)
     .sort();
-  const users = (db.prepare('SELECT DISTINCT started_by FROM runs WHERE started_by IS NOT NULL').all() as { started_by: string }[])
-    .map((r) => r.started_by)
-    .sort();
+  // Union of run-level (Try-On) and row-level (RedChief/Catalog) attribution
+  // — see the started_by migration comment for why these live at different
+  // levels. A Set dedupes a user who happens to appear in both.
+  const users = [
+    ...new Set([
+      ...(db.prepare('SELECT DISTINCT started_by FROM runs WHERE started_by IS NOT NULL').all() as { started_by: string }[]).map(
+        (r) => r.started_by,
+      ),
+      ...(db.prepare('SELECT DISTINCT started_by FROM job_results WHERE started_by IS NOT NULL').all() as { started_by: string }[]).map(
+        (r) => r.started_by,
+      ),
+    ]),
+  ].sort();
 
   return { rows: resultRows, total, runs, sources, genders, categories, users };
 }

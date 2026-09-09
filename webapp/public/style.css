@@ -1123,6 +1123,30 @@ select:focus, input:focus, textarea:focus, .dropzone:focus-within {
   display: inline-block;
 }
 
+/* Top-level Results source switcher (All / Try-On / RedChief / Catalog) —
+   deliberately styled as its own pill row above the filter bar, not folded
+   into it, since it's a click-to-apply-instantly control rather than one
+   more field waiting on the Apply button below. */
+.results-source-tabs {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+.source-tab {
+  padding: 8px 18px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 0.88rem;
+  font-weight: 650;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.source-tab:hover { color: var(--text); border-color: var(--pink); }
+.source-tab.active { background: var(--pink-tint); color: var(--pink); border-color: var(--pink); }
+
 /* Filter Bar */
 .filter-bar {
   display: flex;
@@ -1369,6 +1393,28 @@ select:focus, input:focus, textarea:focus, .dropzone:focus-within {
   height: 204px;
 }
 
+/* RedChief's Inputs/Output cells: 1-6 smaller labeled thumbnails side by
+   side (a full-size .media-box per view would blow out row height), each
+   still using .media-box's own click-to-lightbox/download/hover behavior —
+   just shrunk and given a label strip below instead of beside it. */
+.results-table .cell-position { color: var(--muted); font-size: 0.7rem; font-variant-numeric: tabular-nums; }
+.media-chip-row { display: flex; flex-wrap: wrap; gap: 8px; max-width: 380px; }
+.media-chip { width: 84px; height: 112px; }
+.media-chip-label {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 2px 4px;
+  background: rgba(0, 0, 0, 0.6);
+  color: #fff;
+  font-size: 0.62rem;
+  text-align: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  pointer-events: none;
+}
 .thumb-missing {
   width: 130px;
   height: 172px;
@@ -2987,6 +3033,24 @@ select:focus, input:focus, textarea:focus, .dropzone:focus-within {
   color: var(--text);
   font-size: 0.925rem;
 }
+
+/* Folder-bulk-select control inside a catalog asset picker's section header
+   (see catalogAssetFolderControlHtml in catalog.js) — a small link-style
+   button plus whatever match-status text the last folder upload left. */
+.catalog-asset-folder-control { font-weight: 500; }
+.catalog-asset-folder-control .link-btn { font-size: 0.76rem; }
+.catalog-asset-folder-status { flex-basis: 100%; margin: 4px 0 0; font-weight: 500; }
+
+/* Folder files that matched nothing in the curated library — plain preview
+   only, no checkbox, can't be selected for generation (see
+   catalogUnmatchedThumbsHtml's doc comment in catalog.js for why: the
+   upstream API has no way to submit a custom face/lower/shoe/pose/background
+   image). Dimmed + dashed border so it visually reads as "not usable here"
+   at a glance, distinct from the solid-bordered selected/library tiles. */
+.catalog-unmatched-label { margin: 8px 0 6px; }
+.catalog-unmatched-thumbs { margin: 0 0 12px; }
+.catalog-unmatched-thumbs .upload-thumb { width: 88px; height: 88px; opacity: 0.6; }
+.catalog-unmatched-thumbs .upload-thumb img { border: 1px dashed var(--muted); }
 
 .login-submit {
   width: 100%;

@@ -319,6 +319,13 @@ function safeRunId(v: string | null): string | null {
 }
 
 // ---- POST /api/results/record validation (see the route below) ----
+// 'catalog' is still accepted here for backward compatibility with any
+// browser tab that has an old cached catalog.js loaded (no-store means that
+// shouldn't linger, but a request mid-flight during a deploy could still
+// land) — current catalog.js no longer calls this route at all, since
+// runCatalogAggregate now records catalog results itself, server-side, the
+// moment each one finishes (see that function's doc comment). RedChief is
+// the only source that still genuinely depends on this route.
 const RESULT_RECORD_SOURCES = new Set(['redchief', 'catalog']);
 const RESULT_RECORD_STATUSES = new Set(['COMPLETED', 'FAILED']);
 
@@ -328,6 +335,135 @@ function safeResultLabel(v: unknown, maxLen: number): string | null {
   const trimmed = v.trim();
   if (trimmed.length === 0 || trimmed.length > maxLen) return null;
   return trimmed;
+}
+
+/** Validates an optional http(s) asset URL (e.g. catalog.js's face/lower/shoe thumbnailUrls) — undefined for anything not a well-formed http(s) URL, rather than a hard 400, since these are cosmetic (a Results-page thumbnail), not required for the job itself to be recorded correctly. */
+function safeResultUrl(v: unknown): string | undefined {
+  if (typeof v !== 'string') return undefined;
+  try {
+    const u = new URL(v);
+    return u.protocol === 'https:' || u.protocol === 'http:' ? u.toString() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Decodes a `data:<mime>;base64,<...>` URI into raw bytes plus a best-effort file extension (falls back to .jpg — every mime this tool ever sends is an image). Throws on anything that doesn't look like a base64 data URI, since a malformed one here would otherwise silently write garbage bytes to disk. */
+function decodeDataUrl(dataUrl: string): { bytes: Buffer; ext: string } {
+  const m = /^data:([^;,]+);base64,([a-zA-Z0-9+/=]+)$/.exec(dataUrl);
+  if (!m) throw new Error('not a base64 data URI');
+  const mime = m[1]!;
+  const ext = mime === 'image/png' ? '.png' : mime === 'image/webp' ? '.webp' : '.jpg';
+  return { bytes: Buffer.from(m[2]!, 'base64'), ext };
+}
+
+/** Writes bytes under OUTPUT_DIR/<source>/ with a filename that's just unique, never meaningful — the DB row (personName/categorySlug/garmentName, or media label) carries the human-readable identity. */
+function writeResultMedia(source: string, bytes: Buffer, ext: string): string {
+  const outDir = path.join(OUTPUT_DIR, source);
+  mkdirSync(outDir, { recursive: true });
+  const outFile = path.join(outDir, `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}${ext}`);
+  writeFileSync(outFile, bytes);
+  return outFile;
+}
+
+/**
+ * Shared by POST /api/results/record (still the only path for RedChief,
+ * which has no server-side aggregate loop of its own — every job there is
+ * already submitted as its own direct API call, so the "one call starts N
+ * jobs" problem runCatalogAggregate exists for doesn't apply to it) and
+ * runCatalogAggregate below (which calls this directly, server-side, the
+ * instant each look finishes — no longer waiting on the browser to notice
+ * and report it, which is what could previously lose a result if the tab
+ * was closed or the poll loop just hadn't caught up yet).
+ *
+ * For COMPLETED, downloads/decodes every input+output image and persists the
+ * bytes under OUTPUT_DIR/<source>/ (presigned imageUrls have a ~900s TTL, and
+ * RedChief's inputs only ever exist as in-browser File objects — nothing
+ * durable to point at later either way); for FAILED, records the row with no
+ * media. Throws on a download/decode failure — the two call sites decide how
+ * to surface that (a 502 response for the HTTP route, a FAILED status for
+ * the aggregate-run job stub).
+ *
+ * `inputs`/`outputs` are optional (Catalog's caller doesn't send them yet —
+ * it has no per-view/per-look media concept of its own, still relies on the
+ * legacy single-outputUrl → outputFile path via `imageUrl` for backward
+ * compat with the rest of this function and with getResultRow's bundle/zip
+ * logic, which reads r.outputFile directly). RedChief's caller sends both.
+ */
+async function recordResult(input: {
+  source: 'redchief' | 'catalog';
+  status: 'COMPLETED' | 'FAILED';
+  gender: string;
+  personName: string;
+  categorySlug: string;
+  garmentName: string;
+  jobId?: string;
+  imageUrl?: string;
+  // Each input is EITHER a base64 data URI (RedChief's photos, which only
+  // ever exist as in-browser File objects — nothing else to point a URL at)
+  // OR an http(s) URL this server downloads itself (Catalog's face/pose/
+  // background/shoe asset-library thumbnails, which ARE already hosted
+  // images — no point round-tripping them through the client as base64).
+  // Catalog's garment photo is the one input that's base64 too (the
+  // tester's own upload), so both shapes coexist within a single call's
+  // `inputs` array.
+  inputs?: { label: string; dataUrl?: string; imageUrl?: string }[];
+  outputs?: { label?: string; imageUrl: string }[];
+  credits?: number;
+  startedBy?: string;
+  error?: string;
+}): Promise<number> {
+  let outputFile: string | undefined;
+  const media: { kind: 'input' | 'output'; label: string; filePath: string }[] = [];
+  if (input.status === 'COMPLETED') {
+    for (const inp of input.inputs ?? []) {
+      if (inp.dataUrl) {
+        const { bytes, ext } = decodeDataUrl(inp.dataUrl);
+        media.push({ kind: 'input', label: inp.label, filePath: writeResultMedia(input.source, bytes, ext) });
+      } else if (inp.imageUrl) {
+        const imgRes = await fetch(inp.imageUrl);
+        if (!imgRes.ok) throw new Error(`HTTP ${imgRes.status}`);
+        const bytes = Buffer.from(await imgRes.arrayBuffer());
+        media.push({ kind: 'input', label: inp.label, filePath: writeResultMedia(input.source, bytes, '.jpg') });
+      }
+      // An input with neither is silently skipped — e.g. an optional
+      // lower/shoe axis the tester didn't select for this run.
+    }
+    if (input.outputs && input.outputs.length > 0) {
+      for (let i = 0; i < input.outputs.length; i++) {
+        const out = input.outputs[i]!;
+        const imgRes = await fetch(out.imageUrl);
+        if (!imgRes.ok) throw new Error(`HTTP ${imgRes.status}`);
+        const bytes = Buffer.from(await imgRes.arrayBuffer());
+        const filePath = writeResultMedia(input.source, bytes, '.jpg');
+        media.push({ kind: 'output', label: out.label ?? `Output ${i + 1}`, filePath });
+        if (i === 0) outputFile = filePath; // first output doubles as the legacy single-thumbnail/bundle-zip field
+      }
+    } else if (input.imageUrl) {
+      // Legacy single-output path (Catalog today) — unchanged behavior.
+      const imgRes = await fetch(input.imageUrl);
+      if (!imgRes.ok) throw new Error(`HTTP ${imgRes.status}`);
+      const bytes = Buffer.from(await imgRes.arrayBuffer());
+      outputFile = writeResultMedia(input.source, bytes, '.jpg');
+    }
+  }
+  const runId = `${input.source}-batch`; // one shared pseudo-run per source — neither tab has a real "run" concept the way the CLI/Upload-Generate batch does
+  ensureRun(runId);
+  return insertJobResult(runId, {
+    gender: input.gender,
+    personName: input.personName,
+    categorySlug: input.categorySlug,
+    garmentName: input.garmentName,
+    jobId: input.jobId,
+    status: input.status,
+    error: input.status === 'FAILED' ? (input.error ?? 'unknown error') : undefined,
+    outputFile,
+    finishedAt: new Date().toISOString(),
+    source: input.source,
+    credits: input.credits,
+    startedBy: input.startedBy,
+    media: media.length > 0 ? media : undefined,
+  });
 }
 
 // ---- cookies / sessions ----
@@ -437,6 +573,20 @@ interface CatalogAggregateJob {
   jobId: string; // our own stable id, assigned up front — never the upstream jobId, which doesn't exist yet until this look is actually submitted
   pose: string;
   background: string;
+  // Human-readable labels for this look, supplied by the client at submit
+  // time (catalogBatch.options was already loaded there) — falls back to
+  // the raw slug if the client didn't send one, so an older/mismatched
+  // front-end still works, just with a less pretty Results-page name.
+  poseLabel: string;
+  backgroundLabel: string;
+  // Asset-library thumbnail URLs for this look's pose/background, supplied
+  // by the client (catalogBatch.options was already loaded there) — used
+  // only for the Results page's dedicated Catalog row (see recordResult's
+  // `inputs` in runCatalogAggregate below), never sent upstream. Optional:
+  // an older/mismatched front-end that doesn't send these just gets a
+  // Results-page row missing those two thumbnails, nothing else breaks.
+  poseThumbnailUrl?: string;
+  backgroundThumbnailUrl?: string;
   status: CatalogJobStatus;
   // Captured once, from the single poll that first observed COMPLETED —
   // never re-fetched from upstream after that. Known trade-off: the
@@ -448,14 +598,41 @@ interface CatalogAggregateJob {
   // that refresh path did get a fresh URL — lost in exchange for not
   // hammering upstream with a re-poll of every already-done job on every
   // subsequent poll of a still-running one. Not a regression for the
-  // Results page: /api/results/record downloads and persists the bytes
-  // locally the moment a job finishes, independent of this.
+  // Results page: recordResult (see runCatalogAggregate) downloads and
+  // persists the bytes locally the moment a job finishes, independent of
+  // whether the client ever polls again after that.
   imageUrl?: string;
   error?: string;
 }
 interface CatalogAggregateRun {
   jobs: CatalogAggregateJob[];
   createdAt: number;
+  // Labels for the Results-page row each job in this run finishes as — see
+  // the comment on runCatalogAggregate for why these are recorded
+  // server-side now instead of depending on the browser to report them.
+  gender: string;
+  personName: string; // the run's face/lower/shoe combo label (catalog.js's run.runLabel) — closest equivalent to try-on's "person"
+  garmentLabel: string;
+  startedBy: string; // whoever POSTed /api/catalog/generate — every look in this run was submitted by the same user, unlike the shared 'catalog-batch' pseudo-run id itself
+  // The garment type slug (e.g. "jacket", "dress") the tester picked to
+  // scope the asset pool — used as this run's job_results.categorySlug so
+  // Catalog rows are actually filterable/groupable by real category instead
+  // of every row sharing the literal string 'catalog' (the original,
+  // simplest-possible choice before the Results page grew a dedicated
+  // Catalog view). Falls back to 'catalog' when the tester left "— any —"
+  // selected, since categorySlug is NOT NULL in the schema.
+  categorySlug: string;
+  // Face is the "model" for a catalog look — required by the upstream API,
+  // so always present. Lower/shoe are optional per-run selections; garment
+  // is the tester's own uploaded photo (base64, from `base.garment` at
+  // submit time, reused here rather than re-sent) so it never needs
+  // uploading a second time just to be recorded.
+  faceLabel: string;
+  faceThumbnailUrl?: string;
+  lowerLabel?: string;
+  lowerThumbnailUrl?: string;
+  shoeLabel?: string;
+  shoeThumbnailUrl?: string;
 }
 const catalogAggregateRuns = new Map<string, CatalogAggregateRun>();
 
@@ -480,6 +657,19 @@ function sweepCatalogAggregateRuns() {
  * handler's point of view: it doesn't await this, it returns the initial
  * all-QUEUED job list immediately and the client's existing poll loop picks
  * up progress as `run.jobs` mutate in place here.
+ *
+ * Also calls recordResult() itself the instant each look reaches a terminal
+ * state — this used to be the client's job (catalog.js POSTing to
+ * /api/results/record after noticing a terminal status on its next poll),
+ * which meant a result that finished server-side but hadn't been noticed
+ * and reported yet was silently lost forever if the tab was closed or the
+ * server restarted in that window. Doing it right here, synchronously with
+ * the same poll loop that already observes the terminal state, makes each
+ * result durable the moment it's known — no dependency on the browser
+ * staying open or polling again. catalog.js's own POST to
+ * /api/results/record for catalog jobs was removed to match (recording
+ * twice would double up the Results page); RedChief still uses that route
+ * as-is, since it has no equivalent server-side loop of its own.
  */
 // Console-only, no state — lets `pm2 logs` / the dev console show the
 // throttle actually working (e.g. "active=2" never climbing past
@@ -524,6 +714,48 @@ async function runCatalogAggregate(cfg: DevApiConfig, run: CatalogAggregateRun, 
         } finally {
           catalogActiveLooks--;
           console.log(`[catalog] finished look ${stub.jobId} — status=${stub.status} active=${catalogActiveLooks}/${CATALOG_CONCURRENCY}`);
+          // Persist right here, synchronously with the poll loop's own
+          // observation of the terminal state — see this function's doc
+          // comment for why. Best-effort: a download failure (COMPLETED
+          // only — recordResult fetches imageUrl itself) just gets logged,
+          // it can't turn an already-terminal job stub into an error the
+          // client would know what to do with at this point.
+          if (stub.status === 'COMPLETED' || stub.status === 'FAILED') {
+            try {
+              // Every axis that was actually part of this job: garment is
+              // the tester's own upload (base.garment, already a base64/
+              // data-URI string — reused as-is rather than re-fetched),
+              // face/lower/shoe are admin-curated asset-library images
+              // (hosted thumbnailUrls, downloaded here same as an output),
+              // pose/background vary per look. Lower/shoe are only pushed
+              // when the tester actually selected one for this run — an
+              // unselected optional axis contributes nothing rather than a
+              // broken/missing thumbnail entry.
+              const inputs: { label: string; dataUrl?: string; imageUrl?: string }[] = [
+                { label: 'Face', imageUrl: run.faceThumbnailUrl },
+                { label: 'Garment', dataUrl: base.garment },
+              ];
+              if (stub.poseThumbnailUrl) inputs.push({ label: 'Pose', imageUrl: stub.poseThumbnailUrl });
+              if (stub.backgroundThumbnailUrl) inputs.push({ label: 'Background', imageUrl: stub.backgroundThumbnailUrl });
+              if (run.shoeThumbnailUrl) inputs.push({ label: 'Shoes', imageUrl: run.shoeThumbnailUrl });
+              if (run.lowerThumbnailUrl) inputs.push({ label: 'Lower', imageUrl: run.lowerThumbnailUrl });
+              await recordResult({
+                source: 'catalog',
+                status: stub.status,
+                gender: run.gender,
+                personName: run.personName,
+                categorySlug: run.categorySlug,
+                garmentName: `${run.garmentLabel} — ${stub.poseLabel} × ${stub.backgroundLabel}`,
+                jobId: stub.jobId,
+                inputs,
+                outputs: stub.imageUrl ? [{ label: 'Output', imageUrl: stub.imageUrl }] : undefined,
+                error: stub.error,
+                startedBy: run.startedBy,
+              });
+            } catch (err) {
+              console.error(`[catalog] failed to record result for look ${stub.jobId}:`, err instanceof Error ? err.message : err);
+            }
+          }
         }
       }),
     ),
@@ -1214,6 +1446,15 @@ const server = http.createServer(async (req, res) => {
           personThumb: personFile ? `/api/file?path=${encodeURIComponent(path.relative(INPUT_DIR, path.join(personDir, personFile)))}` : null,
           garmentThumb: garmentFile ? `/api/file?path=${encodeURIComponent(path.relative(INPUT_DIR, path.join(garmentDir, garmentFile)))}` : null,
           outputThumb: r.outputFile ? `/api/result-file?path=${encodeURIComponent(path.relative(OUTPUT_DIR, r.outputFile))}` : null,
+          credits: r.credits ?? null,
+          // RedChief (and, later, Catalog) rows carry their own labeled
+          // input/output thumbnails instead of the tryon-shaped person/
+          // garment/output fields above — see job_result_media in lib/db.mts.
+          media: r.media.map((m) => ({
+            kind: m.kind,
+            label: m.label,
+            thumb: `/api/result-file?path=${encodeURIComponent(path.relative(OUTPUT_DIR, m.filePath))}`,
+          })),
           flag: r.flag,
         };
       });
@@ -1262,7 +1503,12 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/results/record') {
       let body: Buffer;
       try {
-        body = await readBodyCapped(req, 8 * 1024); // just labels/URLs, never an image itself — generous headroom for a long presigned/CDN-signed URL
+        // RedChief now sends its input images as base64 data URIs too (up to
+        // 6 views, same shape/cap as POST /api/redchief's own job-submission
+        // route) since those images only ever exist as in-browser File
+        // objects — nothing else durable to point a URL at. Catalog's calls
+        // stay tiny (labels/URLs only) and are well within this cap too.
+        body = await readBodyCapped(req, 90 * 1024 * 1024);
       } catch {
         json(res, 413, { error: { code: 'VALIDATION', message: 'request body too large' } });
         return;
@@ -1296,54 +1542,90 @@ const server = http.createServer(async (req, res) => {
       const jobId = safeResultLabel(parsed?.jobId, 100) ?? undefined;
       const jobError = status === 'FAILED' ? (safeResultLabel(parsed?.error, 500) ?? 'unknown error') : undefined;
 
-      let outputFile: string | undefined;
-      if (status === 'COMPLETED') {
+      const creditsRaw = parsed?.credits;
+      const credits = typeof creditsRaw === 'number' && Number.isFinite(creditsRaw) && creditsRaw >= 0 ? Math.trunc(creditsRaw) : undefined;
+
+      // Legacy single-output shape — still accepted for Catalog (and any
+      // stale cached RedChief tab), superseded below by `outputs` when sent.
+      let imageUrl: string | undefined;
+      if (status === 'COMPLETED' && typeof parsed?.imageUrl === 'string') {
         let parsedUrl: URL;
         try {
-          parsedUrl = new URL(typeof parsed?.imageUrl === 'string' ? parsed.imageUrl : '');
+          parsedUrl = new URL(parsed.imageUrl);
         } catch {
-          json(res, 400, { error: { code: 'VALIDATION', message: 'imageUrl must be a valid URL when status is COMPLETED' } });
+          json(res, 400, { error: { code: 'VALIDATION', message: 'imageUrl must be a valid URL' } });
           return;
         }
         if (parsedUrl.protocol !== 'https:' && parsedUrl.protocol !== 'http:') {
           json(res, 400, { error: { code: 'VALIDATION', message: 'imageUrl must be http(s)' } });
           return;
         }
-        try {
-          const imgRes = await fetch(parsedUrl);
-          if (!imgRes.ok) throw new Error(`HTTP ${imgRes.status}`);
-          const bytes = Buffer.from(await imgRes.arrayBuffer());
-          const outDir = path.join(OUTPUT_DIR, source);
-          mkdirSync(outDir, { recursive: true });
-          // Filename just needs to be unique per record, not meaningful — the
-          // DB row (personName/categorySlug/garmentName) carries the
-          // human-readable identity, same split as tryon's outputFile.
-          const outFile = path.join(outDir, `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}.jpg`);
-          writeFileSync(outFile, bytes);
-          outputFile = outFile;
-        } catch (err) {
-          json(res, 502, {
-            error: { code: 'DOWNLOAD_FAILED', message: `could not download result image: ${err instanceof Error ? err.message : String(err)}` },
-          });
+        imageUrl = parsedUrl.toString();
+      }
+
+      // New multi-input/multi-output shape (RedChief) — each input is a
+      // base64 data URI (the browser's only copy of that image), each output
+      // an http(s) URL this server downloads itself, same trust boundary as
+      // the legacy single imageUrl above.
+      let inputs: { label: string; dataUrl?: string; imageUrl?: string }[] | undefined;
+      let outputs: { label?: string; imageUrl: string }[] | undefined;
+      if (status === 'COMPLETED') {
+        if (Array.isArray(parsed?.inputs)) {
+          inputs = [];
+          for (const raw of parsed.inputs) {
+            const label = safeResultLabel(raw?.label, 40);
+            if (!label || typeof raw?.dataUrl !== 'string' || !raw.dataUrl.startsWith('data:')) {
+              json(res, 400, { error: { code: 'VALIDATION', message: 'each input needs a label and a base64 data URI' } });
+              return;
+            }
+            inputs.push({ label, dataUrl: raw.dataUrl });
+          }
+        }
+        if (Array.isArray(parsed?.outputs)) {
+          outputs = [];
+          for (const raw of parsed.outputs) {
+            let parsedUrl: URL;
+            try {
+              parsedUrl = new URL(typeof raw?.imageUrl === 'string' ? raw.imageUrl : '');
+            } catch {
+              json(res, 400, { error: { code: 'VALIDATION', message: 'each output needs a valid imageUrl' } });
+              return;
+            }
+            if (parsedUrl.protocol !== 'https:' && parsedUrl.protocol !== 'http:') {
+              json(res, 400, { error: { code: 'VALIDATION', message: 'output imageUrl must be http(s)' } });
+              return;
+            }
+            outputs.push({ label: safeResultLabel(raw?.label, 40) ?? undefined, imageUrl: parsedUrl.toString() });
+          }
+        }
+        if (!imageUrl && (!outputs || outputs.length === 0)) {
+          json(res, 400, { error: { code: 'VALIDATION', message: 'imageUrl or outputs is required when status is COMPLETED' } });
           return;
         }
       }
 
-      const runId = `${source}-batch`; // one shared pseudo-run per source — neither tab has a real "run" concept the way the CLI/Upload-Generate batch does
-      ensureRun(runId);
-      const id = insertJobResult(runId, {
-        gender,
-        personName,
-        categorySlug,
-        garmentName,
-        jobId,
-        status: status as 'COMPLETED' | 'FAILED',
-        error: jobError,
-        outputFile,
-        finishedAt: new Date().toISOString(),
-        source: source as 'redchief' | 'catalog',
-      });
-      json(res, 201, { id });
+      try {
+        const id = await recordResult({
+          source: source as 'redchief' | 'catalog',
+          status: status as 'COMPLETED' | 'FAILED',
+          gender,
+          personName,
+          categorySlug,
+          garmentName,
+          jobId,
+          imageUrl,
+          inputs,
+          outputs,
+          credits,
+          startedBy: session!.username,
+          error: jobError,
+        });
+        json(res, 201, { id });
+      } catch (err) {
+        json(res, 502, {
+          error: { code: 'DOWNLOAD_FAILED', message: `could not download result image: ${err instanceof Error ? err.message : String(err)}` },
+        });
+      }
       return;
     }
 
@@ -1645,7 +1927,25 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      const { garment, gender, face, looks, garmentType, lower, shoe, aspectRatio, resolution } = parsed ?? {};
+      const {
+        garment,
+        gender,
+        face,
+        looks,
+        garmentType,
+        lower,
+        shoe,
+        aspectRatio,
+        resolution,
+        garmentLabel,
+        runLabel,
+        faceLabel,
+        faceThumbnailUrl,
+        lowerLabel,
+        lowerThumbnailUrl,
+        shoeLabel,
+        shoeThumbnailUrl,
+      } = parsed ?? {};
       if (typeof garment !== 'string' || garment.length === 0) {
         json(res, 400, { error: { code: 'VALIDATION', message: 'garment must be a non-empty base64/data-URI string' } });
         return;
@@ -1674,6 +1974,25 @@ const server = http.createServer(async (req, res) => {
         json(res, 400, { error: { code: 'VALIDATION', message: 'looks must be 1-12 {pose, background} slug pairs' } });
         return;
       }
+      // poseLabel/backgroundLabel/garmentLabel/runLabel are optional,
+      // human-readable display strings the client already has cached (from
+      // its own GET /api/catalog/options call) — used only for the Results
+      // page's garmentName column (see runCatalogAggregate's recordResult
+      // call), never sent upstream. Free text, not slugs, so validated with
+      // safeResultLabel rather than CATALOG_SLUG_RE; falls back to the slug
+      // itself if missing/invalid so an older front-end (or a hand-built
+      // request) still works, just with a less pretty Results-page label.
+      const catalogGarmentLabel = safeResultLabel(garmentLabel, 200) ?? 'Garment';
+      const catalogRunLabel = safeResultLabel(runLabel, 200) ?? face;
+      // Same "optional, cosmetic, never sent upstream" treatment as
+      // poseLabel/backgroundLabel above — see runCatalogAggregate's
+      // recordResult call for where these actually get used.
+      const catalogFaceLabel = safeResultLabel(faceLabel, 200) ?? face;
+      const catalogFaceThumbnailUrl = safeResultUrl(faceThumbnailUrl);
+      const catalogLowerLabel = safeResultLabel(lowerLabel, 200) ?? undefined;
+      const catalogLowerThumbnailUrl = safeResultUrl(lowerThumbnailUrl);
+      const catalogShoeLabel = safeResultLabel(shoeLabel, 200) ?? undefined;
+      const catalogShoeThumbnailUrl = safeResultUrl(shoeThumbnailUrl);
       if (garmentType !== undefined && (typeof garmentType !== 'string' || !CATALOG_SLUG_RE.test(garmentType))) {
         json(res, 400, { error: { code: 'VALIDATION', message: 'invalid garmentType' } });
         return;
@@ -1706,13 +2025,33 @@ const server = http.createServer(async (req, res) => {
       sweepCatalogAggregateRuns();
       const aggId = randomUUID();
       const run: CatalogAggregateRun = {
-        jobs: (looks as { pose: string; background: string }[]).map((l, i) => ({
+        jobs: (
+          looks as { pose: string; background: string; poseLabel?: string; backgroundLabel?: string; poseThumbnailUrl?: string; backgroundThumbnailUrl?: string }[]
+        ).map((l, i) => ({
           jobId: `${aggId}-${i}`,
           pose: l.pose,
           background: l.background,
+          poseLabel: safeResultLabel(l.poseLabel, 200) ?? l.pose,
+          backgroundLabel: safeResultLabel(l.backgroundLabel, 200) ?? l.background,
+          poseThumbnailUrl: safeResultUrl(l.poseThumbnailUrl),
+          backgroundThumbnailUrl: safeResultUrl(l.backgroundThumbnailUrl),
           status: 'QUEUED',
         })),
         createdAt: Date.now(),
+        gender,
+        personName: catalogRunLabel,
+        garmentLabel: catalogGarmentLabel,
+        startedBy: session!.username,
+        // "— any —" (garmentType left unselected) has nothing real to
+        // categorize by — falls back to the literal 'catalog' rather than
+        // an empty string, since job_results.category_slug is NOT NULL.
+        categorySlug: (garmentType as string) || 'catalog',
+        faceLabel: catalogFaceLabel,
+        faceThumbnailUrl: catalogFaceThumbnailUrl,
+        lowerLabel: catalogLowerLabel,
+        lowerThumbnailUrl: catalogLowerThumbnailUrl,
+        shoeLabel: catalogShoeLabel,
+        shoeThumbnailUrl: catalogShoeThumbnailUrl,
       };
       catalogAggregateRuns.set(aggId, run);
       const base: Omit<CatalogGenerateBody, 'looks'> = {

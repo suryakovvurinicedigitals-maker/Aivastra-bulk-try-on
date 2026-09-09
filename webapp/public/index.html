@@ -205,17 +205,23 @@
         <section class="panel results-panel">
           <div class="run-banner" id="run-banner" hidden></div>
 
+          <!-- Top-level source switcher, separate from (and independent of)
+               the rest of the filter bar below: clicking one of these applies
+               immediately (no Apply click needed) and instantly narrows the
+               table to just that tab's results, since Try-On/RedChief/Catalog
+               have quite different shapes (single person+garment vs.
+               face/lower/shoe/pose/background vs. multi-angle inputs) and
+               rarely make sense to browse mixed together. -->
+          <div class="results-source-tabs" role="tablist" aria-label="Filter results by source">
+            <button type="button" class="source-tab" data-source="" role="tab">All</button>
+            <button type="button" class="source-tab" data-source="tryon" role="tab">Try-On</button>
+            <button type="button" class="source-tab" data-source="redchief" role="tab">RedChief</button>
+            <button type="button" class="source-tab" data-source="catalog" role="tab">Catalog</button>
+          </div>
+
           <div class="filter-bar">
             <label class="filter-item">Run
               <select id="filter-run"><option value="">All runs</option></select>
-            </label>
-            <label class="filter-item">Source
-              <select id="filter-source">
-                <option value="">All sources</option>
-                <option value="tryon">Try-On</option>
-                <option value="redchief">RedChief</option>
-                <option value="catalog">Catalog</option>
-              </select>
             </label>
             <label class="filter-item">Gender
               <select id="filter-gender"><option value="">All genders</option></select>
@@ -266,8 +272,8 @@
           <div class="results-meta" id="results-meta">Loading…</div>
 
           <div class="results-table-wrap">
-            <table class="results-table">
-              <thead>
+            <table class="results-table" id="results-table">
+              <thead id="results-thead-default">
                 <tr>
                   <th>ID</th>
                   <th>Source</th>
@@ -280,6 +286,50 @@
                   <th>Finished</th>
                   <th>Duration</th>
                   <th>Review / QA</th>
+                </tr>
+              </thead>
+              <!-- RedChief's result shape (N labeled input thumbnails + N
+                   labeled output thumbnails + a flat credit cost per job)
+                   doesn't fit the generic person/garment/category columns
+                   above, so it gets its own <thead>, toggled by
+                   setActiveSourceTab() alongside a matching per-row renderer
+                   in app.js — see resultRowHtml's `source === 'redchief'`
+                   branch. Both theads live in the DOM at once; CSS/JS just
+                   flips which is hidden, since a table can only have one
+                   <thead> shown without rebuilding the element anyway. -->
+              <thead id="results-thead-redchief" hidden>
+                <tr>
+                  <th>ID</th>
+                  <th>User</th>
+                  <th>Inputs</th>
+                  <th>Output</th>
+                  <th>Credits</th>
+                  <th>Status</th>
+                  <th>When</th>
+                  <th>Flag</th>
+                </tr>
+              </thead>
+              <!-- Catalog's result shape is the other one that doesn't fit
+                   the generic columns: a face/garment/pose/background/shoe
+                   axis per job rather than one person+garment, so it gets
+                   its own named columns (one thumbnail per axis, not a
+                   flexible Inputs list like RedChief's — Catalog's axes are
+                   fixed and always mean the same thing) — see
+                   catalogResultRowHtml in app.js. -->
+              <thead id="results-thead-catalog" hidden>
+                <tr>
+                  <th>ID</th>
+                  <th>User</th>
+                  <th>Face</th>
+                  <th>Garment</th>
+                  <th>Pose</th>
+                  <th>Background</th>
+                  <th>Shoes</th>
+                  <th>Output</th>
+                  <th>Credits</th>
+                  <th>Status</th>
+                  <th>When</th>
+                  <th>Flag</th>
                 </tr>
               </thead>
               <tbody id="results-tbody">
