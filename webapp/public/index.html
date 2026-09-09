@@ -21,6 +21,7 @@
         <a href="#upload" class="nav-link" data-view="upload"><span class="nav-icon">⬆</span>Upload</a>
         <a href="#results" class="nav-link" data-view="results"><span class="nav-icon">📁</span>Results</a>
         <a href="#redchief" class="nav-link" data-view="redchief"><span class="nav-icon">📦</span>RedChief</a>
+        <a href="#catalog" class="nav-link" data-view="catalog"><span class="nav-icon">🗂️</span>Catalog Batch</a>
         <a href="#users" class="nav-link" data-view="users" id="nav-users-link" hidden><span class="nav-icon">👥</span>Users</a>
         <a href="#settings" class="nav-link" data-view="settings" id="nav-settings-link" hidden><span class="nav-icon">🔑</span>API Setup</a>
       </nav>
@@ -140,7 +141,7 @@
       <section class="view" data-view="results" hidden>
         <header class="view-header">
           <h1>Results</h1>
-          <p class="subtitle">Every try-on job that's been run, across every batch.</p>
+          <p class="subtitle">Every generated result across all three tabs — Try-On, RedChief, and Catalog Batch — filterable by source.</p>
         </header>
 
         <section class="panel results-panel">
@@ -149,6 +150,14 @@
           <div class="filter-bar">
             <label>Run
               <select id="filter-run"><option value="">All runs</option></select>
+            </label>
+            <label>Source
+              <select id="filter-source">
+                <option value="">All</option>
+                <option value="tryon">Try-On</option>
+                <option value="redchief">RedChief</option>
+                <option value="catalog">Catalog</option>
+              </select>
             </label>
             <label>Gender
               <select id="filter-gender"><option value="">All</option></select>
@@ -196,6 +205,7 @@
               <thead>
                 <tr>
                   <th>ID</th>
+                  <th>Source</th>
                   <th>User</th>
                   <th>Person</th>
                   <th>Garment</th>
@@ -208,7 +218,7 @@
                 </tr>
               </thead>
               <tbody id="results-tbody">
-                <tr><td colspan="10" class="empty">Loading…</td></tr>
+                <tr><td colspan="11" class="empty">Loading…</td></tr>
               </tbody>
             </table>
           </div>
@@ -361,6 +371,53 @@
           </div>
         </div>
       </section>
+
+      <!-- ============ CATALOG BATCH VIEW ============ -->
+      <section class="view" data-view="catalog" hidden>
+        <header class="view-header">
+          <h1>Catalog Batch</h1>
+          <p class="subtitle">Bulk-test the catalog pipeline — upload as many garment photos as you want, pick the shared faces/backgrounds/poses (plus optional lower garment/shoe) once, then generate every combination across every garment in one go.</p>
+        </header>
+
+        <div class="status err" id="catalog-availability-banner" hidden></div>
+
+        <section class="panel" id="catalog-bulk-panel">
+          <h2>👗 Add garments</h2>
+          <p class="hint">Each photo becomes its own card below — upload as many as you want to bulk-test. All of them share the test configuration below.</p>
+          <div class="upload-row">
+            <div class="dropzone" id="catalog-bulk-dropzone" tabindex="0">
+              <input type="file" id="catalog-bulk-input" accept="image/*" multiple hidden />
+              <span class="icon">⬆</span>
+              <span>Drag garment photos here, or click to choose — one card per photo</span>
+            </div>
+            <button type="button" class="btn-secondary" id="catalog-add-row-btn">+ Add garment</button>
+          </div>
+          <div class="status" id="catalog-bulk-status"></div>
+        </section>
+
+        <section class="panel" id="catalog-rows-panel" hidden>
+          <h2>🗂️ Garments</h2>
+          <div class="catalog-rows" id="catalog-rows"></div>
+        </section>
+
+        <section class="panel" id="catalog-config-panel">
+          <h2>🎯 Test configuration</h2>
+          <p class="hint">Applies to every garment above — pick gender, faces, poses, backgrounds (plus optional lower/shoe) once, then Generate runs the whole matrix.</p>
+          <div id="catalog-config-body"></div>
+        </section>
+
+        <div class="redchief-footer-bar" id="catalog-footer-bar" hidden>
+          <span id="catalog-row-count"></span>
+          <button type="button" class="btn-primary" id="catalog-submit-btn" disabled>Generate</button>
+        </div>
+        <div class="confirm-panel" id="catalog-submit-confirm" hidden>
+          <p id="catalog-submit-confirm-text"></p>
+          <div class="confirm-actions">
+            <button type="button" id="catalog-submit-confirm-cancel-btn" class="btn-secondary">Cancel</button>
+            <button type="button" id="catalog-submit-confirm-btn" class="btn-danger">Yes, submit</button>
+          </div>
+        </div>
+      </section>
     </div>
   </div>
 
@@ -393,5 +450,6 @@
 
   <script src="/app.js"></script>
   <script src="/redchief.js"></script>
+  <script src="/catalog.js"></script>
 </body>
 </html>

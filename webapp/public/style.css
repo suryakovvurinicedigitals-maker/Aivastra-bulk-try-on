@@ -582,6 +582,12 @@ select:focus, .dropzone:focus-within { outline: 2px solid var(--pink); outline-o
 .badge.ok { background: rgba(26, 138, 76, 0.12); color: var(--ok); }
 .badge.err { background: color-mix(in srgb, var(--err) 15%, transparent); color: var(--err); }
 
+/* Results table's Source column — one color per tab so a mixed-source view
+   (the default, once the Source filter is left on "All") is easy to scan. */
+.badge.source-tryon { background: color-mix(in srgb, var(--muted) 18%, transparent); color: var(--muted); }
+.badge.source-redchief { background: var(--pink-tint); color: var(--pink); }
+.badge.source-catalog { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
+
 .pagination { display: flex; align-items: center; gap: 12px; justify-content: center; margin-top: 14px; font-size: 0.82rem; }
 
 @media (max-width: 900px) {
@@ -797,3 +803,70 @@ select:focus, .dropzone:focus-within { outline: 2px solid var(--pink); outline-o
   box-shadow: var(--shadow);
 }
 .redchief-footer-bar span { font-size: 0.85rem; color: var(--muted); }
+
+/* ---- Catalog Batch tab ----
+   Row cards, slots, status badges, and the results grid all reuse the
+   .redchief-* classes above verbatim (they're purely structural/visual, not
+   feature-specific) — only the asset-picker bits below (gender/garment-type/
+   aspect/resolution fields, and the face/lower/shoe/pose/background pickers)
+   are unique to this tab and need their own rules. */
+.catalog-rows { display: flex; flex-direction: column; gap: 16px; margin-top: 10px; }
+.catalog-garment-slot { max-width: 220px; margin-top: 12px; }
+
+/* #catalog-config-body holds the single shared test-configuration panel
+   (gender/garment-type/aspect/resolution fields + the face/lower/shoe/pose/
+   background pickers below them) — applied once, to every garment, rather
+   than per-row like .catalog-row-fields used to be nested under. */
+#catalog-config-body { display: flex; flex-direction: column; gap: 14px; margin-top: 10px; }
+
+.catalog-row-fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 12px; }
+.catalog-row-fields label,
+.catalog-picker-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.78rem;
+  font-weight: 650;
+  color: var(--muted);
+}
+.catalog-row-fields select,
+.catalog-picker-group select {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 0.85rem;
+  background: var(--bg);
+  color: var(--text);
+}
+.catalog-picker-row { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; }
+
+.catalog-asset-section-label { font-size: 0.78rem; font-weight: 650; color: var(--muted); margin-bottom: 6px; }
+.catalog-asset-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 10px; }
+.catalog-asset-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 0.74rem;
+  text-align: center;
+  color: var(--muted);
+  background: var(--bg);
+}
+.catalog-asset-item img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 6px; }
+.catalog-asset-item:hover { border-color: var(--pink); }
+.catalog-asset-item.selected { border-color: var(--pink); background: var(--pink-tint); color: var(--pink); font-weight: 650; }
+
+.catalog-looks-summary { font-size: 0.8rem; color: var(--muted); margin: 4px 0 0; }
+.catalog-looks-summary.warn { color: var(--warn); font-weight: 650; }
+.catalog-result-label { font-size: 0.78rem; font-weight: 650; color: var(--muted); }
+
+/* One .catalog-run per selected face — groups that face's job results
+   together so a multi-face row's results don't blur into one undifferentiated
+   grid. */
+.catalog-runs { display: flex; flex-direction: column; gap: 16px; margin-top: 10px; }
+.catalog-run { border-top: 1px solid var(--border); padding-top: 12px; }
+.catalog-run-header { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; font-size: 0.85rem; }

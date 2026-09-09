@@ -17,13 +17,26 @@
  *
  * Usage: pnpm bulk-tryon:web   (defaults to http://localhost:5959)
  */
+import { randomUUID } from 'node:crypto';
 import { createReadStream, existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { getBalance, getCategories, type DevApiConfig } from '../lib/api-client.mts';
+import {
+  DevApiError,
+  generateCatalog,
+  getBalance,
+  getCatalogOptions,
+  getCatalogueStatus,
+  getCategories,
+  type CatalogGender,
+  type CatalogGenerateBody,
+  type CatalogJobStatus,
+  type DevApiConfig,
+} from '../lib/api-client.mts';
 import { runBatch } from '../lib/batch.mts';
-import { clearFlag, ensureRun, getFlag, getResultRow, listResults, resolveFlag, setFlag } from '../lib/db.mts';
+import { createLimiter } from '../lib/concurrency.mts';
+import { clearFlag, ensureRun, getFlag, getResultRow, insertJobResult, listResults, resolveFlag, setFlag } from '../lib/db.mts';
 import { scanInput, type TryonJobSpec } from '../lib/scan-input.mts';
 import {
   PropiclyApiError,
@@ -298,6 +311,18 @@ function safeRunId(v: string | null): string | null {
   return v;
 }
 
+// ---- POST /api/results/record validation (see the route below) ----
+const RESULT_RECORD_SOURCES = new Set(['redchief', 'catalog']);
+const RESULT_RECORD_STATUSES = new Set(['COMPLETED', 'FAILED']);
+
+/** Trimmed, non-empty, length-capped string — used for the free-text labels /api/results/record accepts (product/combo names), which unlike gender/category/run-id aren't restricted to a slug charset. */
+function safeResultLabel(v: unknown, maxLen: number): string | null {
+  if (typeof v !== 'string') return null;
+  const trimmed = v.trim();
+  if (trimmed.length === 0 || trimmed.length > maxLen) return null;
+  return trimmed;
+}
+
 // ---- cookies / sessions ----
 const SESSION_COOKIE = 'bulk_tryon_session';
 
@@ -357,6 +382,145 @@ function propiclyErrorResponse(res: http.ServerResponse, err: unknown) {
     return;
   }
   json(res, 502, { error: { code: 'PROXY_ERROR', message: err instanceof Error ? err.message : String(err) } });
+}
+
+/** Same idea as propiclyErrorResponse, for the catalog routes below (which talk to the aivastra host via the DevApiError class instead). */
+function devApiErrorResponse(res: http.ServerResponse, err: unknown) {
+  if (err instanceof DevApiError) {
+    json(res, err.status, { error: { code: err.code, message: err.message } });
+    return;
+  }
+  json(res, 502, { error: { code: 'PROXY_ERROR', message: err instanceof Error ? err.message : String(err) } });
+}
+
+const CATALOG_GENDERS = new Set(['men', 'women', 'boys', 'girls']);
+const CATALOG_ASPECT_RATIOS = new Set(['1:1', '2:3', '3:4', '4:5']);
+const CATALOG_RESOLUTIONS = new Set(['HD', '2K', '4K']);
+const CATALOG_SLUG_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/; // matches the aivastra API's PUBLIC_SLUG
+
+// catalog.js fires one POST /api/catalog/generate per (garment x face x
+// lower x shoe) combination, all at once, client-side — a bulk submit from
+// even one tester can easily be dozens of calls, and each one's `looks`
+// array (up to 12 pose x background pairs) makes the upstream aivastra API
+// start ALL of those jobs running concurrently the instant that one call is
+// made. So limiting concurrent /api/catalog/generate *calls* alone doesn't
+// give "N jobs at a time" — a single call with 12 looks would still blow
+// straight past N. catalogGenerateLimit is the shared gate; see
+// runCatalogAggregate below for how it's actually used to throttle at the
+// per-job level (one look per limited call, slot held until that job
+// finishes), which is what makes this genuinely mirror the try-on batch's
+// per-job throttling in lib/batch.mts's runBatch. Being a single
+// process-wide instance also keeps it fair across every person using the
+// panel at once, not just self-throttling within one browser tab.
+const CATALOG_CONCURRENCY = Number(process.env.CATALOG_CONCURRENCY ?? 2);
+const catalogGenerateLimit = createLimiter(CATALOG_CONCURRENCY);
+
+// ---- Catalog Batch aggregate-run tracking ----
+// Each (pose, background) "look" the client selects becomes its own
+// single-look upstream generateCatalog call, gated by catalogGenerateLimit
+// and held (via polling right here on the server) until that job reaches a
+// terminal state — see runCatalogAggregate. The client is unaware of this:
+// it still POSTs one `looks` array per run and gets back one
+// {catalogueId, jobs} shape, then polls GET /api/catalog/catalogues/:id
+// exactly as before (see that route below) — what's actually behind that
+// catalogueId is one of these in-memory aggregate runs, not a single real
+// upstream catalogue. The real per-look catalogueIds/jobIds from upstream
+// are tracked only inside runCatalogAggregate and never exposed to the client.
+interface CatalogAggregateJob {
+  jobId: string; // our own stable id, assigned up front — never the upstream jobId, which doesn't exist yet until this look is actually submitted
+  pose: string;
+  background: string;
+  status: CatalogJobStatus;
+  // Captured once, from the single poll that first observed COMPLETED —
+  // never re-fetched from upstream after that. Known trade-off: the
+  // presigned URL is only valid ~900s, so a tester who leaves the Catalog
+  // Batch tab open past that and hits catalog.js's onerror-triggered
+  // refreshCatalogGarmentRun() will keep getting this same stale URL back
+  // (GET below now serves purely from this map, no live upstream re-check).
+  // Previously GET proxied straight through to upstream on every call, so
+  // that refresh path did get a fresh URL — lost in exchange for not
+  // hammering upstream with a re-poll of every already-done job on every
+  // subsequent poll of a still-running one. Not a regression for the
+  // Results page: /api/results/record downloads and persists the bytes
+  // locally the moment a job finishes, independent of this.
+  imageUrl?: string;
+  error?: string;
+}
+interface CatalogAggregateRun {
+  jobs: CatalogAggregateJob[];
+  createdAt: number;
+}
+const catalogAggregateRuns = new Map<string, CatalogAggregateRun>();
+
+// Nothing else ever deletes an aggregate run — sweep anything older than 2h
+// (generously past POLL_TIMEOUT_MS, so this never removes a run a client
+// could still legitimately be polling) on every new generate call, so a
+// long-lived server process doesn't accumulate them forever.
+const CATALOG_AGGREGATE_TTL_MS = 2 * 60 * 60 * 1000;
+function sweepCatalogAggregateRuns() {
+  const cutoff = Date.now() - CATALOG_AGGREGATE_TTL_MS;
+  for (const [id, run] of catalogAggregateRuns) {
+    if (run.createdAt < cutoff) catalogAggregateRuns.delete(id);
+  }
+}
+
+/**
+ * Submits one run's looks to the upstream API one at a time, each gated by
+ * catalogGenerateLimit and held until that look's job finishes (or
+ * POLL_TIMEOUT_MS elapses) — this is what actually delivers "N jobs at a
+ * time, next N once these are done" for Catalog Batch, mirroring runBatch's
+ * per-job throttling for the try-on flow. Fire-and-forget from the route
+ * handler's point of view: it doesn't await this, it returns the initial
+ * all-QUEUED job list immediately and the client's existing poll loop picks
+ * up progress as `run.jobs` mutate in place here.
+ */
+// Console-only, no state — lets `pm2 logs` / the dev console show the
+// throttle actually working (e.g. "active=2" never climbing past
+// CATALOG_CONCURRENCY, and a visible gap between a look finishing and the
+// next one starting) without needing to inspect the DB or add a debug UI.
+let catalogActiveLooks = 0;
+
+async function runCatalogAggregate(cfg: DevApiConfig, run: CatalogAggregateRun, base: Omit<CatalogGenerateBody, 'looks'>): Promise<void> {
+  await Promise.all(
+    run.jobs.map((stub) =>
+      catalogGenerateLimit(async () => {
+        catalogActiveLooks++;
+        console.log(`[catalog] submitting look ${stub.jobId} (${stub.pose} x ${stub.background}) — active=${catalogActiveLooks}/${CATALOG_CONCURRENCY}`);
+        try {
+          const result = await generateCatalog(cfg, { ...base, looks: [{ pose: stub.pose, background: stub.background }] });
+          const realJob = result.jobs[0];
+          if (!realJob) throw new Error('upstream returned no job for this look');
+          stub.status = 'RUNNING';
+          // Single-look call, so getCatalogueStatus always comes back with
+          // exactly one job — poll it at the same cadence/timeout the
+          // try-on flow's runBatch uses, until it reaches a terminal state.
+          const deadline = Date.now() + POLL_TIMEOUT_MS;
+          for (;;) {
+            const status = await getCatalogueStatus(cfg, result.catalogueId);
+            const job = status.jobs.find((j) => j.jobId === realJob.jobId) ?? status.jobs[0];
+            if (job) {
+              stub.status = job.status;
+              stub.imageUrl = job.imageUrl;
+              stub.error = job.error;
+            }
+            if (!job || job.status === 'COMPLETED' || job.status === 'FAILED') break;
+            if (Date.now() > deadline) {
+              stub.status = 'FAILED';
+              stub.error = 'poll timeout';
+              break;
+            }
+            await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+          }
+        } catch (err) {
+          stub.status = 'FAILED';
+          stub.error = err instanceof DevApiError ? err.message : err instanceof Error ? err.message : String(err);
+        } finally {
+          catalogActiveLooks--;
+          console.log(`[catalog] finished look ${stub.jobId} — status=${stub.status} active=${catalogActiveLooks}/${CATALOG_CONCURRENCY}`);
+        }
+      }),
+    ),
+  );
 }
 
 /** Safe decodeURIComponent for a job-id path segment. A stray `%` (or any
@@ -988,6 +1152,7 @@ const server = http.createServer(async (req, res) => {
     //      newest-first comes for free from the id index, no re-sort needed.
     if (req.method === 'GET' && url.pathname === '/api/results') {
       const runFilter = safeRunId(url.searchParams.get('run'));
+      const sourceFilter = safeSlug(url.searchParams.get('source'));
       const genderFilter = safeSlug(url.searchParams.get('gender'));
       const categoryFilter = safeSlug(url.searchParams.get('category'));
       const statusFilter = url.searchParams.get('status');
@@ -1008,6 +1173,7 @@ const server = http.createServer(async (req, res) => {
 
       const page_ = listResults({
         runId: runFilter ?? undefined,
+        source: sourceFilter ?? undefined,
         gender: genderFilter ?? undefined,
         categorySlug: categoryFilter ?? undefined,
         status: statusFilter || undefined,
@@ -1028,6 +1194,7 @@ const server = http.createServer(async (req, res) => {
         return {
           id: r.id,
           runId: r.runId,
+          source: r.source,
           startedBy: r.startedBy,
           gender: r.gender,
           personName: r.personName,
@@ -1051,6 +1218,7 @@ const server = http.createServer(async (req, res) => {
         totalPages: Math.max(1, Math.ceil(page_.total / pageSize)),
         rows,
         runs: page_.runs,
+        sources: page_.sources,
         genders: page_.genders,
         categories: page_.categories,
         users: page_.users,
@@ -1060,6 +1228,115 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'GET' && url.pathname === '/api/results/flag-reasons') {
       json(res, 200, { reasons: FLAG_REASONS });
+      return;
+    }
+
+    // ---- RedChief / Catalog result recording ----
+    // Both of those tabs run their submit/poll loop entirely client-side (see
+    // redchief.js/catalog.js) and know context (product label, face/lower/
+    // shoe/pose/background combo, etc.) this server never sees on its own —
+    // unlike the try-on flow, where lib/batch.mts already lives on the
+    // server and calls insertJobResult() directly from inside its own poll
+    // loop. So the client reports each completed/failed job here once, and
+    // the server does the trust-sensitive part: downloading the actual image
+    // bytes (rather than storing the presigned URL, which expires in ~900s
+    // and would otherwise leave every RedChief/Catalog "result" a broken
+    // thumbnail an hour later — see catalog.js/redchief.js's own onerror
+    // refetch workaround, which only patches this for the current page load)
+    // and writing the job_results row.
+    //
+    // Dedup is best-effort and client-side only (redchief.js/catalog.js each
+    // track a "recorded" Set, mirroring the "refreshed" Sets already used
+    // there for thumbnail retries) — a page reload before that Set is
+    // populated could in principle record the same completed job twice.
+    // Acceptable for a local single-operator testing tool: the worst case is
+    // a duplicate *row* in the Results table, never duplicate spend (this
+    // route never creates jobs, only records ones that already ran).
+    if (req.method === 'POST' && url.pathname === '/api/results/record') {
+      let body: Buffer;
+      try {
+        body = await readBodyCapped(req, 8 * 1024); // just labels/URLs, never an image itself — generous headroom for a long presigned/CDN-signed URL
+      } catch {
+        json(res, 413, { error: { code: 'VALIDATION', message: 'request body too large' } });
+        return;
+      }
+      let parsed: any;
+      try {
+        parsed = JSON.parse(body.toString('utf8'));
+      } catch {
+        json(res, 400, { error: { code: 'VALIDATION', message: 'invalid JSON body' } });
+        return;
+      }
+
+      const source = parsed?.source;
+      if (typeof source !== 'string' || !RESULT_RECORD_SOURCES.has(source)) {
+        json(res, 400, { error: { code: 'VALIDATION', message: "source must be 'redchief' or 'catalog'" } });
+        return;
+      }
+      const status = parsed?.status;
+      if (typeof status !== 'string' || !RESULT_RECORD_STATUSES.has(status)) {
+        json(res, 400, { error: { code: 'VALIDATION', message: "status must be 'COMPLETED' or 'FAILED'" } });
+        return;
+      }
+      const gender = safeResultLabel(parsed?.gender, 40) ?? 'n/a';
+      const personName = safeResultLabel(parsed?.personName, 200);
+      const categorySlug = safeResultLabel(parsed?.categorySlug, 40);
+      const garmentName = safeResultLabel(parsed?.garmentName, 200);
+      if (!personName || !categorySlug || !garmentName) {
+        json(res, 400, { error: { code: 'VALIDATION', message: 'personName, categorySlug, and garmentName are required' } });
+        return;
+      }
+      const jobId = safeResultLabel(parsed?.jobId, 100) ?? undefined;
+      const jobError = status === 'FAILED' ? (safeResultLabel(parsed?.error, 500) ?? 'unknown error') : undefined;
+
+      let outputFile: string | undefined;
+      if (status === 'COMPLETED') {
+        let parsedUrl: URL;
+        try {
+          parsedUrl = new URL(typeof parsed?.imageUrl === 'string' ? parsed.imageUrl : '');
+        } catch {
+          json(res, 400, { error: { code: 'VALIDATION', message: 'imageUrl must be a valid URL when status is COMPLETED' } });
+          return;
+        }
+        if (parsedUrl.protocol !== 'https:' && parsedUrl.protocol !== 'http:') {
+          json(res, 400, { error: { code: 'VALIDATION', message: 'imageUrl must be http(s)' } });
+          return;
+        }
+        try {
+          const imgRes = await fetch(parsedUrl);
+          if (!imgRes.ok) throw new Error(`HTTP ${imgRes.status}`);
+          const bytes = Buffer.from(await imgRes.arrayBuffer());
+          const outDir = path.join(OUTPUT_DIR, source);
+          mkdirSync(outDir, { recursive: true });
+          // Filename just needs to be unique per record, not meaningful — the
+          // DB row (personName/categorySlug/garmentName) carries the
+          // human-readable identity, same split as tryon's outputFile.
+          const outFile = path.join(outDir, `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}.jpg`);
+          writeFileSync(outFile, bytes);
+          outputFile = outFile;
+        } catch (err) {
+          json(res, 502, {
+            error: { code: 'DOWNLOAD_FAILED', message: `could not download result image: ${err instanceof Error ? err.message : String(err)}` },
+          });
+          return;
+        }
+      }
+
+      const runId = `${source}-batch`; // one shared pseudo-run per source — neither tab has a real "run" concept the way the CLI/Upload-Generate batch does
+      ensureRun(runId);
+      const id = insertJobResult(runId, {
+        gender,
+        personName,
+        categorySlug,
+        garmentName,
+        jobId,
+        status: status as 'COMPLETED' | 'FAILED',
+        error: jobError,
+        outputFile,
+        finishedAt: new Date().toISOString(),
+        source: source as 'redchief' | 'catalog',
+      });
+      json(res, 201, { id });
       return;
     }
 
@@ -1300,6 +1577,183 @@ const server = http.createServer(async (req, res) => {
       } catch (err) {
         propiclyErrorResponse(res, err);
       }
+      return;
+    }
+
+    // ---- Catalog Batch (aivastra catalog surface) — separate tab, but the
+    // SAME cfg/DEV_API_KEY as Upload/Generate above (see lib/api-client.mts's
+    // catalog section header comment for why: same host, same 'full'-scoped
+    // key, unlike RedChief's genuinely separate propicly account). ----
+    if (req.method === 'GET' && url.pathname === '/api/catalog/options') {
+      if (!cfg) {
+        json(res, 200, { available: false, error: 'DEV_API_KEY is not set on the server.' });
+        return;
+      }
+      const gender = url.searchParams.get('gender');
+      if (!gender || !CATALOG_GENDERS.has(gender)) {
+        json(res, 400, { error: { code: 'VALIDATION', message: 'gender must be one of men, women, boys, girls' } });
+        return;
+      }
+      const garmentType = url.searchParams.get('garmentType') ?? undefined;
+      if (garmentType && !CATALOG_SLUG_RE.test(garmentType)) {
+        json(res, 400, { error: { code: 'VALIDATION', message: 'invalid garmentType' } });
+        return;
+      }
+      try {
+        const options = await getCatalogOptions(cfg, gender as CatalogGender, garmentType);
+        json(res, 200, { available: true, ...options });
+      } catch (err) {
+        json(res, 200, { available: false, error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/catalog/generate') {
+      if (!cfg) {
+        json(res, 400, { error: { code: 'CONFIG_MISSING', message: 'DEV_API_KEY is not set on the server.' } });
+        return;
+      }
+      // Captured into a const so it stays narrowed to DevApiConfig (not
+      // DevApiConfig | undefined) inside the catalogGenerateLimit() closure
+      // below, which — unlike the rest of this handler — may not actually
+      // run until after this request has returned, at which point the
+      // module-level `cfg` could in principle have been reassigned by a
+      // concurrent Settings-page save.
+      const catalogCfg = cfg;
+      let body: Buffer;
+      try {
+        // One garment image, base64-encoded: 10MB * ~1.34 base64 inflation,
+        // rounded up generously — same reasoning as RedChief's cap, scaled
+        // down since this is a single image per call, not up to six.
+        body = await readBodyCapped(req, 20 * 1024 * 1024);
+      } catch {
+        json(res, 413, { error: { code: 'VALIDATION', message: 'request body too large' } });
+        return;
+      }
+      let parsed: any;
+      try {
+        parsed = JSON.parse(body.toString('utf8'));
+      } catch {
+        json(res, 400, { error: { code: 'VALIDATION', message: 'invalid JSON body' } });
+        return;
+      }
+
+      const { garment, gender, face, looks, garmentType, lower, shoe, aspectRatio, resolution } = parsed ?? {};
+      if (typeof garment !== 'string' || garment.length === 0) {
+        json(res, 400, { error: { code: 'VALIDATION', message: 'garment must be a non-empty base64/data-URI string' } });
+        return;
+      }
+      if (typeof gender !== 'string' || !CATALOG_GENDERS.has(gender)) {
+        json(res, 400, { error: { code: 'VALIDATION', message: 'gender must be one of men, women, boys, girls' } });
+        return;
+      }
+      if (typeof face !== 'string' || !CATALOG_SLUG_RE.test(face)) {
+        json(res, 400, { error: { code: 'VALIDATION', message: 'face must be a valid asset slug' } });
+        return;
+      }
+      if (
+        !Array.isArray(looks) ||
+        looks.length < 1 ||
+        looks.length > 12 ||
+        !looks.every(
+          (l: unknown) =>
+            l &&
+            typeof (l as any).pose === 'string' &&
+            typeof (l as any).background === 'string' &&
+            CATALOG_SLUG_RE.test((l as any).pose) &&
+            CATALOG_SLUG_RE.test((l as any).background),
+        )
+      ) {
+        json(res, 400, { error: { code: 'VALIDATION', message: 'looks must be 1-12 {pose, background} slug pairs' } });
+        return;
+      }
+      if (garmentType !== undefined && (typeof garmentType !== 'string' || !CATALOG_SLUG_RE.test(garmentType))) {
+        json(res, 400, { error: { code: 'VALIDATION', message: 'invalid garmentType' } });
+        return;
+      }
+      if (lower !== undefined && (typeof lower !== 'string' || !CATALOG_SLUG_RE.test(lower))) {
+        json(res, 400, { error: { code: 'VALIDATION', message: 'invalid lower' } });
+        return;
+      }
+      if (shoe !== undefined && (typeof shoe !== 'string' || !CATALOG_SLUG_RE.test(shoe))) {
+        json(res, 400, { error: { code: 'VALIDATION', message: 'invalid shoe' } });
+        return;
+      }
+      if (typeof aspectRatio !== 'string' || !CATALOG_ASPECT_RATIOS.has(aspectRatio)) {
+        json(res, 400, { error: { code: 'VALIDATION', message: 'aspectRatio must be one of 1:1, 2:3, 3:4, 4:5' } });
+        return;
+      }
+      if (typeof resolution !== 'string' || !CATALOG_RESOLUTIONS.has(resolution)) {
+        json(res, 400, { error: { code: 'VALIDATION', message: 'resolution must be one of HD, 2K, 4K' } });
+        return;
+      }
+
+      // Build the aggregate run up front (all jobs QUEUED, none submitted
+      // upstream yet) and hand it straight back — runCatalogAggregate (not
+      // awaited here) drives the actual submissions at CATALOG_CONCURRENCY
+      // at a time in the background; the client's existing poll loop against
+      // GET /api/catalog/catalogues/:id watches the same job objects mutate
+      // in place as that happens. See the aggregate-run comment block above
+      // for why this exists instead of one straight-through generateCatalog
+      // call (which would let all of `looks` run at once upstream).
+      sweepCatalogAggregateRuns();
+      const aggId = randomUUID();
+      const run: CatalogAggregateRun = {
+        jobs: (looks as { pose: string; background: string }[]).map((l, i) => ({
+          jobId: `${aggId}-${i}`,
+          pose: l.pose,
+          background: l.background,
+          status: 'QUEUED',
+        })),
+        createdAt: Date.now(),
+      };
+      catalogAggregateRuns.set(aggId, run);
+      const base: Omit<CatalogGenerateBody, 'looks'> = {
+        garment,
+        gender: gender as CatalogGender,
+        face,
+        garmentType: garmentType || undefined,
+        lower: lower || undefined,
+        shoe: shoe || undefined,
+        aspectRatio: aspectRatio as CatalogGenerateBody['aspectRatio'],
+        resolution: resolution as CatalogGenerateBody['resolution'],
+      };
+      // Fire-and-forget on purpose — errors per look are already caught and
+      // recorded onto that look's job stub inside runCatalogAggregate, so
+      // there's nothing left for this handler to do with the promise.
+      void runCatalogAggregate(catalogCfg, run, base);
+      json(res, 202, {
+        catalogueId: aggId,
+        jobs: run.jobs.map((j) => ({ jobId: j.jobId, pose: j.pose, background: j.background })),
+      });
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname.startsWith('/api/catalog/catalogues/')) {
+      if (!cfg) {
+        json(res, 400, { error: { code: 'CONFIG_MISSING', message: 'DEV_API_KEY is not set on the server.' } });
+        return;
+      }
+      const catalogueId = decodeJobIdParam(url.pathname.slice('/api/catalog/catalogues/'.length));
+      if (catalogueId === null || !/^[0-9a-f-]{36}$/i.test(catalogueId)) {
+        json(res, 400, { error: { code: 'VALIDATION', message: 'invalid catalogue id' } });
+        return;
+      }
+      // Every id POST /api/catalog/generate hands out is one of our own
+      // aggregate runs (see the aggregate-run comment block above), never a
+      // real upstream catalogueId directly — so this is served entirely
+      // from catalogAggregateRuns, no upstream call needed. A miss here
+      // means the run finished sweeping (2h+ old) or the server restarted
+      // since it was created — both fine to just report as not found.
+      const run = catalogAggregateRuns.get(catalogueId);
+      if (!run) {
+        json(res, 404, { error: { code: 'NOT_FOUND', message: 'unknown or expired catalogue run' } });
+        return;
+      }
+      json(res, 200, {
+        catalogueId,
+        jobs: run.jobs.map((j) => ({ jobId: j.jobId, status: j.status, imageUrl: j.imageUrl, error: j.error })),
+      });
       return;
     }
 

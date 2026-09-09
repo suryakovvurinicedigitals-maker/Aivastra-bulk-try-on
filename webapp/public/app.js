@@ -36,6 +36,7 @@ const confirmRunBtn = document.getElementById('confirm-run-btn');
 const runBannerEl = document.getElementById('run-banner');
 const uploadRunBannerEl = document.getElementById('upload-run-banner');
 const filterRunEl = document.getElementById('filter-run');
+const filterSourceEl = document.getElementById('filter-source');
 const filterGenderEl = document.getElementById('filter-gender');
 const filterCategoryEl = document.getElementById('filter-category');
 const filterStatusEl = document.getElementById('filter-status');
@@ -134,6 +135,7 @@ function setView(name) {
   if (target === 'users') loadUsers();
   if (target === 'settings') loadApiSettings();
   if (target === 'redchief') window.enterRedchiefView?.();
+  if (target === 'catalog') window.enterCatalogView?.();
 }
 window.addEventListener('hashchange', () => setView(location.hash.slice(1)));
 
@@ -979,7 +981,7 @@ async function enterUploadView() {
 // you'd already filtered/paged down to. Restoring from localStorage means a
 // refresh (or reopening the tab later) lands back exactly where you left off.
 const RESULTS_STATE_KEY = 'bulkTryonResultsState';
-const DEFAULT_RESULTS_STATE = { run: '', gender: '', category: '', status: '', user: '', q: '', flagged: '', from: '', to: '', page: 1 };
+const DEFAULT_RESULTS_STATE = { run: '', source: '', gender: '', category: '', status: '', user: '', q: '', flagged: '', from: '', to: '', page: 1 };
 
 function loadResultsState() {
   try {
@@ -1000,6 +1002,7 @@ let resultsState = loadResultsState();
 // lists — but the plain inputs (Status, Search, Flag, the two date pickers)
 // are never rebuilt, so nothing else would ever put the restored value back
 // into their DOM elements. Do that once, up front, before the first fetch.
+filterSourceEl.value = resultsState.source;
 filterStatusEl.value = resultsState.status;
 filterSearchEl.value = resultsState.q;
 filterFlaggedEl.value = resultsState.flagged;
@@ -1102,6 +1105,8 @@ function formatDuration(durationMs) {
   return `${minutes}m ${String(seconds).padStart(2, '0')}s`;
 }
 
+const SOURCE_LABEL = { tryon: 'Try-On', redchief: 'RedChief', catalog: 'Catalog' };
+
 function resultRowHtml(row) {
   const statusClass = row.status === 'COMPLETED' ? 'ok' : 'err';
   const statusLabel = row.status === 'COMPLETED' ? 'Completed' : row.status === 'FAILED' ? 'Failed' : 'Error';
@@ -1109,9 +1114,11 @@ function resultRowHtml(row) {
   const duration = formatDuration(row.durationMs);
   const errTitle = row.error ? ` title="${row.error.replace(/"/g, '&quot;')}"` : '';
   const rowClass = row.flag?.resolvedAt ? 'resolved-row' : row.flag ? 'flagged-row' : '';
+  const sourceLabel = SOURCE_LABEL[row.source] || row.source;
   return `
     <tr${rowClass ? ` class="${rowClass}"` : ''}>
       <td class="cell-id">${row.id}</td>
+      <td><span class="badge source-${row.source}">${sourceLabel}</span></td>
       <td class="cell-when">${row.startedBy || '—'}</td>
       <td>
         <div class="cell-thumb">
@@ -1195,6 +1202,7 @@ async function loadResults(resetPage) {
   saveResultsState();
   const params = new URLSearchParams();
   if (resultsState.run) params.set('run', resultsState.run);
+  if (resultsState.source) params.set('source', resultsState.source);
   if (resultsState.gender) params.set('gender', resultsState.gender);
   if (resultsState.category) params.set('category', resultsState.category);
   if (resultsState.status) params.set('status', resultsState.status);
@@ -1216,7 +1224,7 @@ async function loadResults(resetPage) {
 
   resultsTbodyEl.innerHTML =
     data.rows.length === 0
-      ? '<tr><td colspan="10" class="empty">No results yet — run a batch from the Upload page.</td></tr>'
+      ? '<tr><td colspan="11" class="empty">No results yet — run a batch from Upload, RedChief, or Catalog Batch.</td></tr>'
       : data.rows.map(resultRowHtml).join('');
 
   resultsMetaEl.textContent = `${data.total.toLocaleString()} output(s) — page ${data.page} of ${data.totalPages}`;
@@ -1258,6 +1266,7 @@ function stopResultsPolling() {
 
 filterApplyBtn.addEventListener('click', () => {
   resultsState.run = filterRunEl.value;
+  resultsState.source = filterSourceEl.value;
   resultsState.gender = filterGenderEl.value;
   resultsState.category = filterCategoryEl.value;
   resultsState.status = filterStatusEl.value;
@@ -1274,6 +1283,7 @@ filterClearBtn.addEventListener('click', () => {
   // Category/User would keep showing their last pending pick (see
   // fillSelectPreserving's `pending || current` fallback above).
   filterRunEl.value = '';
+  filterSourceEl.value = '';
   filterGenderEl.value = '';
   filterCategoryEl.value = '';
   filterStatusEl.value = '';
@@ -1282,7 +1292,7 @@ filterClearBtn.addEventListener('click', () => {
   filterFlaggedEl.value = '';
   filterFromEl.value = '';
   filterToEl.value = '';
-  resultsState = { run: '', gender: '', category: '', status: '', user: '', q: '', flagged: '', from: '', to: '', page: 1 };
+  resultsState = { run: '', source: '', gender: '', category: '', status: '', user: '', q: '', flagged: '', from: '', to: '', page: 1 };
   loadResults(true);
 });
 filterSearchEl.addEventListener('keydown', (e) => {

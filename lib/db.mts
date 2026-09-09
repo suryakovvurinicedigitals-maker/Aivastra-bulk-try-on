@@ -87,6 +87,17 @@ db.exec(`
   if (!jobResultsCols.includes('duration_ms')) {
     db.exec('ALTER TABLE job_results ADD COLUMN duration_ms INTEGER');
   }
+  // job_results also predates the RedChief and Catalog Batch tabs — every row
+  // written before this migration is, by definition, from the original
+  // try-on flow, so backfilling existing rows to 'tryon' via DEFAULT is
+  // correct rather than just convenient. gender/person_name/category_slug/
+  // garment_name keep their try-on names but take on source-specific meaning
+  // for the other two sources rather than growing a pile of new nullable
+  // columns per source — see the comment on JobResultInput below for the
+  // exact per-source mapping.
+  if (!jobResultsCols.includes('source')) {
+    db.exec("ALTER TABLE job_results ADD COLUMN source TEXT NOT NULL DEFAULT 'tryon'");
+  }
 }
 
 // ---- one-time migration of the pre-DB file-based state, if any is found ----
@@ -265,11 +276,27 @@ export interface JobResultInput {
   finishedAt: string;
   /** Wall-clock time the job took to generate (create → poll → download), in milliseconds. Optional/nullable because rows from before this field existed (and migrated legacy manifest.jsonl rows) have no timing data. */
   durationMs?: number;
+  /**
+   * Which tab produced this row — 'tryon' (default, omit for existing call
+   * sites), 'redchief', or 'catalog'. All three write into the SAME four
+   * columns below (no per-source columns) — the meaning of each column just
+   * shifts:
+   *   - tryon:     gender=real gender, personName=person, categorySlug=garment category, garmentName=garment
+   *   - redchief:  gender='n/a' (RedChief has no gender concept), personName=product/row label,
+   *                categorySlug='redchief' (constant), garmentName='Image N' (Nth output of that job)
+   *   - catalog:   gender=real gender, personName=face·lower·shoe combo label,
+   *                categorySlug='catalog' (constant), garmentName='<garment label> — <pose> × <background>'
+   * This keeps the Results table/filters (Gender/Category/Search) meaningful
+   * across all three without a schema fork — see webapp/server.mts's
+   * POST /api/results/record, the only inserter for the latter two.
+   */
+  source?: 'tryon' | 'redchief' | 'catalog';
 }
 
 export interface JobResultRow extends JobResultInput {
   id: number;
   runId: string;
+  source: 'tryon' | 'redchief' | 'catalog';
 }
 
 export interface FlagRow {
@@ -298,6 +325,7 @@ function rowToJobResult(r: Record<string, unknown>): JobResultRow {
     outputFile: (r.output_file as string) ?? undefined,
     finishedAt: String(r.finished_at),
     durationMs: r.duration_ms != null ? Number(r.duration_ms) : undefined,
+    source: (r.source as JobResultRow['source']) ?? 'tryon',
   };
 }
 
@@ -314,8 +342,8 @@ export function getRunMeta(runId: string): { startedBy?: string } {
 }
 
 const insertJobResultStmt = db.prepare(`
-  INSERT INTO job_results (run_id, gender, person_name, category_slug, garment_name, job_id, status, error_code, error, output_file, finished_at, duration_ms)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO job_results (run_id, gender, person_name, category_slug, garment_name, job_id, status, error_code, error, output_file, finished_at, duration_ms, source)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 export function insertJobResult(runId: string, r: JobResultInput): number {
   ensureRun(runId); // no-op if already inserted with a startedBy
@@ -332,6 +360,7 @@ export function insertJobResult(runId: string, r: JobResultInput): number {
     r.outputFile ?? null,
     r.finishedAt,
     r.durationMs ?? null,
+    r.source ?? 'tryon',
   );
   return Number(info.lastInsertRowid);
 }
@@ -359,6 +388,7 @@ export function getResultRow(id: number): JobResultRow | null {
 
 export interface ResultFilters {
   runId?: string;
+  source?: string; // 'tryon' | 'redchief' | 'catalog'
   gender?: string;
   categorySlug?: string;
   status?: string;
@@ -380,6 +410,7 @@ export interface ResultsPage {
   rows: ResultRowWithFlag[];
   total: number;
   runs: string[];
+  sources: string[];
   genders: string[];
   categories: string[];
   users: string[];
@@ -392,6 +423,10 @@ export function listResults(f: ResultFilters): ResultsPage {
   if (f.runId) {
     where.push('jr.run_id = @runId');
     params.runId = f.runId;
+  }
+  if (f.source) {
+    where.push('jr.source = @source');
+    params.source = f.source;
   }
   if (f.gender) {
     where.push('jr.gender = @gender');
@@ -471,6 +506,7 @@ export function listResults(f: ResultFilters): ResultsPage {
   // Filter-dropdown universes are drawn from the whole table, not the current
   // filtered/paginated view — same behavior as before this migration.
   const runs = (db.prepare('SELECT DISTINCT run_id FROM job_results').all() as { run_id: string }[]).map((r) => r.run_id).sort().reverse();
+  const sources = (db.prepare('SELECT DISTINCT source FROM job_results').all() as { source: string }[]).map((r) => r.source).sort();
   const genders = (db.prepare('SELECT DISTINCT gender FROM job_results').all() as { gender: string }[]).map((r) => r.gender).sort();
   const categories = (db.prepare('SELECT DISTINCT category_slug FROM job_results').all() as { category_slug: string }[])
     .map((r) => r.category_slug)
@@ -479,7 +515,7 @@ export function listResults(f: ResultFilters): ResultsPage {
     .map((r) => r.started_by)
     .sort();
 
-  return { rows: resultRows, total, runs, genders, categories, users };
+  return { rows: resultRows, total, runs, sources, genders, categories, users };
 }
 
 // ==================== flags ====================
