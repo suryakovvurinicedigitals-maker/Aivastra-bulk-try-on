@@ -36,7 +36,6 @@ const confirmRunBtn = document.getElementById('confirm-run-btn');
 const runBannerEl = document.getElementById('run-banner');
 const uploadRunBannerEl = document.getElementById('upload-run-banner');
 const filterRunEl = document.getElementById('filter-run');
-const filterSourceEl = document.getElementById('filter-source');
 const filterGenderEl = document.getElementById('filter-gender');
 const filterCategoryEl = document.getElementById('filter-category');
 const filterStatusEl = document.getElementById('filter-status');
@@ -1002,12 +1001,46 @@ let resultsState = loadResultsState();
 // lists — but the plain inputs (Status, Search, Flag, the two date pickers)
 // are never rebuilt, so nothing else would ever put the restored value back
 // into their DOM elements. Do that once, up front, before the first fetch.
-filterSourceEl.value = resultsState.source;
 filterStatusEl.value = resultsState.status;
 filterSearchEl.value = resultsState.q;
 filterFlaggedEl.value = resultsState.flagged;
 filterFromEl.value = resultsState.from;
 filterToEl.value = resultsState.to;
+
+// ---------- results view: source tabs ----------
+// Deliberately its own click-to-apply control, separate from the rest of
+// the filter bar's Apply/Clear gate below — Try-On, RedChief, and Catalog
+// produce differently-shaped results (single person+garment; face/lower/
+// shoe/pose/background combos; multi-angle inputs), so switching between
+// them is the single most common thing to do on this page and shouldn't
+// need an extra click to take effect.
+const sourceTabEls = [...document.querySelectorAll('.source-tab')];
+const resultsTheadDefaultEl = document.getElementById('results-thead-default');
+const resultsTheadRedchiefEl = document.getElementById('results-thead-redchief');
+const resultsTheadCatalogEl = document.getElementById('results-thead-catalog');
+function setActiveSourceTab(source) {
+  for (const btn of sourceTabEls) {
+    const active = btn.dataset.source === source;
+    btn.classList.toggle('active', active);
+    btn.setAttribute('aria-selected', String(active));
+  }
+  // RedChief's result shape (N labeled inputs + N labeled outputs + a flat
+  // credit cost) and Catalog's (fixed face/garment/pose/background/shoe
+  // axes) each get their own column layout — see resultRowHtml below and
+  // the three <thead>s in index.html.
+  resultsTheadDefaultEl.hidden = source === 'redchief' || source === 'catalog';
+  resultsTheadRedchiefEl.hidden = source !== 'redchief';
+  resultsTheadCatalogEl.hidden = source !== 'catalog';
+}
+setActiveSourceTab(resultsState.source); // reflect whatever was restored from localStorage before the first fetch
+for (const btn of sourceTabEls) {
+  btn.addEventListener('click', () => {
+    if (btn.dataset.source === resultsState.source) return; // already showing this source
+    resultsState.source = btn.dataset.source;
+    setActiveSourceTab(resultsState.source);
+    loadResults(true);
+  });
+}
 
 /** `<input type="datetime-local">` gives back a value like "2026-09-04T10:30" with
  * no timezone — the browser means it in local time. `new Date(...)` parses that as
@@ -1107,7 +1140,91 @@ function formatDuration(durationMs) {
 
 const SOURCE_LABEL = { tryon: 'Try-On', redchief: 'RedChief', catalog: 'Catalog' };
 
-function resultRowHtml(row) {
+// A small labeled thumbnail for the RedChief table's Inputs/Output cells —
+// same click-to-lightbox/download behavior as mediaBoxHtml (delegated on
+// resultsTbodyEl, see wireResultsTable below), just laid out with its label
+// underneath instead of beside it, since a row can carry 1-6 of these.
+function mediaChipHtml(item) {
+  return `
+    <div class="media-box media-chip" data-full="${item.thumb}">
+      <img src="${item.thumb}" loading="lazy" />
+      <a class="dl-btn" href="${item.thumb}" download title="Download">⬇</a>
+      <span class="media-chip-label">${item.label}</span>
+    </div>`;
+}
+
+/**
+ * RedChief's dedicated row layout, matching the shared mockup: ID (plus the
+ * row's 1-based position within the current page, since the mockup shows
+ * both), User, every input thumbnail labeled by view, every output
+ * thumbnail, flat per-job credit cost, When, and QA/Flag — no
+ * person/garment/category columns, which don't mean anything for a job that
+ * can take 1-6 differently-angled inputs.
+ */
+function redchiefResultRowHtml(row, position) {
+  const statusClass = row.status === 'COMPLETED' ? 'ok' : 'err';
+  const statusLabel = row.status === 'COMPLETED' ? 'Completed' : row.status === 'FAILED' ? 'Failed' : 'Error';
+  const when = new Date(row.finishedAt).toLocaleString();
+  const errTitle = row.error ? ` title="${row.error.replace(/"/g, '&quot;')}"` : '';
+  const rowClass = row.flag?.resolvedAt ? 'resolved-row' : row.flag ? 'flagged-row' : '';
+  const inputs = row.media.filter((m) => m.kind === 'input');
+  const outputs = row.media.filter((m) => m.kind === 'output');
+  return `
+    <tr${rowClass ? ` class="${rowClass}"` : ''}>
+      <td class="cell-id">${row.id}<br /><span class="cell-position">#${position}</span></td>
+      <td class="cell-when">${row.startedBy || '—'}</td>
+      <td><div class="media-chip-row">${inputs.length ? inputs.map(mediaChipHtml).join('') : '<div class="thumb-missing">—</div>'}</div></td>
+      <td><div class="media-chip-row">${outputs.length ? outputs.map(mediaChipHtml).join('') : '<div class="thumb-missing">—</div>'}</div></td>
+      <td class="cell-when">${row.credits != null ? row.credits : '—'}</td>
+      <td><span class="badge ${statusClass}"${errTitle}>${statusLabel}</span></td>
+      <td class="cell-when">${when}</td>
+      <td class="cell-flag">${flagCellHtml(row)}</td>
+    </tr>`;
+}
+
+/**
+ * Catalog's dedicated row layout: fixed Face/Garment/Pose/Background/Shoes
+ * columns (each a single thumbnail, picked out of row.media by label — see
+ * runCatalogAggregate's recordResult call in server.mts for where those
+ * labels come from) instead of RedChief's flexible N-chip Inputs cell, since
+ * Catalog's axes are fixed and always mean the same thing. Lower is
+ * intentionally not its own column here (not in the shared mockup) even
+ * though it's captured in row.media when selected — can be added if needed.
+ *
+ * Credits is always "—": the aivastra dev API doesn't expose per-job catalog
+ * credit cost anywhere (it's resolution-dependent and set by admin config —
+ * see catalog.js's own submit-confirmation text) — no source in this repo to
+ * show a real number instead of the mockup's placeholder-looking "10".
+ */
+function catalogResultRowHtml(row, position) {
+  const statusClass = row.status === 'COMPLETED' ? 'ok' : 'err';
+  const statusLabel = row.status === 'COMPLETED' ? 'Completed' : row.status === 'FAILED' ? 'Failed' : 'Error';
+  const when = new Date(row.finishedAt).toLocaleString();
+  const errTitle = row.error ? ` title="${row.error.replace(/"/g, '&quot;')}"` : '';
+  const rowClass = row.flag?.resolvedAt ? 'resolved-row' : row.flag ? 'flagged-row' : '';
+  const byLabel = (label) => row.media.find((m) => m.kind === 'input' && m.label === label);
+  const output = row.media.find((m) => m.kind === 'output');
+  const cell = (item) => `<td>${item ? mediaChipHtml(item) : '<div class="thumb-missing">—</div>'}</td>`;
+  return `
+    <tr${rowClass ? ` class="${rowClass}"` : ''}>
+      <td class="cell-id">${row.id}<br /><span class="cell-position">#${position}</span></td>
+      <td class="cell-when">${row.startedBy || '—'}</td>
+      ${cell(byLabel('Face'))}
+      ${cell(byLabel('Garment'))}
+      ${cell(byLabel('Pose'))}
+      ${cell(byLabel('Background'))}
+      ${cell(byLabel('Shoes'))}
+      ${cell(output)}
+      <td class="cell-when">${row.credits != null ? row.credits : '—'}</td>
+      <td><span class="badge ${statusClass}"${errTitle}>${statusLabel}</span></td>
+      <td class="cell-when">${when}</td>
+      <td class="cell-flag">${flagCellHtml(row)}</td>
+    </tr>`;
+}
+
+function resultRowHtml(row, position) {
+  if (row.source === 'redchief') return redchiefResultRowHtml(row, position);
+  if (row.source === 'catalog') return catalogResultRowHtml(row, position);
   const statusClass = row.status === 'COMPLETED' ? 'ok' : 'err';
   const statusLabel = row.status === 'COMPLETED' ? 'Completed' : row.status === 'FAILED' ? 'Failed' : 'Error';
   const when = new Date(row.finishedAt).toLocaleString();
@@ -1222,10 +1339,11 @@ async function loadResults(resetPage) {
   fillSelectPreserving(filterCategoryEl, data.categories, resultsState.category, 'All');
   fillSelectPreserving(filterUserEl, data.users, resultsState.user, 'All');
 
+  const colCount = resultsState.source === 'redchief' ? 8 : resultsState.source === 'catalog' ? 12 : 11;
   resultsTbodyEl.innerHTML =
     data.rows.length === 0
-      ? '<tr><td colspan="11" class="empty">No results yet — run a batch from Upload, RedChief, or Catalog Batch.</td></tr>'
-      : data.rows.map(resultRowHtml).join('');
+      ? `<tr><td colspan="${colCount}" class="empty">No results yet — run a batch from Upload, RedChief, or Catalog Batch.</td></tr>`
+      : data.rows.map((row, i) => resultRowHtml(row, (resultsState.page - 1) * 25 + i + 1)).join('');
 
   resultsMetaEl.textContent = `${data.total.toLocaleString()} output(s) — page ${data.page} of ${data.totalPages}`;
   renderPagination(data.page, data.totalPages);
@@ -1265,8 +1383,10 @@ function stopResultsPolling() {
 }
 
 filterApplyBtn.addEventListener('click', () => {
+  // Note: resultsState.source is intentionally NOT touched here — it's owned
+  // entirely by the source tabs above (see setActiveSourceTab), which apply
+  // immediately on click rather than waiting for this button.
   resultsState.run = filterRunEl.value;
-  resultsState.source = filterSourceEl.value;
   resultsState.gender = filterGenderEl.value;
   resultsState.category = filterCategoryEl.value;
   resultsState.status = filterStatusEl.value;
@@ -1283,7 +1403,6 @@ filterClearBtn.addEventListener('click', () => {
   // Category/User would keep showing their last pending pick (see
   // fillSelectPreserving's `pending || current` fallback above).
   filterRunEl.value = '';
-  filterSourceEl.value = '';
   filterGenderEl.value = '';
   filterCategoryEl.value = '';
   filterStatusEl.value = '';
@@ -1293,6 +1412,7 @@ filterClearBtn.addEventListener('click', () => {
   filterFromEl.value = '';
   filterToEl.value = '';
   resultsState = { run: '', source: '', gender: '', category: '', status: '', user: '', q: '', flagged: '', from: '', to: '', page: 1 };
+  setActiveSourceTab('');
   loadResults(true);
 });
 filterSearchEl.addEventListener('keydown', (e) => {

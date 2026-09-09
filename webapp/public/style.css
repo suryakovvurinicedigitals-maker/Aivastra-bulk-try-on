@@ -324,6 +324,30 @@ select:focus, .dropzone:focus-within { outline: 2px solid var(--pink); outline-o
   margin-right: 2px;
   display: inline-block;
 }
+/* Top-level Results source switcher (All / Try-On / RedChief / Catalog) —
+   deliberately styled as its own pill row above the filter bar, not folded
+   into it, since it's a click-to-apply-instantly control rather than one
+   more field waiting on the Apply button below. */
+.results-source-tabs {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+.source-tab {
+  padding: 8px 18px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 0.88rem;
+  font-weight: 650;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.source-tab:hover { color: var(--text); border-color: var(--pink); }
+.source-tab.active { background: var(--pink-tint); color: var(--pink); border-color: var(--pink); }
+
 .filter-bar {
   display: flex;
   align-items: flex-end;
@@ -437,6 +461,29 @@ select:focus, .dropzone:focus-within { outline: 2px solid var(--pink); outline-o
 .media-box:hover .dl-btn, .media-box .dl-btn:focus-visible { opacity: 1; }
 .media-box .dl-btn:hover { background: rgba(0, 0, 0, 0.75); }
 .output-thumb-box { width: 164px; height: 216px; }
+
+/* RedChief's Inputs/Output cells: 1-6 smaller labeled thumbnails side by
+   side (a full-size .media-box per view would blow out row height), each
+   still using .media-box's own click-to-lightbox/download/hover behavior —
+   just shrunk and given a label strip below instead of beside it. */
+.results-table .cell-position { color: var(--muted); font-size: 0.7rem; font-variant-numeric: tabular-nums; }
+.media-chip-row { display: flex; flex-wrap: wrap; gap: 8px; max-width: 380px; }
+.media-chip { width: 84px; height: 112px; }
+.media-chip-label {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 2px 4px;
+  background: rgba(0, 0, 0, 0.6);
+  color: #fff;
+  font-size: 0.62rem;
+  text-align: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  pointer-events: none;
+}
 .thumb-missing {
   width: 140px;
   height: 186px;
@@ -840,7 +887,41 @@ select:focus, .dropzone:focus-within { outline: 2px solid var(--pink); outline-o
 }
 .catalog-picker-row { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; }
 
-.catalog-asset-section-label { font-size: 0.78rem; font-weight: 650; color: var(--muted); margin-bottom: 6px; }
+.catalog-asset-section-label { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; font-size: 0.78rem; font-weight: 650; color: var(--muted); margin-bottom: 6px; }
+.catalog-asset-folder-control { font-weight: 500; }
+.catalog-asset-folder-control .link-btn { font-size: 0.76rem; }
+.catalog-asset-folder-status { flex-basis: 100%; margin: -2px 0 4px; font-weight: 500; }
+.catalog-asset-selected-count { font-weight: 500; color: var(--pink); }
+
+/* Review grid of everything currently checked for one axis — deliberately
+   separate from .catalog-asset-grid's tiles (which stay in their fixed,
+   alphabetical-ish library order) so a folder match's dozen-odd hits are all
+   visible together in one place instead of scattered across a long grid.
+   Reuses .upload-thumbs/.upload-thumb/.thumb-remove as-is (see the "upload
+   thumbnail previews" block above) — same large-photo-plus-red-×-badge look
+   as the Upload tab's own preview grid, just smaller tiles here since a
+   picker section can hold far more selections at once than a person/garment
+   upload batch typically does. */
+.catalog-selected-thumbs { margin: 0 0 12px; }
+.catalog-selected-thumbs .upload-thumb { width: 88px; height: 88px; }
+/* A thumbnail that genuinely fails to load (e.g. its presigned asset URL
+   expired — see catalogAssetFolderControlHtml's doc comment) gets hidden by
+   the .broken class a delegated error listener adds in
+   wireCatalogConfigEvents, rather than left showing the browser's own
+   broken-image glyph — the tile still reads fine as a bare remove-badge. */
+.catalog-selected-thumbs img.broken { display: none; }
+
+/* Folder files that matched nothing in the curated library — plain preview
+   only, no checkbox, can't be selected for generation (see
+   catalogUnmatchedThumbsHtml's doc comment in catalog.js for why: the
+   upstream API has no way to submit a custom face/lower/shoe/pose/background
+   image). Dimmed + dashed border so it visually reads as "not usable here"
+   at a glance, distinct from the solid-bordered selected/library tiles. */
+.catalog-unmatched-label { margin: 0 0 6px; }
+.catalog-unmatched-thumbs { margin: 0 0 12px; }
+.catalog-unmatched-thumbs .upload-thumb { width: 88px; height: 88px; opacity: 0.6; }
+.catalog-unmatched-thumbs .upload-thumb img { border: 1px dashed var(--muted); }
+
 .catalog-asset-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 10px; }
 .catalog-asset-item {
   display: flex;
@@ -856,7 +937,8 @@ select:focus, .dropzone:focus-within { outline: 2px solid var(--pink); outline-o
   color: var(--muted);
   background: var(--bg);
 }
-.catalog-asset-item img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 6px; }
+.catalog-asset-item img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 6px; background: var(--border); }
+.catalog-asset-item img.broken { display: none; } /* see the .catalog-selected-thumbs img.broken comment above */
 .catalog-asset-item:hover { border-color: var(--pink); }
 .catalog-asset-item.selected { border-color: var(--pink); background: var(--pink-tint); color: var(--pink); font-weight: 650; }
 

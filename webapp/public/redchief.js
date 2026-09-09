@@ -574,21 +574,49 @@ async function submitRedchiefRow(row) {
 
 const redchiefRecordedJobs = new Set(); // job ids already reported to /api/results/record — avoids re-recording on every poll tick or on a later thumbnail refresh
 
-/** Reports a row's terminal (COMPLETED/FAILED) job to the Results page's DB — see webapp/server.mts's POST /api/results/record for why this has to be client-driven: this file is the only place that knows the product/row label for a given jobId. One record per output image on success (RedChief can return several views from a single job), one record total on failure. Fire-and-forget — a failed recording doesn't affect the tester's own view of this row, which already shows its own status/thumbnails live regardless. */
-function recordRedchiefRowResult(row) {
+/**
+ * Reports a row's terminal (COMPLETED/FAILED) job to the Results page's DB —
+ * see webapp/server.mts's POST /api/results/record for why this has to be
+ * client-driven: this file is the only place that knows the product/row
+ * label, per-view labels, and credit cost for a given jobId, and the only
+ * place row.slots[].file (the actual input image bytes) still exists at all
+ * — they're never uploaded/persisted anywhere else, so this re-derives base64
+ * from those same in-memory File objects one last time before reporting.
+ *
+ * One consolidated POST per row (not one per output image like the old
+ * per-source-imageUrl contract) — carries every input (label + data URI) and
+ * every output (label + presigned URL, server downloads it) together, so the
+ * Results page can render the full multi-thumbnail row in one DB record.
+ * Fire-and-forget — a failed recording doesn't affect the tester's own view
+ * of this row, which already shows its own status/thumbnails live regardless.
+ */
+async function recordRedchiefRowResult(row) {
   if (row.status !== 'COMPLETED' && row.status !== 'FAILED') return;
   if (redchiefRecordedJobs.has(row.jobId)) return;
   redchiefRecordedJobs.add(row.jobId);
-  const base = { source: 'redchief', personName: row.label, categorySlug: 'redchief', jobId: row.jobId };
-  const post = (fields) =>
-    fetch('/api/results/record', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...base, ...fields }) }).catch(
-      () => {}, // best-effort
-    );
+  const payload = {
+    source: 'redchief',
+    status: row.status,
+    personName: row.label,
+    categorySlug: 'redchief',
+    garmentName: row.label,
+    jobId: row.jobId,
+  };
   if (row.status === 'COMPLETED') {
-    (row.resultUrls ?? []).forEach((url, i) => post({ status: 'COMPLETED', garmentName: `Image ${i + 1}`, imageUrl: url }));
+    payload.credits = redchiefConfig?.creditCost;
+    try {
+      payload.inputs = await Promise.all(row.slots.map(async (s) => ({ label: s.label, dataUrl: await redchiefFileToDataUrl(s.file) })));
+    } catch {
+      // A slot's File became unreadable (e.g. GC'd/revoked) between
+      // completion and now — record the outputs without inputs rather than
+      // losing the row entirely.
+      payload.inputs = [];
+    }
+    payload.outputs = (row.resultUrls ?? []).map((url, i) => ({ label: `Output ${i + 1}`, imageUrl: url }));
   } else {
-    post({ status: 'FAILED', garmentName: 'RedChief job', error: row.error ?? 'unknown error' });
+    payload.error = row.error ?? 'unknown error';
   }
+  fetch('/api/results/record', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }).catch(() => {}); // best-effort
 }
 
 function pollRedchiefRow(row, attempt = 0, delay = 2000) {
