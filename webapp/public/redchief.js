@@ -276,7 +276,17 @@ function wireRedchiefRowEvents() {
         continue; // filled slots don't need click-to-browse wiring
       }
       const input = slotEl.querySelector('.redchief-slot-input');
-      dz.addEventListener('click', () => input.click());
+      dz.addEventListener('click', (e) => {
+        // input.click() dispatches a real, bubbling click event on the
+        // input itself (it's a child of dz) — that synthetic event bubbles
+        // straight back up to this same listener, which would call
+        // input.click() again, forever, without this guard. Same fix as
+        // app.js's wireDropzone() uses for the identical bug: a real user
+        // click can never land ON a hidden <input>, so any click whose
+        // target is the <input> is necessarily one of these echoes.
+        if (e.target.tagName === 'INPUT') return;
+        input.click();
+      });
       dz.addEventListener('keydown', (e) => {
         if (e.key === 'Enter' || e.key === ' ') input.click();
       });
