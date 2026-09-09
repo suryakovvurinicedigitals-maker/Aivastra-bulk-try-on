@@ -1186,9 +1186,21 @@ select:focus, input:focus, textarea:focus, .dropzone:focus-within {
   margin-top: 4px;
 }
 
-.run-banner .link-btn.danger {
+.run-banner .link-btn {
   margin-left: 6px;
   font-size: inherit;
+}
+
+/* A paused queued batch keeps its queue slot but is deliberately muted —
+   visually distinct from a normal "will start automatically" queued line. */
+.run-banner .queued-line.paused {
+  opacity: 0.7;
+}
+
+.run-banner .queued-line.paused .queue-badge {
+  background: var(--panel);
+  color: var(--muted);
+  border-color: var(--border);
 }
 
 .run-banner .queued-line .chip {

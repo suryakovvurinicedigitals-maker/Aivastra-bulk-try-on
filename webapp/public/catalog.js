@@ -53,6 +53,7 @@ const catalogSubmitConfirmEl = document.getElementById('catalog-submit-confirm')
 const catalogSubmitConfirmTextEl = document.getElementById('catalog-submit-confirm-text');
 const catalogSubmitConfirmCancelBtn = document.getElementById('catalog-submit-confirm-cancel-btn');
 const catalogSubmitConfirmBtn = document.getElementById('catalog-submit-confirm-btn');
+const catalogRunBannerEl = document.getElementById('catalog-run-banner');
 
 // Asset modal picker elements (SelectGridModal style)
 const catalogModalOverlayEl = document.getElementById('catalog-modal-overlay');
@@ -63,6 +64,7 @@ const catalogModalToolbarEl = document.getElementById('catalog-modal-toolbar');
 const catalogModalFilterChipsEl = document.getElementById('catalog-modal-filter-chips');
 const catalogModalGridEl = document.getElementById('catalog-modal-grid');
 const catalogModalEmptyEl = document.getElementById('catalog-modal-empty');
+const catalogModalSelectAllBtn = document.getElementById('catalog-modal-select-all-btn');
 const catalogModalClearBtn = document.getElementById('catalog-modal-clear-btn');
 const catalogModalDoneBtn = document.getElementById('catalog-modal-done-btn');
 
@@ -234,6 +236,7 @@ function catalogEscapeHtml(s) {
 
 window.enterCatalogView = async function enterCatalogView() {
   initCatalogModalEvents();
+  catalogPollBatchStatus(); // reflect an already-in-flight/queued/paused batch from another session, even on a repeat visit to this tab
   if (catalogLoaded) return;
   catalogLoaded = true;
   await loadCatalogBatchOptions();
@@ -458,6 +461,7 @@ function catalogAssetPickersHtml() {
     const set = catalogBatch[meta.setKey];
     const selectedItems = items.filter((i) => set.has(i.slug));
     const unselectedItems = items.filter((i) => !set.has(i.slug));
+    const allSelected = items.length > 0 && set.size === items.length;
 
     let cardsHtml = '';
     if (selectedItems.length <= CATALOG_VISIBLE_PAGE_CAP) {
@@ -480,6 +484,10 @@ function catalogAssetPickersHtml() {
             ${set.size > 0 ? `<span class="catalog-selected-badge">${set.size} selected</span>` : ''}
           </div>
           <div class="catalog-asset-header-right">
+            ${items.length > 0 ? `
+              <button type="button" class="catalog-view-more-btn catalog-select-all-btn" data-kind="${kind}" data-action="${allSelected ? 'clear' : 'select'}">
+                <span>${allSelected ? 'Clear all' : `Select all (${items.length})`}</span>
+              </button>` : ''}
             ${catalogAssetFolderControlHtml(kind)}
             ${items.length > CATALOG_VISIBLE_PAGE_CAP ? `
               <button type="button" class="catalog-view-more-btn" data-kind="${kind}" title="Browse all ${items.length} options">
@@ -848,9 +856,28 @@ function wireCatalogConfigEvents() {
     });
   }
 
-  for (const btn of catalogConfigBodyEl.querySelectorAll('.catalog-view-more-btn, .catalog-asset-more-card')) {
+  // :not(.catalog-select-all-btn) — the select-all button reuses
+  // .catalog-view-more-btn's pill styling but must NOT open the modal, it
+  // has its own handler right below.
+  for (const btn of catalogConfigBodyEl.querySelectorAll('.catalog-view-more-btn:not(.catalog-select-all-btn), .catalog-asset-more-card')) {
     btn.addEventListener('click', () => {
       openCatalogAssetModal(btn.dataset.kind);
+    });
+  }
+
+  // Per-section "Select all (N)" / "Clear all" toggle — selects/clears
+  // EVERY item in the full library for that kind, not just the paginated
+  // visible subset (catalogBatch.options[...] is the full list either way).
+  for (const btn of catalogConfigBodyEl.querySelectorAll('.catalog-select-all-btn')) {
+    btn.addEventListener('click', () => {
+      const kind = btn.dataset.kind;
+      const meta = CATALOG_ASSET_METADATA[kind];
+      if (!meta) return;
+      const items = catalogBatch.options?.[meta.optionsKey] ?? [];
+      const set = catalogBatch[meta.setKey];
+      if (btn.dataset.action === 'clear') set.clear();
+      else for (const item of items) set.add(item.slug);
+      renderCatalog();
     });
   }
 
@@ -937,16 +964,18 @@ function updateCatalogModalCounter() {
   catalogModalClearBtn.disabled = count === 0;
 }
 
-function renderCatalogModalGrid() {
+/** The modal grid's filter logic, shared by the grid render and the "Select
+ * all" button so the two can never disagree about which items are "currently
+ * shown" — returns [] if the modal isn't open on a known kind. */
+function catalogModalFilteredItems() {
   const kind = catalogModalState.kind;
-  if (!kind || !catalogBatch.options) return;
+  if (!kind || !catalogBatch.options) return [];
 
   const meta = CATALOG_ASSET_METADATA[kind];
   const allItems = catalogBatch.options[meta.optionsKey] ?? [];
-  const set = catalogBatch[meta.setKey];
   const filterTag = catalogModalState.activeFilter;
 
-  const filtered = allItems.filter((item) => {
+  return allItems.filter((item) => {
     if (filterTag && filterTag !== 'All') {
       const tagLower = filterTag.toLowerCase();
       const matchLabel = item.label && item.label.toLowerCase().includes(tagLower);
@@ -955,6 +984,15 @@ function renderCatalogModalGrid() {
     }
     return true;
   });
+}
+
+function renderCatalogModalGrid() {
+  const kind = catalogModalState.kind;
+  if (!kind || !catalogBatch.options) return;
+
+  const meta = CATALOG_ASSET_METADATA[kind];
+  const set = catalogBatch[meta.setKey];
+  const filtered = catalogModalFilteredItems();
 
   if (filtered.length === 0) {
     catalogModalGridEl.innerHTML = '';
@@ -1020,6 +1058,22 @@ function initCatalogModalEvents() {
     catalogBatch[setKey].clear();
     for (const card of catalogModalGridEl.querySelectorAll('.catalog-asset-card.selected')) {
       card.classList.remove('selected');
+    }
+    updateCatalogModalCounter();
+  });
+
+  // Deliberate asymmetry with "Deselect all" above: this only selects the
+  // currently-FILTERED tiles (e.g. just the Studio backgrounds when that
+  // chip is active), while Deselect all always clears the whole set for
+  // this kind regardless of filter — matches each button's own scope.
+  catalogModalSelectAllBtn?.addEventListener('click', () => {
+    const kind = catalogModalState.kind;
+    if (!kind) return;
+    const setKey = CATALOG_ASSET_METADATA[kind].setKey;
+    const set = catalogBatch[setKey];
+    for (const item of catalogModalFilteredItems()) set.add(item.slug);
+    for (const card of catalogModalGridEl.querySelectorAll('.catalog-asset-card')) {
+      card.classList.add('selected');
     }
     updateCatalogModalCounter();
   });
@@ -1110,41 +1164,124 @@ catalogSubmitConfirmBtn.addEventListener('click', () => {
   submitCatalogGarments();
 });
 
-function submitCatalogGarments() {
+/** Submits every submittable garment as ONE whole Catalog Batch — a single
+ * POST to /api/catalog/batch/start — instead of N independent
+ * /api/catalog/generate calls racing each other for the shared throttler.
+ * This is what lets a second Generate click while one batch is already
+ * running QUEUE behind it (server-side whole-batch queue) rather than
+ * interleave with it. A garment whose local file fails to read is marked
+ * FAILED and left out of the request entirely (no network call, no upstream
+ * spend for it); every other garment still goes in the same request so they
+ * queue/run together as one batch. */
+async function submitCatalogGarments() {
   const submittable = catalogSubmittableGarments();
   if (submittable.length === 0 || !catalogBatchIsValid()) return;
   const looks = catalogComputeLooks().slice(0, 12);
   const templates = catalogBuildRunTemplates(); // same combination set applied to every garment
   for (const garment of submittable) garment.status = 'submitting';
   renderCatalog();
-  Promise.allSettled(submittable.map((garment) => submitCatalogGarment(garment, templates, looks)));
-}
 
-/** Builds this garment's runs from the shared templates, then submits every run in parallel. */
-async function submitCatalogGarment(garment, templates, looks) {
-  let garmentDataUrl;
-  try {
-    garmentDataUrl = await catalogFileToDataUrl(garment.file);
-  } catch (err) {
-    garment.status = 'FAILED';
-    garment.error = err instanceof Error ? err.message : String(err);
-    renderCatalog();
-    return;
+  const reads = await Promise.allSettled(submittable.map((garment) => catalogFileToDataUrl(garment.file)));
+  const included = []; // [{garment, garmentDataUrl}] — only garments whose file actually read
+  for (let i = 0; i < submittable.length; i++) {
+    const garment = submittable[i];
+    const read = reads[i];
+    if (read.status === 'rejected') {
+      garment.status = 'FAILED';
+      garment.error = read.reason instanceof Error ? read.reason.message : String(read.reason);
+      continue;
+    }
+    garment.runs = templates.map((t) => ({
+      id: catalogUid('run'),
+      ...t,
+      catalogueId: null,
+      jobs: [],
+      status: 'submitting',
+      error: null,
+      pollTimer: null,
+      pollToken: 0,
+    }));
+    garment.error = null;
+    included.push({ garment, garmentDataUrl: read.value });
   }
-  garment.runs = templates.map((t) => ({
-    id: catalogUid('run'),
-    ...t,
-    catalogueId: null,
-    jobs: [],
-    status: 'submitting',
-    error: null,
-    pollTimer: null,
-    pollToken: 0,
-  }));
-  garment.status = 'RUNNING';
-  garment.error = null;
   renderCatalog();
-  await Promise.allSettled(garment.runs.map((run) => submitCatalogRun(garment, run, garmentDataUrl, looks)));
+  if (included.length === 0) return; // every file failed to read locally — nothing to send
+
+  try {
+    const res = await fetch('/api/catalog/batch/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        gender: catalogBatch.gender,
+        garmentType: catalogBatch.garmentType || undefined,
+        // Cosmetic only (queue banner's category chip) — falls back to the
+        // slug server-side if this lookup ever comes up empty.
+        garmentTypeLabel: catalogBatch.options?.garmentTypes?.find((t) => t.slug === catalogBatch.garmentType)?.label,
+        aspectRatio: catalogBatch.aspectRatio,
+        resolution: catalogBatch.resolution,
+        // poseLabel/backgroundLabel/*ThumbnailUrl ride along for the
+        // server's benefit only (the Results page's dedicated Catalog row)
+        // — see webapp/server.mts's buildCatalogJobStubs.
+        looks: looks.map((l) => ({
+          ...l,
+          poseLabel: catalogPoseLabel(l),
+          backgroundLabel: catalogBackgroundLabel(l),
+          poseThumbnailUrl: catalogBatch.options?.poses.find((p) => p.slug === l.pose)?.thumbnailUrl,
+          backgroundThumbnailUrl: catalogBatch.options?.backgrounds.find((b) => b.slug === l.background)?.thumbnailUrl,
+        })),
+        garments: included.map(({ garment, garmentDataUrl }) => ({
+          garmentId: garment.id,
+          garmentDataUrl,
+          garmentLabel: garment.label,
+          runs: garment.runs.map((run) => ({
+            runId: run.id,
+            face: run.face,
+            faceLabel: run.faceLabel,
+            faceThumbnailUrl: run.faceThumbnailUrl,
+            lower: run.lower,
+            lowerLabel: run.lowerLabel,
+            lowerThumbnailUrl: run.lowerThumbnailUrl,
+            shoe: run.shoe,
+            shoeLabel: run.shoeLabel,
+            shoeThumbnailUrl: run.shoeThumbnailUrl,
+            runLabel: run.runLabel,
+          })),
+        })),
+      }),
+    });
+    const body = await res.json();
+    if (!res.ok) throw new Error(`${body.error?.code ?? res.status}: ${body.error?.message ?? 'request failed'}`);
+
+    const byGarmentId = new Map(body.garments.map((g) => [g.garmentId, g]));
+    for (const { garment } of included) {
+      const echoedGarment = byGarmentId.get(garment.id);
+      const byRunId = new Map((echoedGarment?.runs ?? []).map((r) => [r.runId, r]));
+      for (const run of garment.runs) {
+        const echoedRun = byRunId.get(run.id);
+        if (!echoedRun) {
+          run.status = 'FAILED';
+          run.error = 'Server did not echo this run back — treating as failed.';
+          continue;
+        }
+        run.catalogueId = echoedRun.catalogueId;
+        // Every job stub starts QUEUED whether or not the whole batch itself
+        // is queued behind another one — pollCatalogRun already derives the
+        // right RUNNING/QUEUED display state from the jobs themselves.
+        run.jobs = echoedRun.jobs.map((j) => ({ ...j, status: 'QUEUED' }));
+        run.status = 'QUEUED';
+        pollCatalogRun(garment, run);
+      }
+      catalogUpdateGarmentAggregateStatus(garment);
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    for (const { garment } of included) {
+      garment.status = 'FAILED';
+      garment.error = message;
+    }
+  }
+  catalogStartBatchPolling();
+  renderCatalog();
 }
 
 async function submitCatalogRun(garment, run, garmentDataUrl, looks) {
@@ -1201,7 +1338,13 @@ async function submitCatalogRun(garment, run, garmentDataUrl, looks) {
 /** A garment's status is purely derived from its runs' statuses — RUNNING if anything is still in flight, else COMPLETED only if every run's every job completed, FAILED only if every run failed outright, PARTIAL for anything in between. */
 function catalogUpdateGarmentAggregateStatus(garment) {
   if (garment.runs.length === 0) return;
-  if (garment.runs.some((r) => r.status === 'submitting' || r.status === 'RUNNING')) {
+  // Every run's jobs are still QUEUED — the whole batch this garment belongs
+  // to hasn't started yet (or is waiting behind another queued batch).
+  if (garment.runs.every((r) => r.status === 'QUEUED')) {
+    garment.status = 'QUEUED';
+    return;
+  }
+  if (garment.runs.some((r) => r.status === 'submitting' || r.status === 'RUNNING' || r.status === 'QUEUED')) {
     garment.status = 'RUNNING';
     return;
   }
@@ -1248,7 +1391,11 @@ function pollCatalogRun(garment, run, attempt = 0, delay = 3000) {
         renderCatalog();
         return;
       }
-      run.status = 'RUNNING';
+      // Every job stub starts life QUEUED the moment the batch-start request
+      // responds, whether or not the whole batch itself is still waiting in
+      // line — only flip to RUNNING once the upstream call has actually
+      // been dispatched for at least one job (see runCatalogAggregate).
+      run.status = run.jobs.every((j) => j.status === 'QUEUED') ? 'QUEUED' : 'RUNNING';
       catalogUpdateGarmentAggregateStatus(garment);
       renderCatalog();
       if (attempt >= maxAttempts) return; // give up quietly — run stays RUNNING, tester can check back
@@ -1312,6 +1459,93 @@ function retryCatalogGarment(garmentId) {
       garment.error = err instanceof Error ? err.message : String(err);
       renderCatalog();
     });
+}
+
+// ---------- whole-batch queue banner (mirrors app.js's renderUploadRunBanner
+// / pollRunStatus / startPolling / stopPolling for the Upload view's queue,
+// but against /api/catalog/batch/* instead of /api/run/*) ----------
+
+let catalogPollHandle = null;
+
+// Reuses app.js's queuedCategoriesHtml (both scripts share one global scope
+// — see index.html's plain, non-module <script> tags) rather than
+// duplicating its "one chip per category, em-dash for none" rendering.
+
+function renderCatalogBatchBanner(status) {
+  const queuedList = status?.queued ?? [];
+  const running = status?.status === 'running';
+  if (!running && queuedList.length === 0) {
+    catalogRunBannerEl.hidden = true;
+    catalogRunBannerEl.innerHTML = '';
+    return;
+  }
+  catalogRunBannerEl.hidden = false;
+  const runningLine = running
+    ? `<div class="run-banner-item in-progress"><span class="run-spinner"></span><span>Batch in progress: <b>${status.completed + status.failed} / ${status.total}</b> (${status.completed} completed${status.failed ? `, ${status.failed} failed` : ''})</span></div>`
+    : '';
+  const canManage = currentUser?.role === 'superadmin';
+  const queuedLines = queuedList
+    .map((q, i) => {
+      const badge = `<span class="queue-badge">#${i + 1}</span>`;
+      const categories = queuedCategoriesHtml(q.categories);
+      if (q.paused) {
+        const resumeBtn = canManage ? ` <button type="button" class="link-btn" data-resume-catalog-queue-id="${q.id}">Resume</button>` : '';
+        const cancelBtn = canManage ? ` <button type="button" class="link-btn danger" data-cancel-catalog-queue-id="${q.id}">Cancel</button>` : '';
+        return `<div class="run-banner-item queued-line paused">${badge}<span>Paused: <b>${q.total} job(s)</b> — ${categories} (queued by ${q.queuedBy}) — won't start until resumed.</span>${resumeBtn}${cancelBtn}</div>`;
+      }
+      const pauseBtn = canManage ? ` <button type="button" class="link-btn" data-pause-catalog-queue-id="${q.id}">Pause</button>` : '';
+      const cancelBtn = canManage ? ` <button type="button" class="link-btn danger" data-cancel-catalog-queue-id="${q.id}">Cancel</button>` : '';
+      return `<div class="run-banner-item queued-line">${badge}<span>Queued: <b>${q.total} job(s)</b> — ${categories} (by ${q.queuedBy}) — will start automatically once turn arrives.</span>${pauseBtn}${cancelBtn}</div>`;
+    })
+    .join('');
+  catalogRunBannerEl.innerHTML = runningLine + queuedLines;
+}
+
+// Delegated once (banner's innerHTML is fully replaced every poll tick, so
+// per-button listeners would need rebinding anyway — delegating on the
+// stable parent avoids that), same pattern as app.js's upload-run-banner.
+catalogRunBannerEl?.addEventListener('click', (e) => {
+  const cancelBtn = e.target.closest('[data-cancel-catalog-queue-id]');
+  if (cancelBtn) return cancelCatalogQueuedBatch(cancelBtn.dataset.cancelCatalogQueueId);
+  const pauseBtn = e.target.closest('[data-pause-catalog-queue-id]');
+  if (pauseBtn) return pauseCatalogQueuedBatch(pauseBtn.dataset.pauseCatalogQueueId);
+  const resumeBtn = e.target.closest('[data-resume-catalog-queue-id]');
+  if (resumeBtn) return resumeCatalogQueuedBatch(resumeBtn.dataset.resumeCatalogQueueId);
+});
+
+async function cancelCatalogQueuedBatch(id) {
+  if (!confirm('Cancel this queued batch? It will not start automatically.')) return;
+  await fetch(`/api/catalog/batch/queue/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  await catalogPollBatchStatus();
+}
+
+// No confirm() for pause/resume — unlike Cancel, both are fully reversible
+// and never touch upstream (a paused batch just keeps its queue position).
+async function pauseCatalogQueuedBatch(id) {
+  await fetch(`/api/catalog/batch/queue/${encodeURIComponent(id)}/pause`, { method: 'POST' });
+  await catalogPollBatchStatus();
+}
+async function resumeCatalogQueuedBatch(id) {
+  await fetch(`/api/catalog/batch/queue/${encodeURIComponent(id)}/resume`, { method: 'POST' });
+  await catalogPollBatchStatus();
+}
+
+async function catalogPollBatchStatus() {
+  const res = await fetch('/api/catalog/batch/status');
+  const status = await res.json();
+  renderCatalogBatchBanner(status);
+  const hasQueued = (status.queued ?? []).length > 0;
+  if ((status.status === 'running' || hasQueued) && !catalogPollHandle) catalogStartBatchPolling();
+  if (status.status !== 'running' && !hasQueued && catalogPollHandle) catalogStopBatchPolling();
+  return status;
+}
+function catalogStartBatchPolling() {
+  if (catalogPollHandle) return;
+  catalogPollHandle = setInterval(catalogPollBatchStatus, 1500);
+}
+function catalogStopBatchPolling() {
+  clearInterval(catalogPollHandle);
+  catalogPollHandle = null;
 }
 
 initCatalogModalEvents();

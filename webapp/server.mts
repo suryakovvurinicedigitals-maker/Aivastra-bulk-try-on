@@ -648,6 +648,137 @@ function sweepCatalogAggregateRuns() {
   }
 }
 
+// ---- Shared validation/construction helpers ----
+// Extracted so POST /api/catalog/generate (one garment x run) and POST
+// /api/catalog/batch/start (many garments x runs, one whole Catalog Batch
+// submission — see the whole-batch queue section below) can't drift apart on
+// what counts as a valid request or how a CatalogAggregateRun gets built.
+
+/** Fields shared by an entire batch submission (gender/garmentType/looks/
+ * aspectRatio/resolution apply identically to every garment x run in it), as
+ * well as by one /api/catalog/generate call. Returns the {code,message} to
+ * send via json(res,400,{error:...}), or null if everything's valid. */
+function validateCatalogSharedFields(input: {
+  gender: unknown;
+  garmentType?: unknown;
+  looks: unknown;
+  aspectRatio: unknown;
+  resolution: unknown;
+}): { code: string; message: string } | null {
+  if (typeof input.gender !== 'string' || !CATALOG_GENDERS.has(input.gender)) {
+    return { code: 'VALIDATION', message: 'gender must be one of men, women, boys, girls' };
+  }
+  if (input.garmentType !== undefined && (typeof input.garmentType !== 'string' || !CATALOG_SLUG_RE.test(input.garmentType))) {
+    return { code: 'VALIDATION', message: 'invalid garmentType' };
+  }
+  if (
+    !Array.isArray(input.looks) ||
+    input.looks.length < 1 ||
+    input.looks.length > 12 ||
+    !input.looks.every(
+      (l: unknown) =>
+        l &&
+        typeof (l as any).pose === 'string' &&
+        typeof (l as any).background === 'string' &&
+        CATALOG_SLUG_RE.test((l as any).pose) &&
+        CATALOG_SLUG_RE.test((l as any).background),
+    )
+  ) {
+    return { code: 'VALIDATION', message: 'looks must be 1-12 {pose, background} slug pairs' };
+  }
+  if (typeof input.aspectRatio !== 'string' || !CATALOG_ASPECT_RATIOS.has(input.aspectRatio)) {
+    return { code: 'VALIDATION', message: 'aspectRatio must be one of 1:1, 2:3, 3:4, 4:5' };
+  }
+  if (typeof input.resolution !== 'string' || !CATALOG_RESOLUTIONS.has(input.resolution)) {
+    return { code: 'VALIDATION', message: 'resolution must be one of HD, 2K, 4K' };
+  }
+  return null;
+}
+
+/** Fields that are per (garment photo, face, lower, shoe) combination — used
+ * once by /api/catalog/generate, once per garment x run by
+ * /api/catalog/batch/start. */
+function validateCatalogRunFields(input: {
+  garment: unknown;
+  face: unknown;
+  lower?: unknown;
+  shoe?: unknown;
+}): { code: string; message: string } | null {
+  if (typeof input.garment !== 'string' || input.garment.length === 0) {
+    return { code: 'VALIDATION', message: 'garment must be a non-empty base64/data-URI string' };
+  }
+  if (typeof input.face !== 'string' || !CATALOG_SLUG_RE.test(input.face)) {
+    return { code: 'VALIDATION', message: 'face must be a valid asset slug' };
+  }
+  if (input.lower !== undefined && (typeof input.lower !== 'string' || !CATALOG_SLUG_RE.test(input.lower))) {
+    return { code: 'VALIDATION', message: 'invalid lower' };
+  }
+  if (input.shoe !== undefined && (typeof input.shoe !== 'string' || !CATALOG_SLUG_RE.test(input.shoe))) {
+    return { code: 'VALIDATION', message: 'invalid shoe' };
+  }
+  return null;
+}
+
+/** Builds one run's job stubs (all QUEUED, nothing submitted upstream yet)
+ * from an already-validated `looks` array — the exact shape both
+ * /api/catalog/generate and /api/catalog/batch/start hand to a fresh
+ * CatalogAggregateRun. `aggId` prefixes every stable jobId so two different
+ * runs' jobs can never collide. */
+function buildCatalogJobStubs(
+  aggId: string,
+  looks: { pose: string; background: string; poseLabel?: string; backgroundLabel?: string; poseThumbnailUrl?: string; backgroundThumbnailUrl?: string }[],
+): CatalogAggregateJob[] {
+  return looks.map((l, i) => ({
+    jobId: `${aggId}-${i}`,
+    pose: l.pose,
+    background: l.background,
+    poseLabel: safeResultLabel(l.poseLabel, 200) ?? l.pose,
+    backgroundLabel: safeResultLabel(l.backgroundLabel, 200) ?? l.background,
+    poseThumbnailUrl: safeResultUrl(l.poseThumbnailUrl),
+    backgroundThumbnailUrl: safeResultUrl(l.backgroundThumbnailUrl),
+    status: 'QUEUED' as CatalogJobStatus,
+  }));
+}
+
+/** Builds a fresh CatalogAggregateRun and registers it in
+ * catalogAggregateRuns — shared construction for both
+ * /api/catalog/generate and /api/catalog/batch/start, so runCatalogAggregate's
+ * recordResult() `inputs` (see that function below) are always built
+ * identically regardless of which route created the run. */
+function registerCatalogAggregateRun(fields: {
+  aggId: string;
+  jobs: CatalogAggregateJob[];
+  gender: string;
+  personName: string;
+  garmentLabel: string;
+  startedBy: string;
+  categorySlug: string;
+  faceLabel: string;
+  faceThumbnailUrl?: string;
+  lowerLabel?: string;
+  lowerThumbnailUrl?: string;
+  shoeLabel?: string;
+  shoeThumbnailUrl?: string;
+}): CatalogAggregateRun {
+  const run: CatalogAggregateRun = {
+    jobs: fields.jobs,
+    createdAt: Date.now(),
+    gender: fields.gender,
+    personName: fields.personName,
+    garmentLabel: fields.garmentLabel,
+    startedBy: fields.startedBy,
+    categorySlug: fields.categorySlug,
+    faceLabel: fields.faceLabel,
+    faceThumbnailUrl: fields.faceThumbnailUrl,
+    lowerLabel: fields.lowerLabel,
+    lowerThumbnailUrl: fields.lowerThumbnailUrl,
+    shoeLabel: fields.shoeLabel,
+    shoeThumbnailUrl: fields.shoeThumbnailUrl,
+  };
+  catalogAggregateRuns.set(fields.aggId, run);
+  return run;
+}
+
 /**
  * Submits one run's looks to the upstream API one at a time, each gated by
  * catalogGenerateLimit and held until that look's job finishes (or
@@ -760,6 +891,86 @@ async function runCatalogAggregate(cfg: DevApiConfig, run: CatalogAggregateRun, 
       }),
     ),
   );
+}
+
+// ---- Catalog Batch whole-batch queue ----
+// One layer above runCatalogAggregate — mirrors Try-On's currentRun/
+// queuedRuns (see that section further below) so a whole Catalog Batch
+// submission (every garment x face/lower/shoe run the tester confirmed in
+// one click) runs as one atomic unit rather than dozens of runCatalogAggregate
+// calls all fighting over the same catalogGenerateLimit slots at once.
+// Cancelling/pausing a QUEUED (not-yet-started) batch only ever mutates
+// local job-stub bookkeeping — runCatalogAggregate, the only function that
+// ever calls the real upstream generateCatalog, is invoked exactly once per
+// runInput, either here immediately or later when this batch is dequeued.
+interface CatalogBatchRunInput {
+  run: CatalogAggregateRun;
+  base: Omit<CatalogGenerateBody, 'looks'>;
+}
+interface CatalogBatchState {
+  id: string;
+  queuedBy: string;
+  queuedAt: string;
+  status: 'queued' | 'running' | 'done';
+  // Queued batches only — a paused batch keeps its place in line but is
+  // skipped by tryStartNextCatalogBatch until resumed. Lets someone queue
+  // several batches during the day and hold them until they actually want
+  // the run to happen (e.g. overnight) without losing queue position.
+  paused: boolean;
+  garmentTypeLabel?: string; // for the queue banner's category chip
+  runInputs: CatalogBatchRunInput[];
+}
+let currentCatalogBatch: CatalogBatchState | null = null;
+let catalogQueuedBatches: CatalogBatchState[] = [];
+let nextCatalogBatchId = 1;
+
+/** Actually launches a whole batch — runs every one of its garment x run
+ * combinations' runCatalogAggregate concurrently (each still individually
+ * throttled by catalogGenerateLimit), and once EVERY one is fully terminal,
+ * hands off to the next eligible queued batch (if any). Mirrors startRun/
+ * tryStartQueuedRun's shape for the try-on flow below. */
+async function startCatalogBatch(batch: CatalogBatchState, batchCfg: DevApiConfig): Promise<void> {
+  currentCatalogBatch = batch;
+  batch.status = 'running';
+  await Promise.all(batch.runInputs.map(({ run, base }) => runCatalogAggregate(batchCfg, run, base)));
+  batch.status = 'done';
+  if (currentCatalogBatch?.id === batch.id) currentCatalogBatch = null;
+  tryStartNextCatalogBatch(batchCfg);
+}
+
+/** Picks the first non-paused queued batch (skipping over paused ones, which
+ * keep their position for whenever they're resumed) and starts it, if
+ * nothing else is currently running. If every remaining queued batch is
+ * paused, the queue just sits idle — by design. */
+function tryStartNextCatalogBatch(nextCfg: DevApiConfig | undefined): void {
+  if (!nextCfg || currentCatalogBatch) return;
+  const idx = catalogQueuedBatches.findIndex((b) => !b.paused);
+  if (idx === -1) return;
+  const [next] = catalogQueuedBatches.splice(idx, 1);
+  void startCatalogBatch(next, nextCfg);
+}
+
+/** Scans a batch's runInputs for total/completed/failed job counts — no
+ * separate counters to keep in sync with each job stub's in-place mutations
+ * inside runCatalogAggregate. */
+function summarizeCatalogBatch(batch: CatalogBatchState): { total: number; completed: number; failed: number } {
+  let total = 0, completed = 0, failed = 0;
+  for (const { run } of batch.runInputs) {
+    for (const job of run.jobs) {
+      total++;
+      if (job.status === 'COMPLETED') completed++;
+      else if (job.status === 'FAILED') failed++;
+    }
+  }
+  return { total, completed, failed };
+}
+
+/** Same shape as try-on's queuedCategories — one category chip per queued
+ * Catalog Batch entry so a wrong-garmentType mistake is visible/cancellable
+ * before it spends any credits. */
+function catalogQueueEntrySummary(b: CatalogBatchState) {
+  const s = summarizeCatalogBatch(b);
+  return { id: b.id, total: s.total, queuedBy: b.queuedBy, queuedAt: b.queuedAt, paused: b.paused, categories: b.garmentTypeLabel ? [b.garmentTypeLabel] : [] };
 }
 
 /** Safe decodeURIComponent for a job-id path segment. A stray `%` (or any
@@ -1947,32 +2158,14 @@ const server = http.createServer(async (req, res) => {
         shoeLabel,
         shoeThumbnailUrl,
       } = parsed ?? {};
-      if (typeof garment !== 'string' || garment.length === 0) {
-        json(res, 400, { error: { code: 'VALIDATION', message: 'garment must be a non-empty base64/data-URI string' } });
+      const runErr = validateCatalogRunFields({ garment, face, lower, shoe });
+      if (runErr) {
+        json(res, 400, { error: runErr });
         return;
       }
-      if (typeof gender !== 'string' || !CATALOG_GENDERS.has(gender)) {
-        json(res, 400, { error: { code: 'VALIDATION', message: 'gender must be one of men, women, boys, girls' } });
-        return;
-      }
-      if (typeof face !== 'string' || !CATALOG_SLUG_RE.test(face)) {
-        json(res, 400, { error: { code: 'VALIDATION', message: 'face must be a valid asset slug' } });
-        return;
-      }
-      if (
-        !Array.isArray(looks) ||
-        looks.length < 1 ||
-        looks.length > 12 ||
-        !looks.every(
-          (l: unknown) =>
-            l &&
-            typeof (l as any).pose === 'string' &&
-            typeof (l as any).background === 'string' &&
-            CATALOG_SLUG_RE.test((l as any).pose) &&
-            CATALOG_SLUG_RE.test((l as any).background),
-        )
-      ) {
-        json(res, 400, { error: { code: 'VALIDATION', message: 'looks must be 1-12 {pose, background} slug pairs' } });
+      const sharedErr = validateCatalogSharedFields({ gender, garmentType, looks, aspectRatio, resolution });
+      if (sharedErr) {
+        json(res, 400, { error: sharedErr });
         return;
       }
       // poseLabel/backgroundLabel/garmentLabel/runLabel are optional,
@@ -1994,26 +2187,6 @@ const server = http.createServer(async (req, res) => {
       const catalogLowerThumbnailUrl = safeResultUrl(lowerThumbnailUrl);
       const catalogShoeLabel = safeResultLabel(shoeLabel, 200) ?? undefined;
       const catalogShoeThumbnailUrl = safeResultUrl(shoeThumbnailUrl);
-      if (garmentType !== undefined && (typeof garmentType !== 'string' || !CATALOG_SLUG_RE.test(garmentType))) {
-        json(res, 400, { error: { code: 'VALIDATION', message: 'invalid garmentType' } });
-        return;
-      }
-      if (lower !== undefined && (typeof lower !== 'string' || !CATALOG_SLUG_RE.test(lower))) {
-        json(res, 400, { error: { code: 'VALIDATION', message: 'invalid lower' } });
-        return;
-      }
-      if (shoe !== undefined && (typeof shoe !== 'string' || !CATALOG_SLUG_RE.test(shoe))) {
-        json(res, 400, { error: { code: 'VALIDATION', message: 'invalid shoe' } });
-        return;
-      }
-      if (typeof aspectRatio !== 'string' || !CATALOG_ASPECT_RATIOS.has(aspectRatio)) {
-        json(res, 400, { error: { code: 'VALIDATION', message: 'aspectRatio must be one of 1:1, 2:3, 3:4, 4:5' } });
-        return;
-      }
-      if (typeof resolution !== 'string' || !CATALOG_RESOLUTIONS.has(resolution)) {
-        json(res, 400, { error: { code: 'VALIDATION', message: 'resolution must be one of HD, 2K, 4K' } });
-        return;
-      }
 
       // Build the aggregate run up front (all jobs QUEUED, none submitted
       // upstream yet) and hand it straight back — runCatalogAggregate (not
@@ -2025,20 +2198,9 @@ const server = http.createServer(async (req, res) => {
       // call (which would let all of `looks` run at once upstream).
       sweepCatalogAggregateRuns();
       const aggId = randomUUID();
-      const run: CatalogAggregateRun = {
-        jobs: (
-          looks as { pose: string; background: string; poseLabel?: string; backgroundLabel?: string; poseThumbnailUrl?: string; backgroundThumbnailUrl?: string }[]
-        ).map((l, i) => ({
-          jobId: `${aggId}-${i}`,
-          pose: l.pose,
-          background: l.background,
-          poseLabel: safeResultLabel(l.poseLabel, 200) ?? l.pose,
-          backgroundLabel: safeResultLabel(l.backgroundLabel, 200) ?? l.background,
-          poseThumbnailUrl: safeResultUrl(l.poseThumbnailUrl),
-          backgroundThumbnailUrl: safeResultUrl(l.backgroundThumbnailUrl),
-          status: 'QUEUED',
-        })),
-        createdAt: Date.now(),
+      const run = registerCatalogAggregateRun({
+        aggId,
+        jobs: buildCatalogJobStubs(aggId, looks),
         gender,
         personName: catalogRunLabel,
         garmentLabel: catalogGarmentLabel,
@@ -2053,8 +2215,7 @@ const server = http.createServer(async (req, res) => {
         lowerThumbnailUrl: catalogLowerThumbnailUrl,
         shoeLabel: catalogShoeLabel,
         shoeThumbnailUrl: catalogShoeThumbnailUrl,
-      };
-      catalogAggregateRuns.set(aggId, run);
+      });
       const base: Omit<CatalogGenerateBody, 'looks'> = {
         garment,
         gender: gender as CatalogGender,
@@ -2101,6 +2262,211 @@ const server = http.createServer(async (req, res) => {
         catalogueId,
         jobs: run.jobs.map((j) => ({ jobId: j.jobId, status: j.status, imageUrl: j.imageUrl, error: j.error })),
       });
+      return;
+    }
+
+    // ---- Batch start: kicks off (or queues) a WHOLE Catalog Batch — every
+    // garment x run combination the browser confirmed in one shot. Never
+    // bypasses the confirm-then-submit gate: this route only ever runs in
+    // response to catalog.js's submitCatalogGarments(), itself only ever
+    // called from the confirm dialog's Yes button. Every job stub is created
+    // and registered in catalogAggregateRuns up front (status QUEUED, no
+    // upstream call made) EVEN IF this batch itself ends up queued behind
+    // another — so the client's existing per-run polling (GET
+    // /api/catalog/catalogues/:id, unchanged) can start immediately either
+    // way, it'll just see QUEUED stubs until this batch's turn comes.
+    if (req.method === 'POST' && url.pathname === '/api/catalog/batch/start') {
+      if (!cfg) {
+        json(res, 400, { error: { code: 'CONFIG_MISSING', message: 'DEV_API_KEY is not set on the server.' } });
+        return;
+      }
+      const catalogCfg = cfg;
+      let body: Buffer;
+      try {
+        // Many garments' base64 photos in one request now, not just one —
+        // scaled up from /api/catalog/generate's single-garment 20MB cap.
+        body = await readBodyCapped(req, 200 * 1024 * 1024);
+      } catch {
+        json(res, 413, { error: { code: 'VALIDATION', message: 'request body too large' } });
+        return;
+      }
+      let parsed: any;
+      try {
+        parsed = JSON.parse(body.toString('utf8'));
+      } catch {
+        json(res, 400, { error: { code: 'VALIDATION', message: 'invalid JSON body' } });
+        return;
+      }
+
+      const { gender, garmentType, garmentTypeLabel, aspectRatio, resolution, looks, garments } = parsed ?? {};
+      const sharedErr = validateCatalogSharedFields({ gender, garmentType, looks, aspectRatio, resolution });
+      if (sharedErr) {
+        json(res, 400, { error: sharedErr });
+        return;
+      }
+      if (!Array.isArray(garments) || garments.length === 0) {
+        json(res, 400, { error: { code: 'VALIDATION', message: 'garments must be a non-empty array' } });
+        return;
+      }
+      for (const g of garments) {
+        if (!g || typeof g.garmentId !== 'string' || !g.garmentId) {
+          json(res, 400, { error: { code: 'VALIDATION', message: 'every garment needs a garmentId' } });
+          return;
+        }
+        if (!Array.isArray(g.runs) || g.runs.length === 0) {
+          json(res, 400, { error: { code: 'VALIDATION', message: `garment ${g.garmentId} has no runs` } });
+          return;
+        }
+        for (const r of g.runs) {
+          if (!r || typeof r.runId !== 'string' || !r.runId) {
+            json(res, 400, { error: { code: 'VALIDATION', message: `garment ${g.garmentId} has a run missing runId` } });
+            return;
+          }
+          const runErr = validateCatalogRunFields({ garment: g.garmentDataUrl, face: r.face, lower: r.lower, shoe: r.shoe });
+          if (runErr) {
+            json(res, 400, { error: { code: runErr.code, message: `garment ${g.garmentId} run ${r.runId}: ${runErr.message}` } });
+            return;
+          }
+        }
+      }
+
+      sweepCatalogAggregateRuns();
+      const batchId = String(nextCatalogBatchId++);
+      const runInputs: CatalogBatchRunInput[] = [];
+      const responseGarments: { garmentId: string; runs: { runId: string; catalogueId: string; jobs: { jobId: string; pose: string; background: string }[] }[] }[] = [];
+
+      for (const g of garments) {
+        const garmentLabel = safeResultLabel(g.garmentLabel, 200) ?? 'Garment';
+        const responseRuns: { runId: string; catalogueId: string; jobs: { jobId: string; pose: string; background: string }[] }[] = [];
+        for (const r of g.runs) {
+          const aggId = randomUUID();
+          const run = registerCatalogAggregateRun({
+            aggId,
+            jobs: buildCatalogJobStubs(aggId, looks),
+            gender,
+            personName: safeResultLabel(r.runLabel, 200) ?? r.face,
+            garmentLabel,
+            startedBy: session!.username,
+            categorySlug: (garmentType as string) || 'catalog',
+            faceLabel: safeResultLabel(r.faceLabel, 200) ?? r.face,
+            faceThumbnailUrl: safeResultUrl(r.faceThumbnailUrl),
+            lowerLabel: safeResultLabel(r.lowerLabel, 200) ?? undefined,
+            lowerThumbnailUrl: safeResultUrl(r.lowerThumbnailUrl),
+            shoeLabel: safeResultLabel(r.shoeLabel, 200) ?? undefined,
+            shoeThumbnailUrl: safeResultUrl(r.shoeThumbnailUrl),
+          });
+          const base: Omit<CatalogGenerateBody, 'looks'> = {
+            garment: g.garmentDataUrl,
+            gender: gender as CatalogGender,
+            face: r.face,
+            garmentType: garmentType || undefined,
+            lower: r.lower || undefined,
+            shoe: r.shoe || undefined,
+            aspectRatio: aspectRatio as CatalogGenerateBody['aspectRatio'],
+            resolution: resolution as CatalogGenerateBody['resolution'],
+          };
+          runInputs.push({ run, base });
+          responseRuns.push({ runId: r.runId, catalogueId: aggId, jobs: run.jobs.map((j) => ({ jobId: j.jobId, pose: j.pose, background: j.background })) });
+        }
+        responseGarments.push({ garmentId: g.garmentId, runs: responseRuns });
+      }
+
+      const batch: CatalogBatchState = {
+        id: batchId,
+        queuedBy: session!.username,
+        queuedAt: new Date().toISOString(),
+        status: 'queued',
+        paused: false,
+        // Human-readable, for the queue banner's category chip — same
+        // "optional, cosmetic, falls back to the slug" treatment as every
+        // other *Label field on this route (see faceLabel etc. above).
+        garmentTypeLabel: safeResultLabel(garmentTypeLabel, 100) ?? (garmentType as string) ?? undefined,
+        runInputs,
+      };
+
+      if (currentCatalogBatch) {
+        catalogQueuedBatches.push(batch);
+        json(res, 202, { batchId, queued: true, garments: responseGarments });
+        return;
+      }
+      void startCatalogBatch(batch, catalogCfg);
+      json(res, 202, { batchId, queued: false, garments: responseGarments });
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/catalog/batch/status') {
+      const queued = catalogQueuedBatches.map(catalogQueueEntrySummary);
+      if (!currentCatalogBatch) {
+        json(res, 200, { status: 'idle', total: 0, completed: 0, failed: 0, queued });
+        return;
+      }
+      const { total, completed, failed } = summarizeCatalogBatch(currentCatalogBatch);
+      json(res, 200, { status: 'running', total, completed, failed, queued });
+      return;
+    }
+
+    if (req.method === 'DELETE' && url.pathname.startsWith('/api/catalog/batch/queue/')) {
+      if (session!.role !== 'superadmin') {
+        json(res, 403, { error: { code: 'FORBIDDEN', message: 'Super admin only.' } });
+        return;
+      }
+      const id = decodeJobIdParam(url.pathname.slice('/api/catalog/batch/queue/'.length));
+      const idx = id === null ? -1 : catalogQueuedBatches.findIndex((b) => b.id === id);
+      if (idx === -1) {
+        json(res, 404, { error: { code: 'NOT_FOUND', message: 'Not found in queue — it may have already started.' } });
+        return;
+      }
+      const [removed] = catalogQueuedBatches.splice(idx, 1);
+      // No upstream call was ever made for any of these (this batch never
+      // started) — synthesize a clean terminal FAILED state on every job
+      // stub so the client's already-running pollCatalogRun for these
+      // catalogueIds (started the moment POST /api/catalog/batch/start
+      // responded, even while queued) picks this up on its next poll tick
+      // with zero new client code.
+      for (const { run } of removed.runInputs) {
+        for (const job of run.jobs) {
+          if (job.status === 'QUEUED') {
+            job.status = 'FAILED';
+            job.error = 'Cancelled from queue';
+          }
+        }
+      }
+      json(res, 200, { cancelled: true });
+      return;
+    }
+
+    if (req.method === 'POST' && /^\/api\/catalog\/batch\/queue\/[^/]+\/pause$/.test(url.pathname)) {
+      if (session!.role !== 'superadmin') {
+        json(res, 403, { error: { code: 'FORBIDDEN', message: 'Super admin only.' } });
+        return;
+      }
+      const id = decodeJobIdParam(url.pathname.slice('/api/catalog/batch/queue/'.length, -'/pause'.length));
+      const batch = id === null ? undefined : catalogQueuedBatches.find((b) => b.id === id);
+      if (!batch) {
+        json(res, 404, { error: { code: 'NOT_FOUND', message: 'Not found in queue — it may have already started.' } });
+        return;
+      }
+      batch.paused = true;
+      json(res, 200, { paused: true });
+      return;
+    }
+
+    if (req.method === 'POST' && /^\/api\/catalog\/batch\/queue\/[^/]+\/resume$/.test(url.pathname)) {
+      if (session!.role !== 'superadmin') {
+        json(res, 403, { error: { code: 'FORBIDDEN', message: 'Super admin only.' } });
+        return;
+      }
+      const id = decodeJobIdParam(url.pathname.slice('/api/catalog/batch/queue/'.length, -'/resume'.length));
+      const batch = id === null ? undefined : catalogQueuedBatches.find((b) => b.id === id);
+      if (!batch) {
+        json(res, 404, { error: { code: 'NOT_FOUND', message: 'Not found in queue — it may have already started.' } });
+        return;
+      }
+      batch.paused = false;
+      // In case nothing is currently running and this (or another
+      // already-unpaused entry ahead of it) can start immediately.
+      tryStartNextCatalogBatch(cfg);
+      json(res, 200, { paused: false });
       return;
     }
 
