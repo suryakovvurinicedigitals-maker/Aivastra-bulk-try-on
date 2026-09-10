@@ -24,11 +24,15 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   DevApiError,
+  confirmDevBackground,
+  deleteDevBackground,
   generateCatalog,
   getBalance,
   getCatalogOptions,
   getCatalogueStatus,
   getCategories,
+  listDevBackgrounds,
+  presignDevBackground,
   type CatalogGender,
   type CatalogGenerateBody,
   type CatalogJobStatus,
@@ -674,7 +678,18 @@ function validateCatalogSharedFields(input: {
   if (
     !Array.isArray(input.looks) ||
     input.looks.length < 1 ||
-    input.looks.length > 12 ||
+    // 12 used to be a hard upstream limit on how many looks a single
+    // /v1/dev/catalog/generate call could carry. It no longer is: every
+    // caller of validateCatalogSharedFields feeds `looks` into
+    // runCatalogAggregate, which has ALWAYS submitted one look per upstream
+    // call (throttled by catalogGenerateLimit/CATALOG_CONCURRENCY), never
+    // the whole array in one shot. So the real ceiling here is just a sanity
+    // cap against a catastrophic accidental selection (e.g. someone fat-
+    // fingering "select all" on a background library sized in the tens of
+    // thousands) — not a reflection of any remaining API constraint. Raised
+    // to accommodate real background-testing runs sized in the low
+    // thousands (per user: "there will be more than 1000").
+    input.looks.length > 5000 ||
     !input.looks.every(
       (l: unknown) =>
         l &&
@@ -684,7 +699,7 @@ function validateCatalogSharedFields(input: {
         CATALOG_SLUG_RE.test((l as any).background),
     )
   ) {
-    return { code: 'VALIDATION', message: 'looks must be 1-12 {pose, background} slug pairs' };
+    return { code: 'VALIDATION', message: 'looks must be 1-5000 {pose, background} slug pairs' };
   }
   if (typeof input.aspectRatio !== 'string' || !CATALOG_ASPECT_RATIOS.has(input.aspectRatio)) {
     return { code: 'VALIDATION', message: 'aspectRatio must be one of 1:1, 2:3, 3:4, 4:5' };
@@ -2105,6 +2120,113 @@ const server = http.createServer(async (req, res) => {
         json(res, 200, { available: true, ...options });
       } catch (err) {
         json(res, 200, { available: false, error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
+
+    // ---- dev-API-owned backgrounds: lets a tester upload a CANDIDATE
+    // background image (one that doesn't exist in the admin-curated
+    // library) and actually use it in a real generateCatalog call, before
+    // deciding whether it's worth adding permanently via the aivastra admin
+    // panel. This exists ONLY for background — face/lower/shoe/pose stay
+    // admin-curated-only, both because that's what was asked for and
+    // because that's the only axis aivastra's dev API added this for (see
+    // lib/api-client.mts's doc comment on this section for the full story).
+    //
+    // Three routes mirror the aivastra dev API's own three-step flow:
+    // presign (reserve storage, hand back a direct-to-storage upload URL)
+    // -> the BROWSER PUTs raw image bytes straight to that URL itself
+    // (catalog.js does this with a plain fetch(uploadUrl, {method:'PUT',...}),
+    // never routing bytes through this server) -> confirm (finalize into a
+    // selectable background). This server only ever proxies the two small
+    // JSON steps; unlike every other upload path in this file, it never
+    // sees the image bytes for this one.
+    if (req.method === 'GET' && url.pathname === '/api/catalog/backgrounds') {
+      if (!cfg) {
+        json(res, 200, { available: false, error: 'DEV_API_KEY is not set on the server.' });
+        return;
+      }
+      try {
+        const { items } = await listDevBackgrounds(cfg);
+        json(res, 200, { available: true, items });
+      } catch (err) {
+        json(res, 200, { available: false, error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/catalog/backgrounds/presign') {
+      if (!cfg) {
+        json(res, 400, { error: { code: 'CONFIG_MISSING', message: 'DEV_API_KEY is not set on the server.' } });
+        return;
+      }
+      let body: any;
+      try {
+        body = (await readJsonBody(req)) ?? {};
+      } catch {
+        json(res, 400, { error: { code: 'VALIDATION', message: 'invalid JSON body' } });
+        return;
+      }
+      const { contentType, contentLength } = body;
+      const validContentTypes = new Set(['image/jpeg', 'image/png', 'image/webp']);
+      if (!validContentTypes.has(contentType)) {
+        json(res, 400, { error: { code: 'VALIDATION', message: 'contentType must be image/jpeg, image/png, or image/webp' } });
+        return;
+      }
+      if (!Number.isInteger(contentLength) || contentLength <= 0 || contentLength > 52_428_800) {
+        json(res, 400, { error: { code: 'VALIDATION', message: 'contentLength must be a positive integer up to 50MB' } });
+        return;
+      }
+      try {
+        const result = await presignDevBackground(cfg, contentType, contentLength);
+        json(res, 200, result);
+      } catch (err) {
+        devApiErrorResponse(res, err);
+      }
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/catalog/backgrounds/confirm') {
+      if (!cfg) {
+        json(res, 400, { error: { code: 'CONFIG_MISSING', message: 'DEV_API_KEY is not set on the server.' } });
+        return;
+      }
+      let body: any;
+      try {
+        body = (await readJsonBody(req)) ?? {};
+      } catch {
+        json(res, 400, { error: { code: 'VALIDATION', message: 'invalid JSON body' } });
+        return;
+      }
+      const { r2Key, label } = body;
+      if (typeof r2Key !== 'string' || r2Key.length === 0) {
+        json(res, 400, { error: { code: 'VALIDATION', message: 'r2Key is required' } });
+        return;
+      }
+      try {
+        const item = await confirmDevBackground(cfg, r2Key, safeResultLabel(label, 120) ?? undefined);
+        json(res, 200, item);
+      } catch (err) {
+        devApiErrorResponse(res, err);
+      }
+      return;
+    }
+
+    if (req.method === 'DELETE' && url.pathname.startsWith('/api/catalog/backgrounds/')) {
+      if (!cfg) {
+        json(res, 400, { error: { code: 'CONFIG_MISSING', message: 'DEV_API_KEY is not set on the server.' } });
+        return;
+      }
+      const id = url.pathname.slice('/api/catalog/backgrounds/'.length);
+      if (!/^[0-9a-f-]{36}$/i.test(id)) {
+        json(res, 400, { error: { code: 'VALIDATION', message: 'invalid background id' } });
+        return;
+      }
+      try {
+        const result = await deleteDevBackground(cfg, id);
+        json(res, 200, result);
+      } catch (err) {
+        devApiErrorResponse(res, err);
       }
       return;
     }

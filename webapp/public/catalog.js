@@ -18,11 +18,15 @@
 //
 // The API's own POST /v1/dev/catalog/generate only takes ONE face, ONE
 // lower, and ONE shoe per call (poses/backgrounds are the only fields that
-// batch, via the `looks` array, capped at 12 pairs) — so each garment fans
-// out into one generate call PER (face, lower, shoe) combination under the
-// hood: faces x max(lowers selected, 1) x max(shoes selected, 1) calls per
-// garment, each producing up to 12 jobs. Leaving lower/shoe unselected isn't
-// "0 combinations", it's "1 combination with neither" — that's what the
+// batch, via the `looks` array) — so each garment fans out into one
+// "combination" (registerCatalogAggregateRun) PER (face, lower, shoe) pick
+// under the hood: faces x max(lowers selected, 1) x max(shoes selected, 1)
+// combinations per garment. Each combination itself fans out further,
+// server-side, into one upstream generate call PER pose×background look
+// (runCatalogAggregate, throttled by CATALOG_CONCURRENCY) — so there's no
+// real per-combination job-count ceiling anymore, just the server's sanity
+// cap on looks.length (see validateCatalogSharedFields). Leaving lower/shoe
+// unselected isn't "0 combinations", it's "1 combination with neither" — that's what the
 // max(...,1) is for. Each garment therefore tracks one "run" per combination
 // (garment.runs[]), each with its own catalogueId/jobs/status — the
 // garment's own status is just an aggregate over its runs. Same lifecycle
@@ -139,7 +143,149 @@ let catalogAssetFolderStatus = { face: null, lower: null, shoe: null, pose: null
 // These are preview-only: there's no slug to select, so they're never wired
 // into catalogBatch's Sets or a generate call — see catalogMatchAssetsFromFiles's
 // doc comment for why that's a hard API limitation, not a UI gap.
-let catalogAssetFolderUnmatched = { face: [], lower: [], shoe: [], pose: [], background: [] }; // kind -> [{id, name, previewUrl}]
+let catalogAssetFolderUnmatched = { face: [], lower: [], shoe: [], pose: [], background: [] }; // kind -> [{id, name, previewUrl, file, uploading, uploadError}]
+
+// ---------- backgrounds: the ONE axis where a genuinely-new candidate image
+// can be tested for real (aivastra's dev API added POST /v1/dev/backgrounds/
+// {presign,confirm} + GET/DELETE specifically for this — see
+// lib/api-client.mts's doc comment on that section for the full story of
+// why only background gets this treatment and not face/lower/shoe/pose).
+// A confirmed background's `id` is a UUID that satisfies PUBLIC_SLUG's
+// regex, so it's usable in catalogBatch.backgrounds exactly like a curated
+// slug — no special-casing needed anywhere selection/looks/submit already
+// happens, only in how the id gets INTO that Set in the first place.
+// ---------------------------------------------------------------------------
+let catalogUserBackgrounds = []; // [{id, label, thumbnailUrl}] — this merchant's own dev-API-uploaded backgrounds
+let catalogUserBackgroundsLoaded = false; // loaded once per page load, NOT reset on gender/garmentType change (the list isn't gender-scoped)
+let catalogBackgroundUploading = false; // true while handleCatalogBackgroundUploadFiles is mid-batch — disables the upload button so a tester can't fire a second overlapping batch
+let catalogBackgroundUploadStatus = null; // {err: boolean, message: string} | null — last upload batch's outcome, shown the same way catalogAssetFolderStatus is
+
+/** Loads (once) the merchant's own previously-uploaded backgrounds, so a returning tester doesn't have to re-upload every session. Best-effort — a failure here just means "no self-uploaded backgrounds shown yet", not a hard error, since the curated picker still works fine without it. */
+async function loadCatalogUserBackgrounds() {
+  if (catalogUserBackgroundsLoaded) return;
+  catalogUserBackgroundsLoaded = true;
+  try {
+    const res = await fetch('/api/catalog/backgrounds');
+    const body = await res.json();
+    if (res.ok && body.available !== false) catalogUserBackgrounds = body.items ?? [];
+  } catch {
+    // best-effort — leave catalogUserBackgrounds empty, tester can still use curated backgrounds
+  }
+  renderCatalog();
+}
+
+/**
+ * Uploads ONE candidate background through the real 3-step flow —
+ * presign (this server, JSON) -> PUT raw bytes directly to the presigned
+ * URL (NOT through this server — see the /api/catalog/backgrounds/presign
+ * route's doc comment) -> confirm (this server, JSON). On success the new
+ * background is added to catalogUserBackgrounds AND auto-selected into
+ * catalogBatch.backgrounds, since uploading it was an explicit "I want to
+ * test this one" action — there's no reason to make the tester then also
+ * go find and click its tile.
+ */
+async function uploadCandidateBackground(file, label) {
+  const contentType = file.type;
+  if (!['image/jpeg', 'image/png', 'image/webp'].includes(contentType)) {
+    throw new Error(`${file.name}: only JPEG/PNG/WEBP are supported (got ${contentType || 'unknown type'})`);
+  }
+  const presignRes = await fetch('/api/catalog/backgrounds/presign', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ contentType, contentLength: file.size }),
+  });
+  const presignBody = await presignRes.json();
+  if (!presignRes.ok) throw new Error(`${presignBody.error?.code ?? presignRes.status}: ${presignBody.error?.message ?? 'presign failed'}`);
+
+  // Straight to storage — this is the one upload in this whole tool that
+  // does NOT go through webapp/server.mts, because the presigned URL is
+  // exactly what makes that unnecessary (and sending 50MB through our own
+  // node:http server first would just be slower for no benefit).
+  const putRes = await fetch(presignBody.uploadUrl, { method: 'PUT', headers: { 'Content-Type': contentType }, body: file });
+  if (!putRes.ok) throw new Error(`${file.name}: upload to storage failed (${putRes.status})`);
+
+  const confirmRes = await fetch('/api/catalog/backgrounds/confirm', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ r2Key: presignBody.r2Key, label: label || file.name.replace(/\.[^.]+$/, '') }),
+  });
+  const confirmBody = await confirmRes.json();
+  if (!confirmRes.ok) throw new Error(`${confirmBody.error?.code ?? confirmRes.status}: ${confirmBody.error?.message ?? 'confirm failed'}`);
+  return confirmBody; // DevBackgroundItem: {id, label, thumbnailUrl}
+}
+
+/**
+ * Uploads a whole batch of candidate backgrounds picked directly via the
+ * section header's "Upload new background(s)" button — the main, deliberate
+ * entry point for "I want to test a photo that's not in the admin library
+ * at all", as opposed to the folder-match flow above (which is about
+ * bulk-*selecting* existing curated assets by filename). Sequential, not
+ * Promise.all — presign+confirm share a 10/min write-rate budget upstream,
+ * and firing a big batch all at once would just pile up 429 retries inside
+ * request()'s own backoff instead of finishing any faster. Renders progress
+ * after each file so a large batch doesn't look frozen.
+ */
+async function handleCatalogBackgroundUploadFiles(fileList) {
+  const images = filterImageFiles(fileList);
+  if (images.length === 0) return;
+  catalogBackgroundUploading = true;
+  catalogBackgroundUploadStatus = null;
+  renderCatalog();
+  let uploaded = 0;
+  const errors = [];
+  for (const file of images) {
+    try {
+      const item = await uploadCandidateBackground(file);
+      catalogUserBackgrounds.push(item);
+      catalogBatch.backgrounds.add(item.id); // auto-select — uploading it was already an explicit "test this one" action
+      uploaded++;
+    } catch (err) {
+      errors.push(err instanceof Error ? err.message : String(err));
+    }
+    catalogBackgroundUploadStatus = { err: false, message: `Uploading… ${uploaded + errors.length} of ${images.length} processed.` };
+    renderCatalog();
+  }
+  catalogBackgroundUploading = false;
+  catalogBackgroundUploadStatus = {
+    err: uploaded === 0,
+    message:
+      uploaded === images.length
+        ? `Uploaded and selected ${uploaded} new background${uploaded === 1 ? '' : 's'}.`
+        : `Uploaded and selected ${uploaded} of ${images.length}.` +
+          (errors.length ? ` Errors: ${errors.slice(0, 3).join('; ')}${errors.length > 3 ? `, +${errors.length - 3} more` : ''}.` : ''),
+  };
+  renderCatalog();
+}
+
+/**
+ * Uploads ONE tile from the folder-match "unmatched" preview grid — the
+ * bridge between the two upload flows: a tester drops a folder in expecting
+ * filename matches, most don't match, and rather than making them re-pick
+ * the same file through a second file dialog, each unmatched preview tile
+ * (background axis only — see catalogUnmatchedThumbsHtml) gets its own
+ * "Upload & use" action that reuses the File object already held in memory.
+ * On success the tile moves from "unmatched preview" to "real, selected
+ * background" and disappears from this list; on failure it stays with an
+ * inline error so the tester can retry or give up on just that one file.
+ */
+async function uploadUnmatchedBackgroundTile(kind, id) {
+  const item = catalogAssetFolderUnmatched[kind]?.find((it) => it.id === id);
+  if (!item || item.uploading) return;
+  item.uploading = true;
+  item.uploadError = null;
+  renderCatalog();
+  try {
+    const uploaded = await uploadCandidateBackground(item.file, item.name.replace(/\.[^.]+$/, ''));
+    catalogUserBackgrounds.push(uploaded);
+    catalogBatch.backgrounds.add(uploaded.id);
+    URL.revokeObjectURL(item.previewUrl);
+    catalogAssetFolderUnmatched[kind] = catalogAssetFolderUnmatched[kind].filter((it) => it.id !== id);
+  } catch (err) {
+    item.uploading = false;
+    item.uploadError = err instanceof Error ? err.message : String(err);
+  }
+  renderCatalog();
+}
 
 // Maps a picker `kind` to the CatalogAsset[] it draws from in the currently-
 // loaded options, and to the Set key catalogBatch tracks selections in — the
@@ -148,13 +294,23 @@ let catalogAssetFolderUnmatched = { face: [], lower: [], shoe: [], pose: [], bac
 // new axis can't be added to one and forgotten in the other.
 function catalogAssetListForKind(kind) {
   const o = catalogBatch.options;
-  if (!o) return [];
+  if (!o) return kind === 'background' ? catalogUserBackgroundsAsAssets() : [];
   if (kind === 'face') return o.faces;
   if (kind === 'lower') return o.lowerItems;
   if (kind === 'shoe') return o.shoeItems;
   if (kind === 'pose') return o.poses;
-  if (kind === 'background') return o.backgrounds;
+  // Backgrounds merge the curated (admin) list with this merchant's own
+  // dev-API-uploaded ones — the only axis with a second source, so it's the
+  // only one that needs merging here. A user background's `id` doubles as
+  // its slug (see uploadCandidateBackground's doc comment), so once mapped
+  // into {slug, label, thumbnailUrl} shape it's indistinguishable to every
+  // other piece of selection/looks/submit code in this file.
+  if (kind === 'background') return [...o.backgrounds, ...catalogUserBackgroundsAsAssets()];
   return [];
+}
+
+function catalogUserBackgroundsAsAssets() {
+  return catalogUserBackgrounds.map((b) => ({ slug: b.id, label: b.label, thumbnailUrl: b.thumbnailUrl, mine: true }));
 }
 
 function catalogNormalize(s) {
@@ -217,6 +373,9 @@ function handleCatalogAssetFolderFiles(kind, fileList) {
     id: catalogUid('unmatched'),
     name: f.name,
     previewUrl: URL.createObjectURL(f),
+    file: f, // kept alive (not just the preview URL) so background candidates can actually be uploaded later via uploadCandidateBackground — see catalogUnmatchedThumbsHtml
+    uploading: false,
+    uploadError: null,
   }));
 
   catalogAssetFolderStatus[kind] =
@@ -239,7 +398,7 @@ window.enterCatalogView = async function enterCatalogView() {
   catalogPollBatchStatus(); // reflect an already-in-flight/queued/paused batch from another session, even on a repeat visit to this tab
   if (catalogLoaded) return;
   catalogLoaded = true;
-  await loadCatalogBatchOptions();
+  await Promise.all([loadCatalogBatchOptions(), loadCatalogUserBackgrounds()]);
 };
 
 async function fetchCatalogOptionsCached(gender, garmentType) {
@@ -354,11 +513,11 @@ function removeCatalogGarment(garmentId) {
   renderCatalog();
 }
 
-/** Cross product of selected poses x selected backgrounds, in the order those assets appear in the loaded options list (not selection order) — deterministic regardless of click order. Callers cap this at 12 themselves (the API's own `looks`-per-call limit). */
+/** Cross product of selected poses x selected backgrounds, in the order those assets appear in the loaded options list (not selection order) — deterministic regardless of click order. Callers used to cap this at 12 (an old `looks`-per-call limit that no longer applies — see submitCatalogGarments' comment); the full cross product is sent as-is now, up to the server's much higher sanity cap. Backgrounds come from catalogAssetListForKind (curated + this merchant's own uploaded ones), not catalogBatch.options.backgrounds directly — otherwise a selected self-uploaded background would silently vanish from every look here. */
 function catalogComputeLooks() {
   if (!catalogBatch.options) return [];
   const poses = catalogBatch.options.poses.filter((p) => catalogBatch.poses.has(p.slug));
-  const backgrounds = catalogBatch.options.backgrounds.filter((b) => catalogBatch.backgrounds.has(b.slug));
+  const backgrounds = catalogAssetListForKind('background').filter((b) => catalogBatch.backgrounds.has(b.slug));
   const pairs = [];
   for (const p of poses) for (const b of backgrounds) pairs.push({ pose: p.slug, background: b.slug });
   return pairs;
@@ -425,10 +584,16 @@ function catalogBatchIsValid() {
 
 function catalogAssetTileHtml(kind, asset, selected, aspect = '3/4') {
   const isSquare = aspect === '1/1';
+  // asset.mine (see catalogUserBackgroundsAsAssets) only ever true for
+  // kind === 'background' — a small badge so a tester can tell "this is one
+  // of my own test uploads" apart from an admin-curated one at a glance,
+  // since they're otherwise mixed into the exact same grid/Set.
+  const mineBadge = asset.mine ? `<span class="catalog-asset-mine-badge" title="Your uploaded background — not in the admin-curated library">Mine</span>` : '';
   return `
     <div class="catalog-asset-card${selected ? ' selected' : ''}" data-kind="${kind}" data-slug="${catalogEscapeHtml(asset.slug)}" role="button" tabindex="0" title="${catalogEscapeHtml(asset.label)}">
       <div class="catalog-asset-thumb-wrap${isSquare ? ' square' : ''}">
         <img src="${asset.thumbnailUrl}" alt="${catalogEscapeHtml(asset.label)}" loading="lazy" />
+        ${mineBadge}
         <span class="catalog-asset-check" aria-hidden="true">
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
             <polyline points="20 6 9 17 4 12"/>
@@ -455,7 +620,11 @@ function catalogAssetPickersHtml() {
   const sections = ['face', 'lower', 'shoe', 'pose', 'background'];
   return sections.map((kind) => {
     const meta = CATALOG_ASSET_METADATA[kind];
-    const items = o[meta.optionsKey] ?? [];
+    // catalogAssetListForKind, not o[meta.optionsKey] directly — for
+    // 'background' this also brings in the merchant's own uploaded
+    // candidates (see that function's doc comment); every other kind is
+    // unaffected, it's exactly o[meta.optionsKey] either way.
+    const items = catalogAssetListForKind(kind);
     if (items.length === 0 && !meta.required) return '';
 
     const set = catalogBatch[meta.setKey];
@@ -489,6 +658,7 @@ function catalogAssetPickersHtml() {
                 <span>${allSelected ? 'Clear all' : `Select all (${items.length})`}</span>
               </button>` : ''}
             ${catalogAssetFolderControlHtml(kind)}
+            ${kind === 'background' ? catalogBackgroundUploadControlHtml() : ''}
             ${items.length > CATALOG_VISIBLE_PAGE_CAP ? `
               <button type="button" class="catalog-view-more-btn" data-kind="${kind}" title="Browse all ${items.length} options">
                 <span>View all (${items.length})</span>
@@ -514,19 +684,29 @@ function catalogLooksSummaryHtml() {
   if (totalPairs === 0 || runsPerGarment === 0) {
     return '<p class="catalog-looks-summary">Select at least one face, one pose, and one background to see how many jobs this creates.</p>';
   }
-  const perRunJobs = Math.min(totalPairs, 12);
-  const totalCalls = runsPerGarment * Math.max(garmentCount, 1);
-  const totalJobs = perRunJobs * totalCalls;
-  const overflow = totalPairs > 12;
-  const overflowNote = overflow
-    ? ` — the API allows at most 12 pose×background looks per generate call, so only the first 12 are used for EACH combination (${totalPairs - 12} dropped per call)`
-    : '';
+  // Every pose×background pair now actually gets submitted — the server's
+  // runCatalogAggregate fans each look out to its own upstream
+  // /v1/dev/catalog/generate call one at a time (throttled by
+  // CATALOG_CONCURRENCY), rather than the client packing up to 12 looks
+  // into a single call. So nothing gets silently dropped above 12 anymore;
+  // what matters at real scale (hundreds/thousands of backgrounds) is
+  // making the true credit/time cost impossible to miss before confirming.
+  const totalRuns = runsPerGarment * Math.max(garmentCount, 1);
+  const totalJobs = totalPairs * totalRuns;
   const axisDesc = [`${garmentCount} garment(s)`, `${catalogBatch.faces.size} face(s)`];
   if (catalogBatch.lowers.size > 0) axisDesc.push(`${catalogBatch.lowers.size} lower(s)`);
   if (catalogBatch.shoes.size > 0) axisDesc.push(`${catalogBatch.shoes.size} shoe(s)`);
   axisDesc.push(`${catalogBatch.poses.size} pose(s)`, `${catalogBatch.backgrounds.size} background(s)`);
-  return `<p class="catalog-looks-summary${overflow ? ' warn' : ''}">${axisDesc.join(' × ')}${overflowNote}. ` +
-    `This creates ${totalCalls} generate call${totalCalls === 1 ? '' : 's'} — ${totalJobs} job${totalJobs === 1 ? '' : 's'} total across all garments.</p>`;
+  // Not a hard cap (server allows up to 5000 looks) — just the line above
+  // which the warning styling kicks in, so a large intentional test batch
+  // (the "1000+ backgrounds" case) still gets a loud, explicit heads-up.
+  const HEAVY_JOB_THRESHOLD = 200;
+  const heavy = totalJobs > HEAVY_JOB_THRESHOLD;
+  const costNote = heavy
+    ? ` <strong>This spends real credits on ${totalJobs} jobs and, at the current concurrency limit, will take a while to finish — double-check the selection before confirming.</strong>`
+    : '';
+  return `<p class="catalog-looks-summary${heavy ? ' warn' : ''}">${axisDesc.join(' × ')} = ${totalPairs} pose×background pair${totalPairs === 1 ? '' : 's'} per combination. ` +
+    `This creates ${totalRuns} combination${totalRuns === 1 ? '' : 's'} — ${totalJobs} job${totalJobs === 1 ? '' : 's'} total across all garments.${costNote}</p>`;
 }
 
 function catalogConfigFieldsHtml() {
@@ -597,29 +777,63 @@ function catalogAssetFolderControlHtml(kind) {
 }
 
 /**
+ * Background-only "add a brand-new candidate" control — a plain multi-file
+ * picker (no directory requirement, unlike the folder-match control above,
+ * since this is a deliberate "add exactly these N images" action, not a
+ * filename-matching guess). Each picked file goes through
+ * uploadCandidateBackground's real presign->PUT->confirm flow via
+ * handleCatalogBackgroundUploadFiles and, on success, becomes a real,
+ * selected background tile in the grid above. This is the ONE axis this
+ * exists for — aivastra's dev API added POST /v1/dev/backgrounds/* (see
+ * lib/api-client.mts's doc comment) specifically so background candidates
+ * could be tested before being admin-curated; there's no equivalent for
+ * face/lower/shoe/pose.
+ */
+function catalogBackgroundUploadControlHtml() {
+  const status = catalogBackgroundUploadStatus;
+  const statusClass = status ? (status.err ? 'err' : 'ok') : '';
+  return `
+    <span class="catalog-asset-folder-control catalog-bg-upload-control">
+      <button type="button" class="link-btn catalog-bg-upload-btn"${catalogBackgroundUploading ? ' disabled' : ''}>⬆ ${catalogBackgroundUploading ? 'Uploading…' : 'Upload new background(s)'}</button>
+      <input type="file" class="catalog-bg-upload-input" accept="image/jpeg,image/png,image/webp" multiple hidden${catalogBackgroundUploading ? ' disabled' : ''} />
+    </span>
+    ${status ? `<p class="status ${statusClass} catalog-asset-folder-status">${catalogEscapeHtml(status.message)}</p>` : ''}`;
+}
+
+/**
  * Folder files that matched nothing in the curated library — shown as plain
- * photo previews (no checkbox, not part of any Set) so a folder upload never
- * silently hides files the tester dropped in. There is no way to wire these
- * into an actual generate call: the upstream catalog API only ever accepts
- * an EXISTING asset's slug for face/lower/shoe/pose/background (unlike
- * `garment`, which takes an arbitrary image) — see lib/api-client.mts's
- * CatalogGenerateBody and catalogMatchAssetsFromFiles's doc comment above.
- * The intended loop: browse these previews, pick the ones worth keeping,
- * add them as real assets via the aivastra admin panel, then they'll show up
- * (and match) here on the next folder upload.
+ * photo previews so a folder upload never silently hides files the tester
+ * dropped in. For face/lower/shoe/pose these stay preview-only: the upstream
+ * catalog API only ever accepts an EXISTING asset's slug for those four
+ * (unlike `garment`, which takes an arbitrary image) — see
+ * lib/api-client.mts's CatalogGenerateBody. The intended loop for those:
+ * browse the previews, pick the ones worth keeping, add them as real assets
+ * via the aivastra admin panel, then they'll show up (and match) here on the
+ * next folder upload.
+ *
+ * background is the one exception — each tile gets its own "Upload & use"
+ * button (uploadUnmatchedBackgroundTile) that runs the real presign->PUT->
+ * confirm flow on that exact file, since aivastra's dev API added a real
+ * upload path for this one axis (see catalogBackgroundUploadControlHtml).
  */
 function catalogUnmatchedThumbsHtml(kind) {
   const items = catalogAssetFolderUnmatched[kind];
   if (!items || items.length === 0) return '';
+  const isBackground = kind === 'background';
+  const label = isBackground
+    ? `Not in the asset library yet — upload the ones worth testing:`
+    : `Not in the asset library — preview only, can't be used to generate until added via the admin panel:`;
   return `
-    <p class="hint catalog-unmatched-label">Not in the asset library — preview only, can't be used to generate until added via the admin panel:</p>
+    <p class="hint catalog-unmatched-label">${label}</p>
     <div class="upload-thumbs catalog-unmatched-thumbs">
       ${items
         .map(
           (it) => `
-        <div class="upload-thumb catalog-unmatched-thumb" data-kind="${kind}" data-id="${it.id}" title="${catalogEscapeHtml(it.name)}">
+        <div class="upload-thumb catalog-unmatched-thumb${it.uploading ? ' uploading' : ''}" data-kind="${kind}" data-id="${it.id}" title="${catalogEscapeHtml(it.name)}${it.uploadError ? ` — ${catalogEscapeHtml(it.uploadError)}` : ''}">
           <img src="${it.previewUrl}" loading="lazy" />
           <button type="button" class="thumb-remove catalog-unmatched-thumb-remove" title="Dismiss ${catalogEscapeHtml(it.name)}" aria-label="Dismiss ${catalogEscapeHtml(it.name)}">×</button>
+          ${isBackground ? `<button type="button" class="catalog-unmatched-upload-btn" data-kind="${kind}" data-id="${it.id}"${it.uploading ? ' disabled' : ''}>${it.uploading ? 'Uploading…' : '⬆ Upload & use'}</button>` : ''}
+          ${it.uploadError ? `<span class="catalog-unmatched-upload-error" title="${catalogEscapeHtml(it.uploadError)}">⚠ failed</span>` : ''}
         </div>`,
         )
         .join('')}
@@ -681,7 +895,7 @@ const CATALOG_STATUS_CLASS = {
 
 function catalogJobCellHtml(garment, run, job) {
   const poseLabel = catalogBatch.options?.poses.find((p) => p.slug === job.pose)?.label ?? job.pose;
-  const bgLabel = catalogBatch.options?.backgrounds.find((b) => b.slug === job.background)?.label ?? job.background;
+  const bgLabel = catalogAssetListForKind('background').find((b) => b.slug === job.background)?.label ?? job.background;
   const badgeCls = CATALOG_STATUS_CLASS[job.status] ?? 'muted';
   const badgeLabel = CATALOG_STATUS_LABEL[job.status] ?? job.status;
   let inner = `<span class="catalog-result-label">${catalogEscapeHtml(poseLabel)} · ${catalogEscapeHtml(bgLabel)}</span> <span class="redchief-status-badge ${badgeCls}">${badgeLabel}</span>`;
@@ -767,7 +981,9 @@ function updateCatalogSubmitEnabled() {
     return;
   }
   const runsPerGarment = catalogRunCount();
-  const jobsPerRun = Math.min(catalogComputeLooks().length, 12);
+  // No more 12-cap — see submitCatalogGarments' comment. Every selected
+  // pose×background pair actually gets submitted now.
+  const jobsPerRun = catalogComputeLooks().length;
   const totalCalls = runsPerGarment * submittable.length;
   const totalJobs = jobsPerRun * totalCalls;
   catalogSubmitBtn.textContent = `Generate ${totalJobs} job${totalJobs === 1 ? '' : 's'} (${submittable.length} garment${submittable.length === 1 ? '' : 's'}, ${runsPerGarment} combination${runsPerGarment === 1 ? '' : 's'} each)`;
@@ -873,7 +1089,7 @@ function wireCatalogConfigEvents() {
       const kind = btn.dataset.kind;
       const meta = CATALOG_ASSET_METADATA[kind];
       if (!meta) return;
-      const items = catalogBatch.options?.[meta.optionsKey] ?? [];
+      const items = catalogAssetListForKind(kind); // includes self-uploaded backgrounds for kind === 'background'
       const set = catalogBatch[meta.setKey];
       if (btn.dataset.action === 'clear') set.clear();
       else for (const item of items) set.add(item.slug);
@@ -913,6 +1129,25 @@ function wireCatalogConfigEvents() {
       if (input.files.length > 0) handleCatalogAssetFolderFiles(input.dataset.kind, input.files);
       input.value = ''; // same folder can be re-picked later (e.g. after adding more files to it) without this no-op-ing on an unchanged FileList
     });
+  }
+
+  // Background-only "Upload new background(s)" — see catalogBackgroundUploadControlHtml.
+  const bgUploadBtn = catalogConfigBodyEl.querySelector('.catalog-bg-upload-btn');
+  if (bgUploadBtn) {
+    const bgUploadInput = catalogConfigBodyEl.querySelector('.catalog-bg-upload-input');
+    bgUploadBtn.addEventListener('click', () => bgUploadInput.click());
+    bgUploadInput.addEventListener('change', () => {
+      if (bgUploadInput.files.length > 0) handleCatalogBackgroundUploadFiles(bgUploadInput.files);
+      bgUploadInput.value = '';
+    });
+  }
+
+  // Per-tile "Upload & use" on the unmatched-preview grid — background only,
+  // see catalogUnmatchedThumbsHtml. stopPropagation isn't needed here (this
+  // button isn't nested inside anything with its own click handler), unlike
+  // the dismiss ×.
+  for (const uploadBtn of catalogConfigBodyEl.querySelectorAll('.catalog-unmatched-upload-btn')) {
+    uploadBtn.addEventListener('click', () => uploadUnmatchedBackgroundTile(uploadBtn.dataset.kind, uploadBtn.dataset.id));
   }
 }
 
@@ -971,8 +1206,7 @@ function catalogModalFilteredItems() {
   const kind = catalogModalState.kind;
   if (!kind || !catalogBatch.options) return [];
 
-  const meta = CATALOG_ASSET_METADATA[kind];
-  const allItems = catalogBatch.options[meta.optionsKey] ?? [];
+  const allItems = catalogAssetListForKind(kind); // includes self-uploaded backgrounds for kind === 'background'
   const filterTag = catalogModalState.activeFilter;
 
   return allItems.filter((item) => {
@@ -1141,17 +1375,23 @@ catalogSubmitBtn.addEventListener('click', () => {
   const submittable = catalogSubmittableGarments();
   if (submittable.length === 0 || !catalogBatchIsValid()) return;
   const runsPerGarment = catalogRunCount();
-  const jobsPerRun = Math.min(catalogComputeLooks().length, 12);
-  const totalCalls = runsPerGarment * submittable.length;
-  const totalJobs = jobsPerRun * totalCalls;
+  // No more 12-cap — see submitCatalogGarments' comment. Every selected
+  // pose×background pair actually gets submitted, one upstream call at a
+  // time (throttled server-side), not batched 12-per-call.
+  const jobsPerRun = catalogComputeLooks().length;
+  const totalCombinations = runsPerGarment * submittable.length;
+  const totalJobs = jobsPerRun * totalCombinations;
   // Credit cost per job is resolution-dependent and set by admin config —
   // it isn't exposed by any dev-API response (see the catalog API contract),
   // so this warns honestly about spending real credits without inventing a
   // number the tool can't actually verify.
+  const scaleNote = totalJobs > 200
+    ? ` This is a large batch — at the current concurrency limit it will take a while to fully process; the queue banner will show live progress and can be paused/resumed.`
+    : '';
   catalogSubmitConfirmTextEl.textContent =
-    `This will submit ${totalCalls} generate call${totalCalls === 1 ? '' : 's'} across ${submittable.length} garment${submittable.length === 1 ? '' : 's'} ` +
-    `(${totalJobs} job${totalJobs === 1 ? '' : 's'} total) against PRODUCTION. ` +
-    `Exact credit cost per job depends on the selected resolution and is set by admin config (not shown here). This can't be undone. Continue?`;
+    `This will submit ${totalCombinations} combination${totalCombinations === 1 ? '' : 's'} across ${submittable.length} garment${submittable.length === 1 ? '' : 's'} ` +
+    `(${totalJobs} job${totalJobs === 1 ? '' : 's'} total, ${jobsPerRun} pose×background pair${jobsPerRun === 1 ? '' : 's'} each) against PRODUCTION. ` +
+    `Exact credit cost per job depends on the selected resolution and is set by admin config (not shown here).${scaleNote} This can't be undone. Continue?`;
   catalogSubmitConfirmEl.hidden = false;
 });
 
@@ -1176,7 +1416,14 @@ catalogSubmitConfirmBtn.addEventListener('click', () => {
 async function submitCatalogGarments() {
   const submittable = catalogSubmittableGarments();
   if (submittable.length === 0 || !catalogBatchIsValid()) return;
-  const looks = catalogComputeLooks().slice(0, 12);
+  // Used to be .slice(0, 12) — that cap dated from when the client packed
+  // multiple looks into a single upstream generate call (max 12 per call).
+  // The server's runCatalogAggregate has always fanned each look out to its
+  // own upstream call one at a time instead, so the cap was silently
+  // dropping most of a large background selection for no real reason. Send
+  // the full set; validateCatalogSharedFields still enforces a sane upper
+  // bound (5000) server-side against a catastrophic accidental selection.
+  const looks = catalogComputeLooks();
   const templates = catalogBuildRunTemplates(); // same combination set applied to every garment
   for (const garment of submittable) garment.status = 'submitting';
   renderCatalog();
@@ -1227,7 +1474,7 @@ async function submitCatalogGarments() {
           poseLabel: catalogPoseLabel(l),
           backgroundLabel: catalogBackgroundLabel(l),
           poseThumbnailUrl: catalogBatch.options?.poses.find((p) => p.slug === l.pose)?.thumbnailUrl,
-          backgroundThumbnailUrl: catalogBatch.options?.backgrounds.find((b) => b.slug === l.background)?.thumbnailUrl,
+          backgroundThumbnailUrl: catalogAssetListForKind('background').find((b) => b.slug === l.background)?.thumbnailUrl,
         })),
         garments: included.map(({ garment, garmentDataUrl }) => ({
           garmentId: garment.id,
@@ -1357,7 +1604,7 @@ function catalogPoseLabel(job) {
   return catalogBatch.options?.poses.find((p) => p.slug === job.pose)?.label ?? job.pose;
 }
 function catalogBackgroundLabel(job) {
-  return catalogBatch.options?.backgrounds.find((b) => b.slug === job.background)?.label ?? job.background;
+  return catalogAssetListForKind('background').find((b) => b.slug === job.background)?.label ?? job.background;
 }
 
 // Catalog results used to be reported to the Results page's DB from here,
@@ -1441,7 +1688,9 @@ function retryCatalogGarment(garmentId) {
 
   catalogFileToDataUrl(garment.file)
     .then((garmentDataUrl) => {
-      const looks = catalogComputeLooks().slice(0, 12);
+      // See submitCatalogGarments' comment — the 12-cap here was the same
+      // vestigial artifact and is removed for the same reason.
+      const looks = catalogComputeLooks();
       for (const run of failedRuns) {
         run.pollToken++; // discard any stale continuation from the failed attempt
         if (run.pollTimer) clearTimeout(run.pollTimer);

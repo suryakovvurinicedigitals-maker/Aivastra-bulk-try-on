@@ -3631,6 +3631,56 @@ select:focus, input:focus, textarea:focus, .dropzone:focus-within {
 .catalog-unmatched-thumbs { margin: 0 0 12px; }
 .catalog-unmatched-thumbs .upload-thumb { width: 88px; height: 88px; opacity: 0.6; }
 .catalog-unmatched-thumbs .upload-thumb img { border: 1px dashed var(--muted); }
+/* A background tile mid-upload (uploadUnmatchedBackgroundTile) stays at full
+   opacity instead of the dimmed "not usable" look above — it's actively
+   becoming usable, not a dead end. */
+.catalog-unmatched-thumbs .upload-thumb.uploading { opacity: 1; }
+.catalog-unmatched-thumbs .upload-thumb.uploading img { border-color: var(--primary, #b85030); }
+
+/* Background-only "Upload & use" button on an unmatched-preview tile (see
+   catalogUnmatchedThumbsHtml) — sits below the thumbnail rather than
+   overlapping it like the × badge does, since both need to stay reachable
+   on an 88px tile. */
+.catalog-unmatched-upload-btn {
+  display: block;
+  width: 100%;
+  margin-top: 4px;
+  padding: 2px 4px;
+  border: none;
+  border-radius: 6px;
+  background: var(--primary, #b85030);
+  color: #fff;
+  font-size: 0.68rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+.catalog-unmatched-upload-btn:disabled { opacity: 0.6; cursor: default; }
+.catalog-unmatched-upload-error { display: block; margin-top: 2px; font-size: 0.68rem; color: var(--danger, #c0392b); text-align: center; }
+
+/* Background-only "Upload new background(s)" control in a section header —
+   same small link-button treatment as .catalog-asset-folder-control right
+   above it (see catalogBackgroundUploadControlHtml), just a second, visually
+   distinct entry point: that one MATCHES existing library assets by
+   filename, this one UPLOADS a genuinely new candidate. */
+.catalog-bg-upload-control .link-btn { font-size: 0.76rem; }
+
+/* "Mine" badge on a background tile that's this merchant's own dev-API
+   upload rather than an admin-curated asset (see catalogUserBackgroundsAsAssets
+   / catalogAssetTileHtml) — bottom-left so it never collides with the
+   top-right selected-checkmark badge. */
+.catalog-asset-mine-badge {
+  position: absolute;
+  left: 5px;
+  bottom: 5px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.65);
+  color: #fff;
+  font-size: 0.62rem;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  z-index: 2;
+}
 
 .login-submit {
   width: 100%;

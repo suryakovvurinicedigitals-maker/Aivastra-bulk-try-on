@@ -210,3 +210,79 @@ export interface CatalogueStatus {
 export async function getCatalogueStatus(cfg: DevApiConfig, catalogueId: string): Promise<CatalogueStatus> {
   return parseOrThrow(await request(cfg, `/v1/dev/catalogues/${catalogueId}`));
 }
+
+// ---------------------------------------------------------------------------
+// Dev-API-owned backgrounds (apps/api/src/modules/dev/backgrounds.routes.ts)
+// — added to aivastra's dev API specifically so a merchant can test a
+// CANDIDATE background image (one that doesn't exist in the admin-curated
+// library) in a real generateCatalog call, before deciding whether it's
+// worth adding permanently via the admin panel. Same [requireApiKey,
+// requireDevScope('full')] auth as every other route in this section — no
+// new config needed. Deliberately scoped to background only, not
+// face/lower/shoe/pose, which stay admin-curated-only (see the catalog
+// picker's own comments in webapp/public/catalog.js for why).
+//
+// Upload SHAPE is genuinely different from every other image this client
+// sends: garment (createTryonJob/generateCatalog) goes in as multipart or a
+// base64 data URI directly inside the job-creation call itself. A
+// background instead goes through THREE steps: presign (reserve storage,
+// get a direct-to-storage upload URL) -> the caller PUTs raw image bytes to
+// that URL directly (S3-style, bypassing this API entirely) -> confirm
+// (finalize the upload into a selectable background). Don't conflate the
+// two upload mechanisms.
+// ---------------------------------------------------------------------------
+
+export interface DevBackgroundItem {
+  /** A UUID — happens to satisfy PUBLIC_SLUG's regex, so it can be passed straight into looks[].background alongside admin-curated slugs from getCatalogOptions. */
+  id: string;
+  label: string;
+  /** Presigned GET, 3600s TTL — same caveat as CatalogAsset.thumbnailUrl above. */
+  thumbnailUrl: string;
+}
+
+/** Every background this merchant (this DEV_API_KEY) has uploaded and not deleted. Not gender-scoped — one list regardless of the catalog picker's current gender/garmentType selection. */
+export async function listDevBackgrounds(cfg: DevApiConfig): Promise<{ items: DevBackgroundItem[] }> {
+  return parseOrThrow(await request(cfg, '/v1/dev/backgrounds'));
+}
+
+export interface DevBackgroundPresignResult {
+  /** Presigned S3-style PUT URL — PUT raw image bytes here directly; this server/client never round-trips them through the dev API itself. */
+  uploadUrl: string;
+  /** Pass straight through to confirmDevBackground once the PUT succeeds. */
+  r2Key: string;
+  /** The eventual background's id — already known before confirm, but not usable in a generate call until confirm succeeds. */
+  id: string;
+  /** Seconds the uploadUrl stays valid for (300 as of the route's current implementation) — PUT promptly. */
+  expiresIn: number;
+}
+
+/** Step 1 of 3. contentType must be one of the three formats the route accepts; contentLength is only an outer bound (50MB) — real size enforcement happens server-side at confirm time via a HEAD on the uploaded object. */
+export async function presignDevBackground(
+  cfg: DevApiConfig,
+  contentType: 'image/jpeg' | 'image/png' | 'image/webp',
+  contentLength: number,
+): Promise<DevBackgroundPresignResult> {
+  return parseOrThrow(
+    await request(cfg, '/v1/dev/backgrounds/presign', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contentType, contentLength }),
+    }),
+  );
+}
+
+/** Step 3 of 3 (step 2 is the caller PUTting bytes to presignDevBackground's uploadUrl — not an API call at all, so there's no client function for it here). The server re-sniffs the real image format/size itself; the contentType declared at presign time is never trusted. */
+export async function confirmDevBackground(cfg: DevApiConfig, r2Key: string, label?: string): Promise<DevBackgroundItem> {
+  return parseOrThrow(
+    await request(cfg, '/v1/dev/backgrounds/confirm', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ r2Key, label }),
+    }),
+  );
+}
+
+/** Soft-deletes one of THIS merchant's own uploaded backgrounds. "Not yours" / "already deleted" / "never existed" all produce the same 404 upstream — same non-enumerability pattern as the job/catalogue routes, not something this client can distinguish either. */
+export async function deleteDevBackground(cfg: DevApiConfig, id: string): Promise<{ deleted: true }> {
+  return parseOrThrow(await request(cfg, `/v1/dev/backgrounds/${id}`, { method: 'DELETE' }));
+}
