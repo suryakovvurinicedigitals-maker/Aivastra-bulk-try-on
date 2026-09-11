@@ -1078,12 +1078,20 @@ function renderUploadRunBanner(run, running) {
   const runningLine = running
     ? `<div class="run-banner-item in-progress"><span class="run-spinner"></span><span>Run in progress: <b>${run.completed + run.failed} / ${run.total}</b> (${run.completed} completed${run.failed ? `, ${run.failed} failed` : ''})</span></div>`
     : '';
-  const canCancel = currentUser?.role === 'superadmin';
+  const canManage = currentUser?.role === 'superadmin';
   const queuedLines = queuedList
-    .map(
-      (q, i) =>
-        `<div class="run-banner-item queued-line"><span class="queue-badge">#${i + 1}</span><span>Queued: <b>${q.total} job(s)</b> — ${queuedCategoriesHtml(q.categories)} (by ${q.queuedBy}) — will start automatically once turn arrives.</span>${canCancel ? ` <button type="button" class="link-btn danger" data-cancel-queue-id="${q.id}">Cancel</button>` : ''}</div>`,
-    )
+    .map((q, i) => {
+      const badge = `<span class="queue-badge">#${i + 1}</span>`;
+      const categories = queuedCategoriesHtml(q.categories);
+      if (q.paused) {
+        const resumeBtn = canManage ? ` <button type="button" class="link-btn" data-resume-queue-id="${q.id}">Resume</button>` : '';
+        const cancelBtn = canManage ? ` <button type="button" class="link-btn danger" data-cancel-queue-id="${q.id}">Cancel</button>` : '';
+        return `<div class="run-banner-item queued-line paused">${badge}<span>Paused: <b>${q.total} job(s)</b> — ${categories} (queued by ${q.queuedBy}) — won't start until resumed.</span>${resumeBtn}${cancelBtn}</div>`;
+      }
+      const pauseBtn = canManage ? ` <button type="button" class="link-btn" data-pause-queue-id="${q.id}">Pause</button>` : '';
+      const cancelBtn = canManage ? ` <button type="button" class="link-btn danger" data-cancel-queue-id="${q.id}">Cancel</button>` : '';
+      return `<div class="run-banner-item queued-line"><span class="queue-badge">#${i + 1}</span><span>Queued: <b>${q.total} job(s)</b> — ${categories} (by ${q.queuedBy}) — will start automatically once turn arrives.</span>${pauseBtn}${cancelBtn}</div>`;
+    })
     .join('');
   uploadRunBannerEl.innerHTML = runningLine + queuedLines;
 }
@@ -1092,13 +1100,29 @@ function renderUploadRunBanner(run, running) {
 // replaced on every poll tick, so per-button listeners would need rebinding
 // each time anyway; delegation on the stable parent avoids that.
 uploadRunBannerEl.addEventListener('click', (e) => {
-  const btn = e.target.closest('[data-cancel-queue-id]');
-  if (btn) cancelQueuedRun(btn.dataset.cancelQueueId);
+  const cancelBtn = e.target.closest('[data-cancel-queue-id]');
+  if (cancelBtn) return cancelQueuedRun(cancelBtn.dataset.cancelQueueId);
+  const pauseBtn = e.target.closest('[data-pause-queue-id]');
+  if (pauseBtn) return pauseQueuedRun(pauseBtn.dataset.pauseQueueId);
+  const resumeBtn = e.target.closest('[data-resume-queue-id]');
+  if (resumeBtn) return resumeQueuedRun(resumeBtn.dataset.resumeQueueId);
 });
 
 async function cancelQueuedRun(id) {
   if (!confirm('Cancel this queued batch? It will not start automatically.')) return;
   await fetch(`/api/run/queue/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  await pollRunStatus();
+}
+
+// No confirm() for pause/resume — unlike Cancel, both are fully reversible
+// and never touch upstream (a paused run just keeps its queue position).
+async function pauseQueuedRun(id) {
+  await fetch(`/api/run/queue/${encodeURIComponent(id)}/pause`, { method: 'POST' });
+  await pollRunStatus();
+}
+
+async function resumeQueuedRun(id) {
+  await fetch(`/api/run/queue/${encodeURIComponent(id)}/resume`, { method: 'POST' });
   await pollRunStatus();
 }
 

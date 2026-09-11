@@ -66,7 +66,7 @@ const INPUT_DIR = process.env.INPUT_DIR ? path.resolve(process.env.INPUT_DIR) : 
 const OUTPUT_DIR = process.env.OUTPUT_DIR ? path.resolve(process.env.OUTPUT_DIR) : path.join(SCRIPT_DIR, 'output');
 const CONCURRENCY = Number(opt('concurrency') ?? process.env.CONCURRENCY ?? 2);
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? 4000);
-const POLL_TIMEOUT_MS = Number(process.env.POLL_TIMEOUT_MS ?? 5 * 60 * 1000);
+const POLL_TIMEOUT_MS = Number(process.env.POLL_TIMEOUT_MS ?? 30 * 60 * 1000);
 
 if (!API_KEY) {
   console.error('DEV_API_KEY is not set. Copy scripts/bulk-tryon/.env.example to scripts/bulk-tryon/.env and fill it in.');
