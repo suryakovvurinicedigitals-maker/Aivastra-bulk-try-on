@@ -123,6 +123,12 @@ function applyRedchiefWorkflowSelection(index) {
     row.pollToken++;
     if (row.pollTimer) clearTimeout(row.pollTimer);
     row.pollTimer = null;
+    // Frees this row's submission-queue slot immediately if a submit/poll
+    // cycle was still in flight — otherwise redchiefSubmitLimit would wait
+    // forever on a promise nothing will ever resolve now that pollToken has
+    // moved on and the poll timer is cleared.
+    row.pollResolve?.();
+    row.pollResolve = null;
     row.slots = w.viewLabels.map((label) => ({ id: redchiefUid('slot'), label, file: null, previewUrl: null }));
     row.status = 'idle';
     row.jobId = null;
@@ -150,6 +156,7 @@ redchiefAddRowBtn.addEventListener('click', () => {
     error: null,
     pollTimer: null,
     pollToken: 0,
+    pollResolve: null,
   });
   renderRedchiefRows();
 });
@@ -221,8 +228,8 @@ function redchiefRowCardHtml(row) {
     </div>`;
 }
 
-const REDCHIEF_STATUS_LABEL = { QUEUED: 'Queued', RUNNING: 'Running', COMPLETED: 'Completed', FAILED: 'Failed', submitting: 'Submitting…' };
-const REDCHIEF_STATUS_CLASS = { QUEUED: 'warn', RUNNING: 'accent', COMPLETED: 'ok', FAILED: 'err', submitting: 'muted' };
+const REDCHIEF_STATUS_LABEL = { QUEUED: 'Queued', RUNNING: 'Running', COMPLETED: 'Completed', FAILED: 'Failed', submitting: 'Submitting…', 'queued-local': 'Waiting to submit…' };
+const REDCHIEF_STATUS_CLASS = { QUEUED: 'warn', RUNNING: 'accent', COMPLETED: 'ok', FAILED: 'err', submitting: 'muted', 'queued-local': 'muted' };
 
 function redchiefRowStatusHtml(row) {
   if (row.status === 'idle') return '';
@@ -415,6 +422,7 @@ function createRedchiefRowsFromFileGroups(groups) {
       error: null,
       pollTimer: null,
       pollToken: 0,
+      pollResolve: null,
     });
   }
   renderRedchiefRows();
@@ -504,6 +512,7 @@ function createRedchiefRowsFromFolderGroups(groups) {
       error: null,
       pollTimer: null,
       pollToken: 0,
+      pollResolve: null,
     });
     if (!group.label) redchiefRowCounter++;
   }
@@ -525,6 +534,49 @@ function redchiefFileToDataUrl(file) {
     reader.readAsDataURL(file);
   });
 }
+
+// Hand-rolled concurrency limiter — same shape as lib/concurrency.mts's
+// createLimiter (the server-side one Try-On/Catalog throttle job creation
+// with), duplicated here rather than shared: this file's whole flow is
+// deliberately standalone (separate propicly merchant account/credit
+// balance — see lib/propicly-client.mts's header comment), and these are
+// plain non-module <script> tags (index.html), so sharing would mean an
+// implicit load-order dependency on app.js instead of a real import.
+function createRedchiefLimiter(concurrency) {
+  let active = 0;
+  const queue = [];
+  function next() {
+    if (active >= concurrency || queue.length === 0) return;
+    active++;
+    const run = queue.shift();
+    run();
+  }
+  return function limit(fn) {
+    return new Promise((resolve, reject) => {
+      queue.push(() => {
+        fn()
+          .then(resolve, reject)
+          .finally(() => {
+            active--;
+            next();
+          });
+      });
+      next();
+    });
+  };
+}
+
+// How many rows are actually submitted-and-in-flight (create job + poll to a
+// terminal state) at once. RedChief has no server-side queue of its own
+// (POST /api/redchief is a stateless 1:1 proxy to propicly, unlike Try-On's
+// runBatch/CONCURRENCY or Catalog's runCatalogAggregate/CATALOG_CONCURRENCY)
+// — clicking Submit used to fire every submittable row at propicly
+// simultaneously. This is the client-side equivalent limiter for this flow
+// specifically: the rest of a large submission now waits here and each row
+// auto-fires as a slot frees up, matching the concurrency cap the other two
+// flows already have server-side.
+const REDCHIEF_SUBMIT_CONCURRENCY = 2;
+const redchiefSubmitLimit = createRedchiefLimiter(REDCHIEF_SUBMIT_CONCURRENCY);
 
 const redchiefSubmitConfirmEl = document.getElementById('redchief-submit-confirm');
 const redchiefSubmitConfirmTextEl = document.getElementById('redchief-submit-confirm-text');
@@ -552,9 +604,21 @@ redchiefSubmitConfirmBtn.addEventListener('click', () => {
 function submitRedchiefRows() {
   const submittable = redchiefSubmittableRows();
   if (submittable.length === 0) return;
-  for (const row of submittable) row.status = 'submitting';
+  // 'queued-local' vs 'submitting': a row only flips to 'submitting' once it
+  // actually acquires a redchiefSubmitLimit slot (see the wrapper below) —
+  // this distinguishes "waiting behind other rows in this tool's own local
+  // queue" from "request actually in flight" for a large submission.
+  for (const row of submittable) row.status = 'queued-local';
   renderRedchiefRows();
-  Promise.allSettled(submittable.map(submitRedchiefRow));
+  Promise.allSettled(
+    submittable.map((row) =>
+      redchiefSubmitLimit(() => {
+        row.status = 'submitting';
+        renderRedchiefRows();
+        return submitRedchiefRow(row);
+      }),
+    ),
+  );
 }
 
 async function submitRedchiefRow(row) {
@@ -571,7 +635,13 @@ async function submitRedchiefRow(row) {
     redchiefRefreshedRows.delete(row.id);
     row.status = 'QUEUED';
     row.error = null;
-    pollRedchiefRow(row);
+    renderRedchiefRows();
+    // Held until this row reaches a terminal state (or client-side polling
+    // gives up) — this is what actually caps how many rows are
+    // simultaneously in flight against propicly, not just how many initial
+    // create-job POSTs fire close together. See createRedchiefLimiter above.
+    await pollRedchiefRow(row);
+    return;
   } catch (err) {
     row.status = 'FAILED';
     row.error = err instanceof Error ? err.message : String(err);
@@ -631,42 +701,61 @@ async function recordRedchiefRowResult(row) {
   fetch('/api/results/record', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }).catch(() => {}); // best-effort
 }
 
-function pollRedchiefRow(row, attempt = 0, delay = 2000) {
-  const maxAttempts = 20;
-  const maxDelay = 20000;
-  const token = row.pollToken;
+// Returns a Promise that resolves once this row reaches a terminal state,
+// gives up quietly after maxAttempts, or is superseded by an external
+// invalidation (cancel/retry/workflow-switch — those call row.pollResolve()
+// directly, since a cleared pollTimer means no future tick of this function
+// will ever run again to resolve it otherwise). submitRedchiefRow awaits
+// this so redchiefSubmitLimit holds a row's concurrency slot for its whole
+// lifecycle, not just the initial create-job POST.
+function pollRedchiefRow(row) {
+  return new Promise((resolve) => {
+    row.pollResolve = resolve;
+    const done = () => {
+      row.pollResolve = null;
+      resolve();
+    };
 
-  fetch(`/api/redchief/jobs/${row.jobId}`)
-    .then((res) => res.json().then((body) => ({ ok: res.ok, body })))
-    .then(({ ok, body }) => {
-      if (token !== row.pollToken) return; // superseded by a cancel/retry — discard
-      if (!ok) throw new Error(`${body.error?.code ?? 'ERROR'}: ${body.error?.message ?? 'poll failed'}`);
+    const maxAttempts = 20;
+    const maxDelay = 20000;
+    const token = row.pollToken;
 
-      if (body.status === 'COMPLETED') {
-        row.status = 'COMPLETED';
-        row.resultUrls = body.imageUrls ?? (body.imageUrl ? [body.imageUrl] : []);
-        recordRedchiefRowResult(row);
-        renderRedchiefRows();
-        return;
-      }
-      if (body.status === 'FAILED') {
-        row.status = 'FAILED';
-        row.error = body.error ?? 'unknown error';
-        recordRedchiefRowResult(row);
-        renderRedchiefRows();
-        return;
-      }
-      row.status = body.status; // QUEUED or RUNNING
-      renderRedchiefRows();
-      if (attempt >= maxAttempts) return; // give up quietly — row stays QUEUED/RUNNING, tester can check back
-      row.pollTimer = setTimeout(() => pollRedchiefRow(row, attempt + 1, Math.min(delay * 1.5, maxDelay)), delay);
-    })
-    .catch((err) => {
-      if (token !== row.pollToken) return;
-      row.status = 'FAILED';
-      row.error = err instanceof Error ? err.message : String(err);
-      renderRedchiefRows();
-    });
+    function tick(attempt, delay) {
+      fetch(`/api/redchief/jobs/${row.jobId}`)
+        .then((res) => res.json().then((body) => ({ ok: res.ok, body })))
+        .then(({ ok, body }) => {
+          if (token !== row.pollToken) return; // superseded — the invalidator already resolved this promise
+          if (!ok) throw new Error(`${body.error?.code ?? 'ERROR'}: ${body.error?.message ?? 'poll failed'}`);
+
+          if (body.status === 'COMPLETED') {
+            row.status = 'COMPLETED';
+            row.resultUrls = body.imageUrls ?? (body.imageUrl ? [body.imageUrl] : []);
+            recordRedchiefRowResult(row);
+            renderRedchiefRows();
+            return done();
+          }
+          if (body.status === 'FAILED') {
+            row.status = 'FAILED';
+            row.error = body.error ?? 'unknown error';
+            recordRedchiefRowResult(row);
+            renderRedchiefRows();
+            return done();
+          }
+          row.status = body.status; // QUEUED or RUNNING
+          renderRedchiefRows();
+          if (attempt >= maxAttempts) return done(); // give up quietly — row stays QUEUED/RUNNING, tester can check back; still frees this row's local-queue slot
+          row.pollTimer = setTimeout(() => tick(attempt + 1, Math.min(delay * 1.5, maxDelay)), delay);
+        })
+        .catch((err) => {
+          if (token !== row.pollToken) return;
+          row.status = 'FAILED';
+          row.error = err instanceof Error ? err.message : String(err);
+          renderRedchiefRows();
+          done();
+        });
+    }
+    tick(0, 2000);
+  });
 }
 
 const redchiefRefreshedRows = new Set(); // one auto-retry per row per completed result, avoids a hot loop against a permanently-broken URL
@@ -708,6 +797,10 @@ async function cancelRedchiefRow(rowId) {
     row.pollToken++;
     if (row.pollTimer) clearTimeout(row.pollTimer);
     row.pollTimer = null;
+    // Frees this row's submission-queue slot — pollTimer is cleared so no
+    // future tick would ever resolve pollRedchiefRow's promise otherwise.
+    row.pollResolve?.();
+    row.pollResolve = null;
     row.jobId = null;
     row.status = 'idle';
     row.error = null;
@@ -727,9 +820,13 @@ function retryRedchiefRow(rowId) {
   row.error = null;
   row.cancelNote = null;
   row.resultUrls = null;
-  row.status = 'submitting';
+  row.status = 'queued-local';
   renderRedchiefRows();
-  submitRedchiefRow(row);
+  redchiefSubmitLimit(() => {
+    row.status = 'submitting';
+    renderRedchiefRows();
+    return submitRedchiefRow(row);
+  });
 }
 
 wireDropzone(redchiefFolderDropzoneEl, redchiefFolderInputEl, handleRedchiefFolderFiles, redchiefBulkStatusEl);

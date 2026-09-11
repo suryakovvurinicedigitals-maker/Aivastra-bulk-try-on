@@ -82,7 +82,7 @@ let API_KEY = process.env.DEV_API_KEY;
 let cfg: DevApiConfig | undefined = API_KEY ? { baseUrl: BASE_URL, apiKey: API_KEY } : undefined;
 const CONCURRENCY = Number(process.env.CONCURRENCY ?? 2);
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? 4000);
-const POLL_TIMEOUT_MS = Number(process.env.POLL_TIMEOUT_MS ?? 5 * 60 * 1000);
+const POLL_TIMEOUT_MS = Number(process.env.POLL_TIMEOUT_MS ?? 30 * 60 * 1000);
 
 // RedChief tab (propicly API) — a separate merchant account/host from the
 // aivastra BASE_URL/API_KEY above. Never reuse those here: the two flows are
@@ -689,14 +689,25 @@ interface CatalogAggregateRun {
 const catalogAggregateRuns = new Map<string, CatalogAggregateRun>();
 
 // Nothing else ever deletes an aggregate run — sweep anything older than 2h
-// (generously past POLL_TIMEOUT_MS, so this never removes a run a client
-// could still legitimately be polling) on every new generate call, so a
-// long-lived server process doesn't accumulate them forever.
+// on every new generate call, so a long-lived server process doesn't
+// accumulate them forever. Age alone isn't enough to decide a run is safe to
+// evict though: runCatalogAggregate holds its `run` object via closure, not
+// via this map, so deleting the entry never stops an in-flight run — it just
+// makes GET /api/catalog/catalogues/:id 404 for a run that's still actively
+// submitting jobs and spending credits in the background. At
+// CATALOG_CONCURRENCY=2 and up to 5000 looks per run, a large batch can
+// legitimately still be mid-flight well past 2h (more so now that
+// POLL_TIMEOUT_MS is 30min, not 5), so a run with any non-terminal job is
+// exempted from the sweep regardless of age — it's only ever swept once
+// every one of its jobs has reached COMPLETED/FAILED.
 const CATALOG_AGGREGATE_TTL_MS = 2 * 60 * 60 * 1000;
 function sweepCatalogAggregateRuns() {
   const cutoff = Date.now() - CATALOG_AGGREGATE_TTL_MS;
   for (const [id, run] of catalogAggregateRuns) {
-    if (run.createdAt < cutoff) catalogAggregateRuns.delete(id);
+    if (run.createdAt >= cutoff) continue;
+    const stillActive = run.jobs.some((j) => j.status === 'QUEUED' || j.status === 'RUNNING');
+    if (stillActive) continue;
+    catalogAggregateRuns.delete(id);
   }
 }
 
@@ -1013,19 +1024,28 @@ async function startCatalogBatch(batch: CatalogBatchState, batchCfg: DevApiConfi
   await Promise.all(batch.runInputs.map(({ run, base }) => runCatalogAggregate(batchCfg, run, base)));
   batch.status = 'done';
   if (currentCatalogBatch?.id === batch.id) currentCatalogBatch = null;
-  tryStartNextCatalogBatch(batchCfg);
+  tryStartNextCatalogBatch();
 }
 
 /** Picks the first non-paused queued batch (skipping over paused ones, which
  * keep their position for whenever they're resumed) and starts it, if
  * nothing else is currently running. If every remaining queued batch is
- * paused, the queue just sits idle — by design. */
-function tryStartNextCatalogBatch(nextCfg: DevApiConfig | undefined): void {
-  if (!nextCfg || currentCatalogBatch) return;
+ * paused, the queue just sits idle — by design.
+ *
+ * Deliberately re-reads the live module-level `cfg` on every call rather
+ * than taking it as a parameter threaded from whichever batch just
+ * finished: `cfg` can be rotated at runtime (superadmin's API Setup page,
+ * applyApiSettings()), and threading the previous batch's cfg forward would
+ * silently chain that stale key/base-URL through every auto-started batch
+ * after it, forever, until the next manual pause/resume. Reading it fresh
+ * here means a key rotation takes effect on the very next batch dequeued,
+ * not just on ones started by a manual click. */
+function tryStartNextCatalogBatch(): void {
+  if (!cfg || currentCatalogBatch) return;
   const idx = catalogQueuedBatches.findIndex((b) => !b.paused);
   if (idx === -1) return;
   const [next] = catalogQueuedBatches.splice(idx, 1);
-  void startCatalogBatch(next, nextCfg);
+  void startCatalogBatch(next, cfg);
 }
 
 /** Scans a batch's runInputs for total/completed/failed job counts — no
@@ -1171,6 +1191,11 @@ interface QueuedRun {
   confirmedTotal: number;
   queuedBy: string;
   queuedAt: string;
+  // Keeps its place in line but is skipped by tryStartQueuedRun until
+  // resumed — same shape as Catalog Batch's queue pause (see
+  // CatalogBatchState.paused), lets someone queue several runs and hold
+  // specific ones back (e.g. for overnight) without losing queue position.
+  paused: boolean;
 }
 let queuedRuns: QueuedRun[] = [];
 let nextQueueId = 1;
@@ -1227,10 +1252,12 @@ function startRun(jobs: TryonJobSpec[], startedBy: string): { runId: string; tot
   return { runId, total: jobs.length };
 }
 
-/** Called whenever a run finishes (success or crash) — if a batch is waiting, its turn has arrived. Re-resolves the plan fresh (files may have changed since it was queued) rather than trusting the count confirmed at queue time. Pops from the front (FIFO) so batches start in the order they were queued. */
+/** Called whenever a run finishes (success or crash) — if a batch is waiting, its turn has arrived. Re-resolves the plan fresh (files may have changed since it was queued) rather than trusting the count confirmed at queue time. Picks the first non-paused entry (skipping over paused ones, which keep their position for whenever they're resumed) so batches start in the order they were queued. If every remaining queued run is paused, the queue just sits idle — by design, same as Catalog Batch's tryStartNextCatalogBatch. */
 async function tryStartQueuedRun(): Promise<void> {
-  if (queuedRuns.length === 0 || currentRun?.status === 'running' || !cfg) return;
-  const pending = queuedRuns.shift()!;
+  if (currentRun?.status === 'running' || !cfg) return;
+  const idx = queuedRuns.findIndex((q) => !q.paused);
+  if (idx === -1) return;
+  const pending = queuedRuns.splice(idx, 1)[0];
   const jobs = await computeJobs(cfg, 'selected', pending.selection);
   if (jobs.length === 0) {
     console.warn(`Queued run from ${pending.queuedBy} skipped — nothing left to run (inputs may have been cleared or its categories disabled).`);
@@ -1628,7 +1655,7 @@ const server = http.createServer(async (req, res) => {
           return;
         }
         const id = String(nextQueueId++);
-        queuedRuns.push({ id, selection: payload.selection, confirmedTotal, queuedBy: session!.username, queuedAt: new Date().toISOString() });
+        queuedRuns.push({ id, selection: payload.selection, confirmedTotal, queuedBy: session!.username, queuedAt: new Date().toISOString(), paused: false });
         json(res, 202, { queued: true, position: queuedRuns.length, total: confirmedTotal });
         return;
       }
@@ -1654,6 +1681,41 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === 'POST' && /^\/api\/run\/queue\/[^/]+\/pause$/.test(url.pathname)) {
+      if (session!.role !== 'superadmin') {
+        json(res, 403, { error: 'Super admin only.' });
+        return;
+      }
+      const id = decodeURIComponent(url.pathname.slice('/api/run/queue/'.length, -'/pause'.length));
+      const pending = queuedRuns.find((q) => q.id === id);
+      if (!pending) {
+        json(res, 404, { error: 'Not found in queue — it may have already started.' });
+        return;
+      }
+      pending.paused = true;
+      json(res, 200, { paused: true });
+      return;
+    }
+
+    if (req.method === 'POST' && /^\/api\/run\/queue\/[^/]+\/resume$/.test(url.pathname)) {
+      if (session!.role !== 'superadmin') {
+        json(res, 403, { error: 'Super admin only.' });
+        return;
+      }
+      const id = decodeURIComponent(url.pathname.slice('/api/run/queue/'.length, -'/resume'.length));
+      const pending = queuedRuns.find((q) => q.id === id);
+      if (!pending) {
+        json(res, 404, { error: 'Not found in queue — it may have already started.' });
+        return;
+      }
+      pending.paused = false;
+      // In case nothing is currently running and this (or another
+      // already-unpaused entry ahead of it) can start immediately.
+      void tryStartQueuedRun();
+      json(res, 200, { paused: false });
+      return;
+    }
+
     if (req.method === 'GET' && url.pathname === '/api/run/status') {
       json(res, 200, {
         ...(currentRun ?? { status: 'idle' }),
@@ -1662,6 +1724,7 @@ const server = http.createServer(async (req, res) => {
           total: q.confirmedTotal,
           queuedBy: q.queuedBy,
           queuedAt: q.queuedAt,
+          paused: q.paused,
           categories: queuedCategories(q.selection),
         })),
       });
@@ -2829,7 +2892,7 @@ const server = http.createServer(async (req, res) => {
       batch.paused = false;
       // In case nothing is currently running and this (or another
       // already-unpaused entry ahead of it) can start immediately.
-      tryStartNextCatalogBatch(cfg);
+      tryStartNextCatalogBatch();
       json(res, 200, { paused: false });
       return;
     }
