@@ -48,7 +48,6 @@ const catalogAddRowBtn = document.getElementById('catalog-add-row-btn');
 const catalogConfigBodyEl = document.getElementById('catalog-config-body');
 const catalogRowsPanelEl = document.getElementById('catalog-rows-panel');
 const catalogRowsEl = document.getElementById('catalog-rows');
-const catalogResultsEl = document.getElementById('catalog-results');
 const catalogClearAllBtn = document.getElementById('catalog-clear-all-btn');
 const catalogFooterBarEl = document.getElementById('catalog-footer-bar');
 const catalogRowCountEl = document.getElementById('catalog-row-count');
@@ -121,30 +120,6 @@ const catalogBatch = {
 // poison a gender/garmentType combo the tester switches back to later.
 const catalogOptionsCache = new Map(); // `${gender}|${garmentType}` -> CatalogOptions
 
-// ---------- bulk-select faces/lower/shoe/poses/backgrounds from a folder ----------
-// The upstream catalog API only ever accepts a SLUG for face/lower/shoe/pose/
-// background — there is no endpoint anywhere in lib/api-client.mts to upload
-// a brand new custom image for any of these (unlike `garment`, which really
-// is an arbitrary base64 upload). So "upload a folder" here can only mean
-// bulk-*selecting* existing admin-curated assets by matching a dropped
-// folder's filenames against each asset's label/slug — never creating new
-// ones. This mirrors redchief.js's folder-matching (redchiefMatchViewLabels)
-// but many-to-many instead of one-slot-per-label, since a picker here can
-// have dozens of assets rather than a fixed handful of view slots.
-let catalogAssetFolderStatus = { face: null, lower: null, shoe: null, pose: null, background: null }; // kind -> status message string, or null
-
-// Every folder-uploaded file that DIDN'T match a curated asset used to just
-// get named in the status text and dropped — the tester (who's using this as
-// a sandbox to preview local candidate photos before manually adding winners
-// to the aivastra admin panel) needs to actually SEE every file they
-// uploaded, not just the lucky filename matches. So each kind also keeps the
-// full list of unmatched files as real thumbnail previews (object URLs, kept
-// alive only as long as they're shown — revoked on replacement/reset below).
-// These are preview-only: there's no slug to select, so they're never wired
-// into catalogBatch's Sets or a generate call — see catalogMatchAssetsFromFiles's
-// doc comment for why that's a hard API limitation, not a UI gap.
-let catalogAssetFolderUnmatched = { face: [], lower: [], shoe: [], pose: [], background: [] }; // kind -> [{id, name, previewUrl, file, uploading, uploadError}]
-
 // ---------- backgrounds: the ONE axis where a genuinely-new candidate image
 // can be tested for real (aivastra's dev API added POST /v1/dev/backgrounds/
 // {presign,confirm} + GET/DELETE specifically for this — see
@@ -158,7 +133,7 @@ let catalogAssetFolderUnmatched = { face: [], lower: [], shoe: [], pose: [], bac
 let catalogUserBackgrounds = []; // [{id, label, thumbnailUrl}] — this merchant's own dev-API-uploaded backgrounds
 let catalogUserBackgroundsLoaded = false; // loaded once per page load, NOT reset on gender/garmentType change (the list isn't gender-scoped)
 let catalogBackgroundUploading = false; // true while handleCatalogBackgroundUploadFiles is mid-batch — disables the upload button so a tester can't fire a second overlapping batch
-let catalogBackgroundUploadStatus = null; // {err: boolean, message: string} | null — last upload batch's outcome, shown the same way catalogAssetFolderStatus is
+let catalogBackgroundUploadStatus = null; // {err: boolean, message: string} | null — last upload batch's outcome
 
 /** Loads (once) the merchant's own previously-uploaded backgrounds, so a returning tester doesn't have to re-upload every session. Best-effort — a failure here just means "no self-uploaded backgrounds shown yet", not a hard error, since the curated picker still works fine without it. */
 async function loadCatalogUserBackgrounds() {
@@ -216,11 +191,9 @@ async function uploadCandidateBackground(file, label) {
 
 /**
  * Uploads a whole batch of candidate backgrounds picked directly via the
- * section header's "Upload new background(s)" button — the main, deliberate
- * entry point for "I want to test a photo that's not in the admin library
- * at all", as opposed to the folder-match flow above (which is about
- * bulk-*selecting* existing curated assets by filename). Sequential, not
- * Promise.all — presign+confirm share a 10/min write-rate budget upstream,
+ * section header's "Upload new background(s)" button — the deliberate entry
+ * point for "I want to test a photo that's not in the admin library at all".
+ * Sequential, not Promise.all — presign+confirm share a 10/min write-rate budget upstream,
  * and firing a big batch all at once would just pile up 429 retries inside
  * request()'s own backoff instead of finishing any faster. Renders progress
  * after each file so a large batch doesn't look frozen.
@@ -257,41 +230,11 @@ async function handleCatalogBackgroundUploadFiles(fileList) {
   renderCatalog();
 }
 
-/**
- * Uploads ONE tile from the folder-match "unmatched" preview grid — the
- * bridge between the two upload flows: a tester drops a folder in expecting
- * filename matches, most don't match, and rather than making them re-pick
- * the same file through a second file dialog, each unmatched preview tile
- * (background axis only — see catalogUnmatchedThumbsHtml) gets its own
- * "Upload & use" action that reuses the File object already held in memory.
- * On success the tile moves from "unmatched preview" to "real, selected
- * background" and disappears from this list; on failure it stays with an
- * inline error so the tester can retry or give up on just that one file.
- */
-async function uploadUnmatchedBackgroundTile(kind, id) {
-  const item = catalogAssetFolderUnmatched[kind]?.find((it) => it.id === id);
-  if (!item || item.uploading) return;
-  item.uploading = true;
-  item.uploadError = null;
-  renderCatalog();
-  try {
-    const uploaded = await uploadCandidateBackground(item.file, item.name.replace(/\.[^.]+$/, ''));
-    catalogUserBackgrounds.push(uploaded);
-    catalogBatch.backgrounds.add(uploaded.id);
-    URL.revokeObjectURL(item.previewUrl);
-    catalogAssetFolderUnmatched[kind] = catalogAssetFolderUnmatched[kind].filter((it) => it.id !== id);
-  } catch (err) {
-    item.uploading = false;
-    item.uploadError = err instanceof Error ? err.message : String(err);
-  }
-  renderCatalog();
-}
-
 // Maps a picker `kind` to the CatalogAsset[] it draws from in the currently-
 // loaded options, and to the Set key catalogBatch tracks selections in — the
-// same two mappings CATALOG_ASSET_SET_KEY (defined below, tile click
-// handling) and catalogAssetPickersHtml already need, kept in one place so a
-// new axis can't be added to one and forgotten in the other.
+// same mapping catalogAssetPickersHtml's tile click handling already needs,
+// kept in one place so a new axis can't be added to one and forgotten in the
+// other.
 function catalogAssetListForKind(kind) {
   const o = catalogBatch.options;
   if (!o) return kind === 'background' ? catalogUserBackgroundsAsAssets() : [];
@@ -311,78 +254,6 @@ function catalogAssetListForKind(kind) {
 
 function catalogUserBackgroundsAsAssets() {
   return catalogUserBackgrounds.map((b) => ({ slug: b.id, label: b.label, thumbnailUrl: b.thumbnailUrl, mine: true }));
-}
-
-function catalogNormalize(s) {
-  return s.toLowerCase().replace(/[^a-z0-9]/g, '');
-}
-
-/**
- * For each asset (in list order, deterministic regardless of file order),
- * claims the first not-yet-used file whose normalized stem contains the
- * asset's normalized label or slug, or vice versa — same lenient
- * containment match as redchief.js's redchiefMatchViewLabels. Returns the
- * matched slugs plus the File objects that matched nothing (so the caller
- * can preview them, not just name them); never touches catalogBatch state
- * itself (caller decides how to merge).
- */
-function catalogMatchAssetsFromFiles(assets, files) {
-  const usedFileIdx = new Set();
-  const matchedSlugs = [];
-  for (const asset of assets) {
-    const normLabel = catalogNormalize(asset.label);
-    const normSlug = catalogNormalize(asset.slug);
-    const idx = files.findIndex((f, i) => {
-      if (usedFileIdx.has(i)) return false;
-      const stem = catalogNormalize(f.name.replace(/\.[^.]+$/, ''));
-      return stem.includes(normLabel) || normLabel.includes(stem) || stem.includes(normSlug) || normSlug.includes(stem);
-    });
-    if (idx !== -1) {
-      usedFileIdx.add(idx);
-      matchedSlugs.push(asset.slug);
-    }
-  }
-  const unmatchedFiles = files.filter((_, i) => !usedFileIdx.has(i));
-  return { matchedSlugs, unmatchedFiles };
-}
-
-/**
- * Bulk-selects assets for one picker (`kind` is 'face'|'lower'|'shoe'|
- * 'pose'|'background') by matching a dropped/picked folder's filenames.
- * ADDS matched slugs to whatever's already selected — a folder upload never
- * clears or replaces the tester's existing clicks-in-the-grid selections
- * (or a previous folder upload's matches) for that same axis, it only ever
- * grows the Set. Re-uploading the same folder twice is a harmless no-op
- * (Set.add is idempotent).
- */
-function handleCatalogAssetFolderFiles(kind, fileList) {
-  const images = filterImageFiles(fileList);
-  if (images.length === 0) return;
-  const assets = catalogAssetListForKind(kind);
-  const { matchedSlugs, unmatchedFiles } = assets.length > 0
-    ? catalogMatchAssetsFromFiles(assets, images)
-    : { matchedSlugs: [], unmatchedFiles: images }; // options not loaded yet for this axis — nothing to match against, so every file is "unmatched" (still previewed below, not silently dropped)
-  const set = catalogBatch[CATALOG_ASSET_SET_KEY[kind]];
-  for (const slug of matchedSlugs) set.add(slug);
-
-  // Replace (not append) this axis's unmatched preview with THIS upload's
-  // leftovers — revoke the previous batch's object URLs first so repeated
-  // folder uploads don't leak blob: URLs for images no longer shown anywhere.
-  for (const item of catalogAssetFolderUnmatched[kind]) URL.revokeObjectURL(item.previewUrl);
-  catalogAssetFolderUnmatched[kind] = unmatchedFiles.map((f) => ({
-    id: catalogUid('unmatched'),
-    name: f.name,
-    previewUrl: URL.createObjectURL(f),
-    file: f, // kept alive (not just the preview URL) so background candidates can actually be uploaded later via uploadCandidateBackground — see catalogUnmatchedThumbsHtml
-    uploading: false,
-    uploadError: null,
-  }));
-
-  catalogAssetFolderStatus[kind] =
-    matchedSlugs.length === 0
-      ? `No filenames matched any asset label or slug in this category — showing all ${images.length} below for reference.`
-      : `Matched and selected ${matchedSlugs.length} of ${images.length} file(s) — the other ${unmatchedFiles.length} are shown below for reference.`;
-  renderCatalog();
 }
 
 function catalogUid(prefix) {
@@ -657,7 +528,6 @@ function catalogAssetPickersHtml() {
               <button type="button" class="catalog-view-more-btn catalog-select-all-btn" data-kind="${kind}" data-action="${allSelected ? 'clear' : 'select'}">
                 <span>${allSelected ? 'Clear all' : `Select all (${items.length})`}</span>
               </button>` : ''}
-            ${catalogAssetFolderControlHtml(kind)}
             ${kind === 'background' ? catalogBackgroundUploadControlHtml() : ''}
             ${items.length > CATALOG_VISIBLE_PAGE_CAP ? `
               <button type="button" class="catalog-view-more-btn" data-kind="${kind}" title="Browse all ${items.length} options">
@@ -668,7 +538,6 @@ function catalogAssetPickersHtml() {
               </button>` : ''}
           </div>
         </div>
-        ${catalogUnmatchedThumbsHtml(kind)}
         <div class="catalog-asset-grid">
           ${cardsHtml || '<p class="hint">No items available.</p>'}
         </div>
@@ -753,41 +622,14 @@ function catalogConfigFieldsHtml() {
 }
 
 /**
- * Folder-upload control for one asset picker: a small button (opens a
- * folder picker via a hidden `webkitdirectory` input, same browser-support
- * caveat as redchief.js's own folder picker — Chromium-family only) plus
- * whatever status text the last match attempt for this axis left behind.
- * Lives inside catalogAssetPickersHtml's per-section header, wired in
- * wireCatalogConfigEvents alongside the tile click handlers, since both are
- * rebuilt fresh on every renderCatalog() call.
- */
-function catalogAssetFolderControlHtml(kind) {
-  const status = catalogAssetFolderStatus[kind];
-  // Same "Done: N uploaded."-style green/red status line as the Upload
-  // tab's own bulk upload (see app.js's uploadFiles) — .status/.status.ok/
-  // .status.err are shared, not re-implemented here, so the two features
-  // read as the same interaction pattern rather than two different ones.
-  const statusClass = status ? (status.startsWith('Matched') ? 'ok' : 'err') : '';
-  return `
-    <span class="catalog-asset-folder-control">
-      <button type="button" class="link-btn catalog-asset-folder-btn" data-kind="${kind}">📁 Bulk-select from folder</button>
-      <input type="file" class="catalog-asset-folder-input" data-kind="${kind}" webkitdirectory multiple hidden />
-    </span>
-    ${status ? `<p class="status ${statusClass} catalog-asset-folder-status">${catalogEscapeHtml(status)}</p>` : ''}`;
-}
-
-/**
  * Background-only "add a brand-new candidate" control — a plain multi-file
- * picker (no directory requirement, unlike the folder-match control above,
- * since this is a deliberate "add exactly these N images" action, not a
- * filename-matching guess). Each picked file goes through
- * uploadCandidateBackground's real presign->PUT->confirm flow via
- * handleCatalogBackgroundUploadFiles and, on success, becomes a real,
- * selected background tile in the grid above. This is the ONE axis this
- * exists for — aivastra's dev API added POST /v1/dev/backgrounds/* (see
- * lib/api-client.mts's doc comment) specifically so background candidates
- * could be tested before being admin-curated; there's no equivalent for
- * face/lower/shoe/pose.
+ * picker. Each picked file goes through uploadCandidateBackground's real
+ * presign->PUT->confirm flow via handleCatalogBackgroundUploadFiles and, on
+ * success, becomes a real, selected background tile in the grid above. This
+ * is the ONE axis this exists for — aivastra's dev API added POST
+ * /v1/dev/backgrounds/* (see lib/api-client.mts's doc comment) specifically
+ * so background candidates could be tested before being admin-curated;
+ * there's no equivalent for face/lower/shoe/pose.
  */
 function catalogBackgroundUploadControlHtml() {
   const status = catalogBackgroundUploadStatus;
@@ -800,52 +642,9 @@ function catalogBackgroundUploadControlHtml() {
     ${status ? `<p class="status ${statusClass} catalog-asset-folder-status">${catalogEscapeHtml(status.message)}</p>` : ''}`;
 }
 
-/**
- * Folder files that matched nothing in the curated library — shown as plain
- * photo previews so a folder upload never silently hides files the tester
- * dropped in. For face/lower/shoe/pose these stay preview-only: the upstream
- * catalog API only ever accepts an EXISTING asset's slug for those four
- * (unlike `garment`, which takes an arbitrary image) — see
- * lib/api-client.mts's CatalogGenerateBody. The intended loop for those:
- * browse the previews, pick the ones worth keeping, add them as real assets
- * via the aivastra admin panel, then they'll show up (and match) here on the
- * next folder upload.
- *
- * background is the one exception — each tile gets its own "Upload & use"
- * button (uploadUnmatchedBackgroundTile) that runs the real presign->PUT->
- * confirm flow on that exact file, since aivastra's dev API added a real
- * upload path for this one axis (see catalogBackgroundUploadControlHtml).
- */
-function catalogUnmatchedThumbsHtml(kind) {
-  const items = catalogAssetFolderUnmatched[kind];
-  if (!items || items.length === 0) return '';
-  const isBackground = kind === 'background';
-  const label = isBackground
-    ? `Not in the asset library yet — upload the ones worth testing:`
-    : `Not in the asset library — preview only, can't be used to generate until added via the admin panel:`;
-  return `
-    <p class="hint catalog-unmatched-label">${label}</p>
-    <div class="upload-thumbs catalog-unmatched-thumbs">
-      ${items
-        .map(
-          (it) => `
-        <div class="upload-thumb catalog-unmatched-thumb${it.uploading ? ' uploading' : ''}" data-kind="${kind}" data-id="${it.id}" title="${catalogEscapeHtml(it.name)}${it.uploadError ? ` — ${catalogEscapeHtml(it.uploadError)}` : ''}">
-          <img src="${it.previewUrl}" loading="lazy" />
-          <button type="button" class="thumb-remove catalog-unmatched-thumb-remove" title="Dismiss ${catalogEscapeHtml(it.name)}" aria-label="Dismiss ${catalogEscapeHtml(it.name)}">×</button>
-          ${isBackground ? `<button type="button" class="catalog-unmatched-upload-btn" data-kind="${kind}" data-id="${it.id}"${it.uploading ? ' disabled' : ''}>${it.uploading ? 'Uploading…' : '⬆ Upload & use'}</button>` : ''}
-          ${it.uploadError ? `<span class="catalog-unmatched-upload-error" title="${catalogEscapeHtml(it.uploadError)}">⚠ failed</span>` : ''}
-        </div>`,
-        )
-        .join('')}
-    </div>`;
-}
-
 function catalogGarmentCardHtml(garment) {
   const invalid = garment.status === 'idle' && !garment.file;
   if (garment.previewUrl) {
-    const badgeHtml = garment.status !== 'idle'
-      ? `<span class="catalog-garment-badge redchief-status-badge ${CATALOG_STATUS_CLASS[garment.status] ?? 'muted'}">${CATALOG_STATUS_LABEL[garment.status] ?? garment.status}</span>`
-      : '';
     return `
       <div class="catalog-garment-card upload-thumb" data-row="${garment.id}">
         <img src="${garment.previewUrl}" alt="${catalogEscapeHtml(garment.label)}" title="${catalogEscapeHtml(garment.label)}" />
@@ -855,7 +654,6 @@ function catalogGarmentCardHtml(garment) {
             <line x1="6" y1="6" x2="18" y2="18"/>
           </svg>
         </button>
-        ${badgeHtml}
       </div>`;
   }
   return `
@@ -872,98 +670,6 @@ function catalogGarmentCardHtml(garment) {
           <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
         </svg>
         <span>Add photo</span>
-      </div>
-    </div>`;
-}
-
-const CATALOG_STATUS_LABEL = {
-  QUEUED: 'Queued',
-  RUNNING: 'Running',
-  COMPLETED: 'Completed',
-  FAILED: 'Failed',
-  PARTIAL: 'Partially failed',
-  submitting: 'Submitting…',
-};
-const CATALOG_STATUS_CLASS = {
-  QUEUED: 'warn',
-  RUNNING: 'accent',
-  COMPLETED: 'ok',
-  FAILED: 'err',
-  PARTIAL: 'warn',
-  submitting: 'muted',
-};
-
-function catalogJobCellHtml(garment, run, job) {
-  const poseLabel = catalogBatch.options?.poses.find((p) => p.slug === job.pose)?.label ?? job.pose;
-  const bgLabel = catalogAssetListForKind('background').find((b) => b.slug === job.background)?.label ?? job.background;
-  const badgeCls = CATALOG_STATUS_CLASS[job.status] ?? 'muted';
-  const badgeLabel = CATALOG_STATUS_LABEL[job.status] ?? job.status;
-  let inner = `<span class="catalog-result-label">${catalogEscapeHtml(poseLabel)} · ${catalogEscapeHtml(bgLabel)}</span> <span class="redchief-status-badge ${badgeCls}">${badgeLabel}</span>`;
-  if (job.status === 'COMPLETED' && job.imageUrl) {
-    inner += `<img src="${job.imageUrl}" data-row="${garment.id}" data-run="${run.id}" data-job="${job.jobId}" /><a href="${job.imageUrl}" target="_blank" rel="noopener" class="link-btn">Open</a>`;
-  }
-  if (job.status === 'FAILED' && job.error) {
-    inner += `<span class="redchief-error-code">${catalogEscapeHtml(job.error)}</span>`;
-  }
-  return `<div class="redchief-result-cell">${inner}</div>`;
-}
-
-function catalogRunStatusHtml(garment, run) {
-  const cls = CATALOG_STATUS_CLASS[run.status] ?? 'muted';
-  const label = CATALOG_STATUS_LABEL[run.status] ?? run.status;
-  let body = `<div class="catalog-run-header"><strong>${catalogEscapeHtml(run.runLabel)}</strong> <span class="redchief-status-badge ${cls}">${label}</span>`;
-  if (run.error) body += ` <span class="redchief-error-code">${catalogEscapeHtml(run.error)}</span>`;
-  body += `</div>`;
-  if (run.jobs.length > 0) {
-    body += `<div class="redchief-result-grid">${run.jobs.map((j) => catalogJobCellHtml(garment, run, j)).join('')}</div>`;
-  }
-  return `<div class="catalog-run">${body}</div>`;
-}
-
-function catalogGarmentStatusHtml(garment) {
-  if (garment.status === 'idle') return '';
-  const cls = CATALOG_STATUS_CLASS[garment.status] ?? 'muted';
-  const label = CATALOG_STATUS_LABEL[garment.status] ?? garment.status;
-  let body = `<span class="redchief-status-badge ${cls}">${label}</span>`;
-  if (garment.error) body += ` <span class="redchief-error-code">${catalogEscapeHtml(garment.error)}</span>`;
-  if (garment.status === 'FAILED' || garment.status === 'PARTIAL') {
-    const failedCount = garment.runs.filter((r) => r.status === 'FAILED').length;
-    body += ` <button type="button" class="btn-secondary btn-small catalog-row-retry-btn" data-row="${garment.id}">Retry ${failedCount} failed combination${failedCount === 1 ? '' : 's'}</button>`;
-  }
-  if (garment.runs.length > 0) {
-    body += `<div class="catalog-runs">${garment.runs.map((r) => catalogRunStatusHtml(garment, r)).join('')}</div>`;
-  }
-  return `<div class="redchief-row-status">${body}</div>`;
-}
-
-function catalogResultsHtml() {
-  const withRuns = catalogGarments.filter((g) => g.status !== 'idle' && (g.runs.length > 0 || g.error));
-  if (withRuns.length === 0) return '';
-  return `
-    <div class="catalog-results-panel">
-      <h3 class="catalog-results-title">Generation Results</h3>
-      <div class="catalog-results-list">
-        ${withRuns.map((g) => {
-          const cls = CATALOG_STATUS_CLASS[g.status] ?? 'muted';
-          const label = CATALOG_STATUS_LABEL[g.status] ?? g.status;
-          const failedCount = g.runs.filter((r) => r.status === 'FAILED').length;
-          return `
-            <div class="catalog-result-row-card" data-row="${g.id}">
-              <div class="catalog-result-row-header">
-                ${g.previewUrl ? `<img class="catalog-result-row-thumb" src="${g.previewUrl}" alt="${catalogEscapeHtml(g.label)}" />` : ''}
-                <div class="catalog-result-row-info">
-                  <span class="catalog-result-row-name">${catalogEscapeHtml(g.label)}</span>
-                  <span class="redchief-status-badge ${cls}">${label}</span>
-                </div>
-                ${(g.status === 'FAILED' || g.status === 'PARTIAL') ? `
-                  <button type="button" class="btn-secondary btn-small catalog-row-retry-btn" data-row="${g.id}">
-                    Retry ${failedCount} failed combination${failedCount === 1 ? '' : 's'}
-                  </button>` : ''}
-              </div>
-              ${g.error ? `<p class="redchief-error-code">${catalogEscapeHtml(g.error)}</p>` : ''}
-              ${g.runs.length > 0 ? `<div class="catalog-runs">${g.runs.map((r) => catalogRunStatusHtml(g, r)).join('')}</div>` : ''}
-            </div>`;
-        }).join('')}
       </div>
     </div>`;
 }
@@ -995,9 +701,6 @@ function renderCatalog() {
   catalogConfigBodyEl.innerHTML = catalogConfigFieldsHtml();
   wireCatalogConfigEvents();
   catalogRowsEl.innerHTML = catalogGarments.map(catalogGarmentCardHtml).join('');
-  if (catalogResultsEl) {
-    catalogResultsEl.innerHTML = catalogResultsHtml();
-  }
   wireCatalogGarmentEvents();
   catalogRowsPanelEl.hidden = catalogGarments.length === 0;
   catalogFooterBarEl.hidden = catalogGarments.length === 0;
@@ -1013,20 +716,7 @@ function catalogResetBatchSelections() {
   catalogBatch.poses = new Set();
   catalogBatch.backgrounds = new Set();
   catalogBatch.options = null;
-  // A previous folder-match's status text ("Matched 4 of 5 files…") refers
-  // to the asset list that's about to be thrown away — leaving it up would
-  // read as still describing the new (unrelated) list once options reload.
-  catalogAssetFolderStatus = { face: null, lower: null, shoe: null, pose: null, background: null };
-  // Unmatched previews are also scoped to the asset list just invalidated —
-  // revoke their object URLs (they'd otherwise leak for the rest of the tab's
-  // lifetime) and drop them along with everything else.
-  for (const kind of Object.keys(catalogAssetFolderUnmatched)) {
-    for (const item of catalogAssetFolderUnmatched[kind]) URL.revokeObjectURL(item.previewUrl);
-  }
-  catalogAssetFolderUnmatched = { face: [], lower: [], shoe: [], pose: [], background: [] };
 }
-
-const CATALOG_ASSET_SET_KEY = { face: 'faces', lower: 'lowers', shoe: 'shoes', pose: 'poses', background: 'backgrounds' };
 
 function wireCatalogConfigEvents() {
   for (const btn of catalogConfigBodyEl.querySelectorAll('#catalog-gender-pills .segmented-pill')) {
@@ -1097,19 +787,6 @@ function wireCatalogConfigEvents() {
     });
   }
 
-  // Unmatched-preview ×: purely dismisses that one preview tile (revoking its
-  // object URL) — there's no Set entry to touch, these were never selectable.
-  for (const removeBtn of catalogConfigBodyEl.querySelectorAll('.catalog-unmatched-thumb-remove')) {
-    removeBtn.addEventListener('click', () => {
-      const thumb = removeBtn.closest('.catalog-unmatched-thumb');
-      const kind = thumb.dataset.kind;
-      const item = catalogAssetFolderUnmatched[kind].find((it) => it.id === thumb.dataset.id);
-      if (item) URL.revokeObjectURL(item.previewUrl);
-      catalogAssetFolderUnmatched[kind] = catalogAssetFolderUnmatched[kind].filter((it) => it.id !== thumb.dataset.id);
-      renderCatalog();
-    });
-  }
-
   // Asset thumbnailUrls are presigned (1h TTL — see the network probe that
   // confirmed this) — a picker left open past that, or a genuine network
   // blip, makes the <img> fail to load. Left alone, a failed <img> shows the
@@ -1118,17 +795,6 @@ function wireCatalogConfigEvents() {
   // labeled tile.
   for (const img of catalogConfigBodyEl.querySelectorAll('.catalog-asset-card img')) {
     img.addEventListener('error', () => img.classList.add('broken'), { once: true });
-  }
-
-  for (const btn of catalogConfigBodyEl.querySelectorAll('.catalog-asset-folder-btn')) {
-    const input = catalogConfigBodyEl.querySelector(`.catalog-asset-folder-input[data-kind="${btn.dataset.kind}"]`);
-    btn.addEventListener('click', () => input.click());
-  }
-  for (const input of catalogConfigBodyEl.querySelectorAll('.catalog-asset-folder-input')) {
-    input.addEventListener('change', () => {
-      if (input.files.length > 0) handleCatalogAssetFolderFiles(input.dataset.kind, input.files);
-      input.value = ''; // same folder can be re-picked later (e.g. after adding more files to it) without this no-op-ing on an unchanged FileList
-    });
   }
 
   // Background-only "Upload new background(s)" — see catalogBackgroundUploadControlHtml.
@@ -1140,14 +806,6 @@ function wireCatalogConfigEvents() {
       if (bgUploadInput.files.length > 0) handleCatalogBackgroundUploadFiles(bgUploadInput.files);
       bgUploadInput.value = '';
     });
-  }
-
-  // Per-tile "Upload & use" on the unmatched-preview grid — background only,
-  // see catalogUnmatchedThumbsHtml. stopPropagation isn't needed here (this
-  // button isn't nested inside anything with its own click handler), unlike
-  // the dismiss ×.
-  for (const uploadBtn of catalogConfigBodyEl.querySelectorAll('.catalog-unmatched-upload-btn')) {
-    uploadBtn.addEventListener('click', () => uploadUnmatchedBackgroundTile(uploadBtn.dataset.kind, uploadBtn.dataset.id));
   }
 }
 
@@ -1349,15 +1007,6 @@ function wireCatalogGarmentEvents() {
         if (file) setCatalogGarmentFile(garmentId, file);
         input.value = '';
       });
-    }
-  }
-
-  if (catalogResultsEl) {
-    for (const retryBtn of catalogResultsEl.querySelectorAll('.catalog-row-retry-btn')) {
-      retryBtn.addEventListener('click', () => retryCatalogGarment(retryBtn.dataset.row));
-    }
-    for (const img of catalogResultsEl.querySelectorAll('.redchief-result-cell img')) {
-      img.addEventListener('error', () => refreshCatalogGarmentRun(img.dataset.row, img.dataset.run, img.dataset.job));
     }
   }
 }
@@ -1653,59 +1302,6 @@ function pollCatalogRun(garment, run, attempt = 0, delay = 3000) {
       run.status = 'FAILED';
       run.error = err instanceof Error ? err.message : String(err);
       catalogUpdateGarmentAggregateStatus(garment);
-      renderCatalog();
-    });
-}
-
-const catalogRefreshedJobs = new Set(); // one auto-retry per job per completed result, avoids a hot loop against a permanently-broken (or expired-presigned) URL
-
-async function refreshCatalogGarmentRun(garmentId, runId, jobId) {
-  const garment = catalogFindGarment(garmentId);
-  const run = garment?.runs.find((r) => r.id === runId);
-  if (!run || !run.catalogueId) return;
-  if (catalogRefreshedJobs.has(jobId)) return;
-  catalogRefreshedJobs.add(jobId);
-  try {
-    // imageUrl is a 900s-TTL presigned URL — if the tester left this tab open
-    // past that, a full status refetch is the only way to get a fresh one.
-    const res = await fetch(`/api/catalog/catalogues/${run.catalogueId}`);
-    const body = await res.json();
-    if (res.ok) {
-      run.jobs = body.jobs;
-      renderCatalog();
-    }
-  } catch {
-    // best-effort — leave the broken thumbnail if this also fails
-  }
-}
-
-/** Re-submits only the FAILED runs (combinations) for a garment — a COMPLETED or still-RUNNING run is left untouched, so a partially-successful garment never re-spends credits on a combination that already succeeded. */
-function retryCatalogGarment(garmentId) {
-  const garment = catalogFindGarment(garmentId);
-  if (!garment || (garment.status !== 'FAILED' && garment.status !== 'PARTIAL')) return;
-  const failedRuns = garment.runs.filter((r) => r.status === 'FAILED');
-  if (failedRuns.length === 0) return;
-
-  catalogFileToDataUrl(garment.file)
-    .then((garmentDataUrl) => {
-      // See submitCatalogGarments' comment — the 12-cap here was the same
-      // vestigial artifact and is removed for the same reason.
-      const looks = catalogComputeLooks();
-      for (const run of failedRuns) {
-        run.pollToken++; // discard any stale continuation from the failed attempt
-        if (run.pollTimer) clearTimeout(run.pollTimer);
-        run.pollTimer = null;
-        run.catalogueId = null;
-        run.jobs = [];
-        run.error = null;
-        run.status = 'submitting';
-      }
-      garment.status = 'RUNNING';
-      renderCatalog();
-      return Promise.allSettled(failedRuns.map((run) => submitCatalogRun(garment, run, garmentDataUrl, looks)));
-    })
-    .catch((err) => {
-      garment.error = err instanceof Error ? err.message : String(err);
       renderCatalog();
     });
 }

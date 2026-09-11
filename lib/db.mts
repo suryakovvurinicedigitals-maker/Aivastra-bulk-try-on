@@ -135,6 +135,22 @@ db.exec(`
   if (!jobResultsCols.includes('started_by')) {
     db.exec('ALTER TABLE job_results ADD COLUMN started_by TEXT');
   }
+  // retry_payload: the exact upstream request body needed to resubmit THIS
+  // job from the Results page's Retry button — captured at record time (see
+  // webapp/server.mts's recordResult/runCatalogAggregate), not reconstructed
+  // after the fact, since a completed/failed job's original request can't
+  // always be recovered from its recorded fields alone (Catalog's pose/
+  // background/face are asset-library SLUGS, but job_results only stores
+  // human-readable labels — the slugs would otherwise be gone the moment the
+  // request finished). Only Catalog populates this today: Try-On retries by
+  // re-reading person/garment straight out of input/ (same lookup the
+  // Results table already does for thumbnails), and RedChief retries by
+  // re-reading its own stored job_result_media input files — neither needs a
+  // second copy of its request stashed here. NULL for every row from before
+  // this migration and for any source that doesn't populate it.
+  if (!jobResultsCols.includes('retry_payload')) {
+    db.exec('ALTER TABLE job_results ADD COLUMN retry_payload TEXT');
+  }
 }
 
 // ---- one-time migration of the pre-DB file-based state, if any is found ----
@@ -341,6 +357,8 @@ export interface JobResultInput {
    * entries render as "Output" (usually one, but a job can return several).
    */
   media?: { kind: 'input' | 'output'; label: string; filePath: string }[];
+  /** See the retry_payload migration comment above — Catalog-only today, opaque JSON the Results page's Retry route round-trips straight back to generateCatalog(). */
+  retryPayload?: string;
 }
 
 export interface JobResultRow extends JobResultInput {
@@ -387,6 +405,7 @@ function rowToJobResult(r: Record<string, unknown>): JobResultRow {
     source: (r.source as JobResultRow['source']) ?? 'tryon',
     credits: r.credits != null ? Number(r.credits) : undefined,
     startedBy: (r.started_by as string) ?? undefined,
+    retryPayload: (r.retry_payload as string) ?? undefined,
   };
 }
 
@@ -414,8 +433,8 @@ export function getRunMeta(runId: string): { startedBy?: string } {
 }
 
 const insertJobResultStmt = db.prepare(`
-  INSERT INTO job_results (run_id, gender, person_name, category_slug, garment_name, job_id, status, error_code, error, output_file, finished_at, duration_ms, source, credits, started_by)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO job_results (run_id, gender, person_name, category_slug, garment_name, job_id, status, error_code, error, output_file, finished_at, duration_ms, source, credits, started_by, retry_payload)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 const insertJobResultMediaStmt = db.prepare(`
   INSERT INTO job_result_media (result_id, kind, label, file_path, position)
@@ -444,6 +463,7 @@ export function insertJobResult(runId: string, r: JobResultInput): number {
       r.source ?? 'tryon',
       r.credits ?? null,
       r.startedBy ?? null,
+      r.retryPayload ?? null,
     );
     resultId = Number(info.lastInsertRowid);
     r.media?.forEach((m, i) => insertJobResultMediaStmt.run(resultId, m.kind, m.label, m.filePath, i));

@@ -2137,6 +2137,14 @@ select:focus, input:focus, textarea:focus, .dropzone:focus-within {
   letter-spacing: 0.04em;
 }
 
+/* Results page's per-row Retry button (see app.js's retryBtnHtml) sits right
+   under the status badge in the same cell — FAILED/ERROR rows only, so the
+   two never appear side-by-side wide enough to need horizontal layout. */
+.retry-btn {
+  display: block;
+  margin-top: 6px;
+}
+
 .badge.running {
   background: var(--accent-tint);
   color: var(--accent);
@@ -2889,23 +2897,6 @@ select:focus, input:focus, textarea:focus, .dropzone:focus-within {
   z-index: 2;
 }
 
-.catalog-garment-badge {
-  position: absolute;
-  bottom: 6px;
-  left: 6px;
-  right: 6px;
-  text-align: center;
-  font-size: 0.7rem;
-  font-weight: 650;
-  padding: 3px 6px;
-  border-radius: var(--radius-sm);
-  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.25);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  z-index: 1;
-}
-
 /* Empty Garment Slot */
 .catalog-garment-card.catalog-garment-empty {
   border: 2px dashed var(--border);
@@ -2946,73 +2937,6 @@ select:focus, input:focus, textarea:focus, .dropzone:focus-within {
 
 .catalog-garment-card.catalog-garment-empty:hover .catalog-empty-placeholder svg {
   stroke: var(--primary);
-}
-
-/* Catalog Results Section (below gallery) */
-.catalog-results {
-  margin-top: 24px;
-}
-
-.catalog-results:empty {
-  display: none;
-}
-
-.catalog-results-panel {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-  border-top: 1px solid var(--border);
-  padding-top: 20px;
-}
-
-.catalog-results-title {
-  font-size: 1rem;
-  font-weight: 700;
-  color: var(--text);
-  margin: 0;
-}
-
-.catalog-results-list {
-  display: flex;
-  flex-direction: column;
-  gap: 18px;
-}
-
-.catalog-result-row-card {
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  padding: 16px;
-  background: var(--bg);
-  box-shadow: var(--shadow-xs);
-}
-
-.catalog-result-row-header {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  margin-bottom: 12px;
-}
-
-.catalog-result-row-thumb {
-  width: 48px;
-  height: 56px;
-  object-fit: cover;
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--border);
-  flex-shrink: 0;
-}
-
-.catalog-result-row-info {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex: 1;
-}
-
-.catalog-result-row-name {
-  font-size: 0.9rem;
-  font-weight: 650;
-  color: var(--text);
 }
 
 #catalog-config-body {
@@ -3508,33 +3432,6 @@ select:focus, input:focus, textarea:focus, .dropzone:focus-within {
   font-weight: 650;
 }
 
-.catalog-result-label {
-  font-size: 0.775rem;
-  font-weight: 650;
-  color: var(--muted);
-}
-
-.catalog-runs {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-  margin-top: 12px;
-}
-
-.catalog-run {
-  border-top: 1px solid var(--border);
-  padding-top: 14px;
-}
-
-.catalog-run-header {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 10px;
-  font-size: 0.875rem;
-  font-weight: 600;
-}
-
 /* ==========================================================================
    Login Page
    ========================================================================== */
@@ -3614,54 +3511,15 @@ select:focus, input:focus, textarea:focus, .dropzone:focus-within {
   font-size: 0.925rem;
 }
 
-/* Folder-bulk-select control inside a catalog asset picker's section header
-   (see catalogAssetFolderControlHtml in catalog.js) — a small link-style
-   button plus whatever match-status text the last folder upload left. */
+/* Small link-style control inside a catalog asset picker's section header
+   (see catalogBackgroundUploadControlHtml in catalog.js) — a button plus
+   whatever status text the last upload batch left. */
 .catalog-asset-folder-control { font-weight: 500; }
 .catalog-asset-folder-control .link-btn { font-size: 0.76rem; }
 .catalog-asset-folder-status { flex-basis: 100%; margin: 4px 0 0; font-weight: 500; }
 
-/* Folder files that matched nothing in the curated library — plain preview
-   only, no checkbox, can't be selected for generation (see
-   catalogUnmatchedThumbsHtml's doc comment in catalog.js for why: the
-   upstream API has no way to submit a custom face/lower/shoe/pose/background
-   image). Dimmed + dashed border so it visually reads as "not usable here"
-   at a glance, distinct from the solid-bordered selected/library tiles. */
-.catalog-unmatched-label { margin: 8px 0 6px; }
-.catalog-unmatched-thumbs { margin: 0 0 12px; }
-.catalog-unmatched-thumbs .upload-thumb { width: 88px; height: 88px; opacity: 0.6; }
-.catalog-unmatched-thumbs .upload-thumb img { border: 1px dashed var(--muted); }
-/* A background tile mid-upload (uploadUnmatchedBackgroundTile) stays at full
-   opacity instead of the dimmed "not usable" look above — it's actively
-   becoming usable, not a dead end. */
-.catalog-unmatched-thumbs .upload-thumb.uploading { opacity: 1; }
-.catalog-unmatched-thumbs .upload-thumb.uploading img { border-color: var(--primary, #b85030); }
-
-/* Background-only "Upload & use" button on an unmatched-preview tile (see
-   catalogUnmatchedThumbsHtml) — sits below the thumbnail rather than
-   overlapping it like the × badge does, since both need to stay reachable
-   on an 88px tile. */
-.catalog-unmatched-upload-btn {
-  display: block;
-  width: 100%;
-  margin-top: 4px;
-  padding: 2px 4px;
-  border: none;
-  border-radius: 6px;
-  background: var(--primary, #b85030);
-  color: #fff;
-  font-size: 0.68rem;
-  font-weight: 600;
-  cursor: pointer;
-}
-.catalog-unmatched-upload-btn:disabled { opacity: 0.6; cursor: default; }
-.catalog-unmatched-upload-error { display: block; margin-top: 2px; font-size: 0.68rem; color: var(--danger, #c0392b); text-align: center; }
-
 /* Background-only "Upload new background(s)" control in a section header —
-   same small link-button treatment as .catalog-asset-folder-control right
-   above it (see catalogBackgroundUploadControlHtml), just a second, visually
-   distinct entry point: that one MATCHES existing library assets by
-   filename, this one UPLOADS a genuinely new candidate. */
+   same small link-button treatment as .catalog-asset-folder-control above. */
 .catalog-bg-upload-control .link-btn { font-size: 0.76rem; }
 
 /* "Mine" badge on a background tile that's this merchant's own dev-API

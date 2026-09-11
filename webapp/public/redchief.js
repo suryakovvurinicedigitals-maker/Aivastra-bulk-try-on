@@ -596,6 +596,11 @@ const redchiefRecordedJobs = new Set(); // job ids already reported to /api/resu
  * Results page can render the full multi-thumbnail row in one DB record.
  * Fire-and-forget — a failed recording doesn't affect the tester's own view
  * of this row, which already shows its own status/thumbnails live regardless.
+ *
+ * Inputs are built and sent regardless of COMPLETED/FAILED — this is the
+ * ONLY place row.slots[].file (the actual input bytes) still exists at all,
+ * so a FAILED job whose inputs aren't captured here can never be retried
+ * later from the Results page (see webapp/server.mts's recordResult).
  */
 async function recordRedchiefRowResult(row) {
   if (row.status !== 'COMPLETED' && row.status !== 'FAILED') return;
@@ -609,16 +614,16 @@ async function recordRedchiefRowResult(row) {
     garmentName: row.label,
     jobId: row.jobId,
   };
+  try {
+    payload.inputs = await Promise.all(row.slots.map(async (s) => ({ label: s.label, dataUrl: await redchiefFileToDataUrl(s.file) })));
+  } catch {
+    // A slot's File became unreadable (e.g. GC'd/revoked) between
+    // completion and now — record without inputs rather than losing the row
+    // entirely (this job just won't be retryable later).
+    payload.inputs = [];
+  }
   if (row.status === 'COMPLETED') {
     payload.credits = redchiefConfig?.creditCost;
-    try {
-      payload.inputs = await Promise.all(row.slots.map(async (s) => ({ label: s.label, dataUrl: await redchiefFileToDataUrl(s.file) })));
-    } catch {
-      // A slot's File became unreadable (e.g. GC'd/revoked) between
-      // completion and now — record the outputs without inputs rather than
-      // losing the row entirely.
-      payload.inputs = [];
-    }
     payload.outputs = (row.resultUrls ?? []).map((url, i) => ({ label: `Output ${i + 1}`, imageUrl: url }));
   } else {
     payload.error = row.error ?? 'unknown error';

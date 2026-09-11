@@ -38,9 +38,9 @@ import {
   type CatalogJobStatus,
   type DevApiConfig,
 } from '../lib/api-client.mts';
-import { runBatch } from '../lib/batch.mts';
+import { runBatch, runOneJob } from '../lib/batch.mts';
 import { createLimiter } from '../lib/concurrency.mts';
-import { clearFlag, ensureRun, getFlag, getResultRow, insertJobResult, listResults, resolveFlag, setFlag } from '../lib/db.mts';
+import { clearFlag, ensureRun, getFlag, getResultMedia, getResultRow, insertJobResult, listResults, resolveFlag, setFlag } from '../lib/db.mts';
 import { scanInput, type TryonJobSpec } from '../lib/scan-input.mts';
 import {
   PropiclyApiError,
@@ -370,6 +370,14 @@ function writeResultMedia(source: string, bytes: Buffer, ext: string): string {
   return outFile;
 }
 
+const RESULT_MEDIA_EXT_MIME: Record<string, string> = { '.png': 'image/png', '.webp': 'image/webp', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg' };
+
+/** The reverse of decodeDataUrl — re-reads a job_result_media file straight back into the `data:<mime>;base64,...` URI it was originally decoded from, so the Results page's Retry route can hand a RedChief/Catalog job's already-stored input images straight back to createRedchiefJob/generateCatalog without the browser having to re-supply them. */
+function fileToDataUrl(filePath: string): string {
+  const mime = RESULT_MEDIA_EXT_MIME[path.extname(filePath).toLowerCase()] ?? 'image/jpeg';
+  return `data:${mime};base64,${readFileSync(filePath).toString('base64')}`;
+}
+
 /**
  * Shared by POST /api/results/record (still the only path for RedChief,
  * which has no server-side aggregate loop of its own — every job there is
@@ -416,23 +424,40 @@ async function recordResult(input: {
   credits?: number;
   startedBy?: string;
   error?: string;
+  retryPayload?: string;
+  // How long the actual generate→terminal-status cycle took, in ms — Catalog
+  // is the only caller that measures and sends this (see runCatalogAggregate
+  // and the retry route's catalog branch): it's the one source whose Results
+  // page column shows Duration instead of Credits (the aivastra dev API has
+  // no per-job catalog credit figure to show — see catalogResultRowHtml's
+  // doc comment — but wall-clock time is easy to measure server-side since
+  // this function's callers already own the full generate→poll loop).
+  durationMs?: number;
 }): Promise<number> {
   let outputFile: string | undefined;
   const media: { kind: 'input' | 'output'; label: string; filePath: string }[] = [];
-  if (input.status === 'COMPLETED') {
-    for (const inp of input.inputs ?? []) {
-      if (inp.dataUrl) {
-        const { bytes, ext } = decodeDataUrl(inp.dataUrl);
-        media.push({ kind: 'input', label: inp.label, filePath: writeResultMedia(input.source, bytes, ext) });
-      } else if (inp.imageUrl) {
-        const imgRes = await fetch(inp.imageUrl);
-        if (!imgRes.ok) throw new Error(`HTTP ${imgRes.status}`);
-        const bytes = Buffer.from(await imgRes.arrayBuffer());
-        media.push({ kind: 'input', label: inp.label, filePath: writeResultMedia(input.source, bytes, '.jpg') });
-      }
-      // An input with neither is silently skipped — e.g. an optional
-      // lower/shoe axis the tester didn't select for this run.
+  // Inputs are persisted regardless of COMPLETED/FAILED (unlike outputs,
+  // which only exist on success) — a FAILED job's inputs are exactly what
+  // the Results page's Retry button needs to resubmit it later (RedChief;
+  // Catalog also gets a nicer failed-row display for free, since it already
+  // sends the same `inputs` array either way — see runCatalogAggregate).
+  // This used to be COMPLETED-only, silently dropping every failed job's
+  // inputs even when the caller had already gone to the trouble of sending
+  // them.
+  for (const inp of input.inputs ?? []) {
+    if (inp.dataUrl) {
+      const { bytes, ext } = decodeDataUrl(inp.dataUrl);
+      media.push({ kind: 'input', label: inp.label, filePath: writeResultMedia(input.source, bytes, ext) });
+    } else if (inp.imageUrl) {
+      const imgRes = await fetch(inp.imageUrl);
+      if (!imgRes.ok) throw new Error(`HTTP ${imgRes.status}`);
+      const bytes = Buffer.from(await imgRes.arrayBuffer());
+      media.push({ kind: 'input', label: inp.label, filePath: writeResultMedia(input.source, bytes, '.jpg') });
     }
+    // An input with neither is silently skipped — e.g. an optional
+    // lower/shoe axis the tester didn't select for this run.
+  }
+  if (input.status === 'COMPLETED') {
     if (input.outputs && input.outputs.length > 0) {
       for (let i = 0; i < input.outputs.length; i++) {
         const out = input.outputs[i]!;
@@ -463,10 +488,12 @@ async function recordResult(input: {
     error: input.status === 'FAILED' ? (input.error ?? 'unknown error') : undefined,
     outputFile,
     finishedAt: new Date().toISOString(),
+    durationMs: input.durationMs,
     source: input.source,
     credits: input.credits,
     startedBy: input.startedBy,
     media: media.length > 0 ? media : undefined,
+    retryPayload: input.retryPayload,
   });
 }
 
@@ -516,6 +543,16 @@ function findInputFileByStem(dir: string, stem: string): string | null {
   return readdirSync(dir).find((f) => IMAGE_EXT.has(path.extname(f).toLowerCase()) && path.basename(f, path.extname(f)) === stem) ?? null;
 }
 
+/** Re-locates a Try-On job's original person/garment files, same stem lookup as findInputFileByStem — the one piece the Results page's Retry route needs that isn't already in the job_results row itself. Returns null (not a partial result) if either file is gone, since a retry needs both. */
+function findTryonInputFiles(r: { gender: string; categorySlug: string; personName: string; garmentName: string }): { personFile: string; garmentFile: string } | null {
+  const personDir = path.join(INPUT_DIR, 'people', r.gender);
+  const garmentDir = path.join(INPUT_DIR, 'garments', r.gender, r.categorySlug);
+  const personStem = findInputFileByStem(personDir, r.personName);
+  const garmentStem = findInputFileByStem(garmentDir, r.garmentName);
+  if (!personStem || !garmentStem) return null;
+  return { personFile: path.join(personDir, personStem), garmentFile: path.join(garmentDir, garmentStem) };
+}
+
 function json(res: http.ServerResponse, status: number, body: unknown) {
   const buf = Buffer.from(JSON.stringify(body));
   res.writeHead(status, { 'Content-Type': 'application/json', 'Content-Length': buf.length });
@@ -538,6 +575,17 @@ function devApiErrorResponse(res: http.ServerResponse, err: unknown) {
     return;
   }
   json(res, 502, { error: { code: 'PROXY_ERROR', message: err instanceof Error ? err.message : String(err) } });
+}
+
+/** Polls a propicly job (RedChief) to a terminal state — same shape/cadence as lib/batch.mts's pollJob for the aivastra host, duplicated rather than shared because the two hosts' DevJob-ish response shapes and client modules are deliberately kept separate (see lib/propicly-client.mts's header comment). Used by the Results page's Retry route, which — unlike redchief.js's own client-side pollRedchiefRow — has no browser tab left open to keep polling after the initial request. */
+async function pollPropiclyJobToTerminal(cfgP: PropiclyApiConfig, jobId: string): Promise<{ status: 'COMPLETED' | 'FAILED'; imageUrl?: string; imageUrls?: string[]; error?: string }> {
+  const deadline = Date.now() + POLL_TIMEOUT_MS;
+  for (;;) {
+    const job = await getPropiclyJob(cfgP, jobId);
+    if (job.status === 'COMPLETED' || job.status === 'FAILED') return job;
+    if (Date.now() > deadline) return { status: 'FAILED', error: 'poll timeout' };
+    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+  }
 }
 
 const CATALOG_GENDERS = new Set(['men', 'women', 'boys', 'girls']);
@@ -829,6 +877,11 @@ async function runCatalogAggregate(cfg: DevApiConfig, run: CatalogAggregateRun, 
       catalogGenerateLimit(async () => {
         catalogActiveLooks++;
         console.log(`[catalog] submitting look ${stub.jobId} (${stub.pose} x ${stub.background}) — active=${catalogActiveLooks}/${CATALOG_CONCURRENCY}`);
+        // Measured from right before the actual upstream submit (not from
+        // when this look was queued behind catalogGenerateLimit/the whole
+        // batch) so Duration reflects generate-to-terminal time for THIS
+        // look, the same thing a tester watching one job would time by hand.
+        const startedAt = Date.now();
         try {
           const result = await generateCatalog(cfg, { ...base, looks: [{ pose: stub.pose, background: stub.background }] });
           const realJob = result.jobs[0];
@@ -885,6 +938,14 @@ async function runCatalogAggregate(cfg: DevApiConfig, run: CatalogAggregateRun, 
               if (stub.backgroundThumbnailUrl) inputs.push({ label: 'Background', imageUrl: stub.backgroundThumbnailUrl });
               if (run.shoeThumbnailUrl) inputs.push({ label: 'Shoes', imageUrl: run.shoeThumbnailUrl });
               if (run.lowerThumbnailUrl) inputs.push({ label: 'Lower', imageUrl: run.lowerThumbnailUrl });
+              // `base` + this look's {pose, background} together are exactly
+              // a CatalogGenerateBody — the real slugs actually sent upstream
+              // (unlike `inputs` above, which only carries human labels/
+              // thumbnails for display). Stashed verbatim as JSON so the
+              // Results page's Retry button can hand this straight back to
+              // generateCatalog() without trying to reverse-engineer slugs
+              // out of a thumbnail URL or a label string.
+              const retryPayload: CatalogGenerateBody = { ...base, looks: [{ pose: stub.pose, background: stub.background }] };
               await recordResult({
                 source: 'catalog',
                 status: stub.status,
@@ -895,8 +956,10 @@ async function runCatalogAggregate(cfg: DevApiConfig, run: CatalogAggregateRun, 
                 jobId: stub.jobId,
                 inputs,
                 outputs: stub.imageUrl ? [{ label: 'Output', imageUrl: stub.imageUrl }] : undefined,
+                retryPayload: JSON.stringify(retryPayload),
                 error: stub.error,
                 startedBy: run.startedBy,
+                durationMs: Date.now() - startedAt,
               });
             } catch (err) {
               console.error(`[catalog] failed to record result for look ${stub.jobId}:`, err instanceof Error ? err.message : err);
@@ -1199,10 +1262,7 @@ function resolveResultRowById(id: number): {
   const r = getResultRow(id);
   if (!r) return null;
 
-  const personDir = path.join(INPUT_DIR, 'people', r.gender);
-  const garmentDir = path.join(INPUT_DIR, 'garments', r.gender, r.categorySlug);
-  const personStem = findInputFileByStem(personDir, r.personName);
-  const garmentStem = findInputFileByStem(garmentDir, r.garmentName);
+  const files = findTryonInputFiles(r);
 
   return {
     id: r.id,
@@ -1213,8 +1273,8 @@ function resolveResultRowById(id: number): {
     garmentName: r.garmentName,
     status: r.status,
     finishedAt: r.finishedAt,
-    personFile: personStem ? path.join(personDir, personStem) : null,
-    garmentFile: garmentStem ? path.join(garmentDir, garmentStem) : null,
+    personFile: files?.personFile ?? null,
+    garmentFile: files?.garmentFile ?? null,
     outputFile: r.outputFile ?? null,
   };
 }
@@ -1653,10 +1713,7 @@ const server = http.createServer(async (req, res) => {
       });
 
       const rows = page_.rows.map((r) => {
-        const personDir = path.join(INPUT_DIR, 'people', r.gender);
-        const garmentDir = path.join(INPUT_DIR, 'garments', r.gender, r.categorySlug);
-        const personFile = findInputFileByStem(personDir, r.personName);
-        const garmentFile = findInputFileByStem(garmentDir, r.garmentName);
+        const files = findTryonInputFiles(r);
         return {
           id: r.id,
           runId: r.runId,
@@ -1670,8 +1727,8 @@ const server = http.createServer(async (req, res) => {
           error: r.error,
           finishedAt: r.finishedAt,
           durationMs: r.durationMs ?? null,
-          personThumb: personFile ? `/api/file?path=${encodeURIComponent(path.relative(INPUT_DIR, path.join(personDir, personFile)))}` : null,
-          garmentThumb: garmentFile ? `/api/file?path=${encodeURIComponent(path.relative(INPUT_DIR, path.join(garmentDir, garmentFile)))}` : null,
+          personThumb: files ? `/api/file?path=${encodeURIComponent(path.relative(INPUT_DIR, files.personFile))}` : null,
+          garmentThumb: files ? `/api/file?path=${encodeURIComponent(path.relative(INPUT_DIR, files.garmentFile))}` : null,
           outputThumb: r.outputFile ? `/api/result-file?path=${encodeURIComponent(path.relative(OUTPUT_DIR, r.outputFile))}` : null,
           credits: r.credits ?? null,
           // RedChief (and, later, Catalog) rows carry their own labeled
@@ -1683,6 +1740,12 @@ const server = http.createServer(async (req, res) => {
             thumb: `/api/result-file?path=${encodeURIComponent(path.relative(OUTPUT_DIR, m.filePath))}`,
           })),
           flag: r.flag,
+          // Whether the Results page shows a Retry button — the server does
+          // the real per-source retry-data check (original input/ files,
+          // stored job_result_media, or a recorded retryPayload) only when
+          // Retry is actually clicked, since that check means touching disk/
+          // JSON-parsing for every row and this list can be up to 100 long.
+          retryable: r.status !== 'COMPLETED',
         };
       });
 
@@ -1793,21 +1856,24 @@ const server = http.createServer(async (req, res) => {
       // New multi-input/multi-output shape (RedChief) — each input is a
       // base64 data URI (the browser's only copy of that image), each output
       // an http(s) URL this server downloads itself, same trust boundary as
-      // the legacy single imageUrl above.
+      // the legacy single imageUrl above. Inputs are accepted regardless of
+      // status (unlike outputs, which only exist on success) — a FAILED
+      // job's inputs are what the Results page's Retry button needs later;
+      // see recordResult's doc comment.
       let inputs: { label: string; dataUrl?: string; imageUrl?: string }[] | undefined;
       let outputs: { label?: string; imageUrl: string }[] | undefined;
-      if (status === 'COMPLETED') {
-        if (Array.isArray(parsed?.inputs)) {
-          inputs = [];
-          for (const raw of parsed.inputs) {
-            const label = safeResultLabel(raw?.label, 40);
-            if (!label || typeof raw?.dataUrl !== 'string' || !raw.dataUrl.startsWith('data:')) {
-              json(res, 400, { error: { code: 'VALIDATION', message: 'each input needs a label and a base64 data URI' } });
-              return;
-            }
-            inputs.push({ label, dataUrl: raw.dataUrl });
+      if (Array.isArray(parsed?.inputs)) {
+        inputs = [];
+        for (const raw of parsed.inputs) {
+          const label = safeResultLabel(raw?.label, 40);
+          if (!label || typeof raw?.dataUrl !== 'string' || !raw.dataUrl.startsWith('data:')) {
+            json(res, 400, { error: { code: 'VALIDATION', message: 'each input needs a label and a base64 data URI' } });
+            return;
           }
+          inputs.push({ label, dataUrl: raw.dataUrl });
         }
+      }
+      if (status === 'COMPLETED') {
         if (Array.isArray(parsed?.outputs)) {
           outputs = [];
           for (const raw of parsed.outputs) {
@@ -1920,6 +1986,182 @@ const server = http.createServer(async (req, res) => {
       const note = typeof body.note === 'string' ? body.note.trim().slice(0, 500) : undefined;
       const flag = resolveFlag(id, note, session!.username);
       json(res, 200, { flag });
+      return;
+    }
+
+    // ---- retry a failed/errored job from the Results page ----
+    // Synchronous, not fire-and-forget: this is always a single job (unlike
+    // Generate/Catalog Batch, which can be hundreds), so awaiting the whole
+    // create→poll→record cycle inside one request is simpler than building
+    // yet another progress-polling path for just this one button, and the
+    // client shows its own "Retrying…" state on the button meanwhile.
+    // Confirmation happens client-side (a confirm() naming the source and
+    // that this spends real credits) before this route is ever called — see
+    // CLAUDE.md's "never create jobs without going through the existing
+    // confirmation flow".
+    //
+    // Always inserts a NEW job_results row rather than mutating the failed
+    // one in place — the original stays as history (what failed and why),
+    // exactly like Catalog's old per-garment retry used to behave before the
+    // Catalog Batch results panel was removed.
+    if (req.method === 'POST' && url.pathname.startsWith('/api/results/') && url.pathname.endsWith('/retry')) {
+      const id = Number(decodeURIComponent(url.pathname.slice('/api/results/'.length, -'/retry'.length)));
+      const row = Number.isInteger(id) ? getResultRow(id) : null;
+      if (!row) {
+        json(res, 404, { error: { code: 'NOT_FOUND', message: 'Result not found.' } });
+        return;
+      }
+      if (row.status === 'COMPLETED') {
+        json(res, 400, { error: { code: 'VALIDATION', message: 'Only failed/errored jobs can be retried.' } });
+        return;
+      }
+
+      try {
+        if (row.source === 'tryon') {
+          if (!cfg) {
+            json(res, 400, { error: { code: 'CONFIG_MISSING', message: 'DEV_API_KEY is not set on the server.' } });
+            return;
+          }
+          const files = findTryonInputFiles(row);
+          if (!files) {
+            json(res, 400, {
+              error: { code: 'INPUT_MISSING', message: 'The original person/garment photo is no longer in input/ — cannot retry.' },
+            });
+            return;
+          }
+          const spec: TryonJobSpec = {
+            gender: row.gender,
+            personFile: files.personFile,
+            personName: row.personName,
+            categorySlug: row.categorySlug,
+            garmentFile: files.garmentFile,
+            garmentName: row.garmentName,
+          };
+          const result = await runOneJob(cfg, spec, path.join(OUTPUT_DIR, row.runId, 'results'), {
+            intervalMs: POLL_INTERVAL_MS,
+            timeoutMs: POLL_TIMEOUT_MS,
+          });
+          const newId = insertJobResult(row.runId, result);
+          json(res, 200, { id: newId, status: result.status, error: result.error });
+          return;
+        }
+
+        if (row.source === 'redchief') {
+          if (!propiclyCfg) {
+            json(res, 400, { error: { code: 'CONFIG_MISSING', message: 'PROPICLY_API_KEY is not set on the server.' } });
+            return;
+          }
+          // The only place a RedChief job's original input bytes survive —
+          // see recordResult's doc comment on why inputs are now persisted
+          // for FAILED jobs too. A row recorded before that fix has none.
+          const inputMedia = getResultMedia(id).filter((m) => m.kind === 'input');
+          if (inputMedia.length === 0) {
+            json(res, 400, {
+              error: { code: 'NO_RETRY_DATA', message: 'No stored input images for this job (recorded before Retry support existed) — cannot retry.' },
+            });
+            return;
+          }
+          const inputs = inputMedia.map((m) => ({ label: m.label, dataUrl: fileToDataUrl(m.filePath) }));
+          const created = await createRedchiefJob(propiclyCfg, inputs.map((i) => i.dataUrl!));
+          const outcome = await pollPropiclyJobToTerminal(propiclyCfg, created.jobId);
+          const outputs =
+            outcome.status === 'COMPLETED'
+              ? (outcome.imageUrls ?? (outcome.imageUrl ? [outcome.imageUrl] : [])).map((u, i) => ({ label: `Output ${i + 1}`, imageUrl: u }))
+              : undefined;
+          const newId = await recordResult({
+            source: 'redchief',
+            status: outcome.status,
+            gender: 'n/a',
+            personName: row.personName,
+            categorySlug: 'redchief',
+            garmentName: row.garmentName,
+            jobId: created.jobId,
+            inputs,
+            outputs,
+            error: outcome.error,
+            startedBy: session!.username,
+          });
+          json(res, 200, { id: newId, status: outcome.status, error: outcome.error });
+          return;
+        }
+
+        if (row.source === 'catalog') {
+          if (!cfg) {
+            json(res, 400, { error: { code: 'CONFIG_MISSING', message: 'DEV_API_KEY is not set on the server.' } });
+            return;
+          }
+          if (!row.retryPayload) {
+            json(res, 400, {
+              error: { code: 'NO_RETRY_DATA', message: 'No retry data stored for this job (recorded before Retry support existed) — cannot retry.' },
+            });
+            return;
+          }
+          let payload: CatalogGenerateBody;
+          try {
+            payload = JSON.parse(row.retryPayload);
+          } catch {
+            json(res, 500, { error: { code: 'CORRUPT_RETRY_DATA', message: 'Stored retry data for this job is corrupt.' } });
+            return;
+          }
+          const startedAt = Date.now(); // same measurement point as runCatalogAggregate's — right before the upstream submit
+          const created = await generateCatalog(cfg, payload);
+          const realJob = created.jobs[0];
+          if (!realJob) {
+            json(res, 502, { error: { code: 'UPSTREAM_ERROR', message: 'Upstream returned no job for this look.' } });
+            return;
+          }
+          const deadline = Date.now() + POLL_TIMEOUT_MS;
+          let job: { jobId: string; status: CatalogJobStatus; imageUrl?: string; error?: string } | undefined;
+          for (;;) {
+            const status = await getCatalogueStatus(cfg, created.catalogueId);
+            job = status.jobs.find((j) => j.jobId === realJob.jobId) ?? status.jobs[0];
+            if (!job || job.status === 'COMPLETED' || job.status === 'FAILED') break;
+            if (Date.now() > deadline) {
+              job = { ...job, status: 'FAILED', error: 'poll timeout' };
+              break;
+            }
+            await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+          }
+          const status: 'COMPLETED' | 'FAILED' = job?.status === 'COMPLETED' ? 'COMPLETED' : 'FAILED';
+          // Reuse whatever face/garment/pose/background thumbnails were
+          // already downloaded for the original attempt (present regardless
+          // of its outcome — see recordResult's doc comment) so the retried
+          // row's display doesn't regress to blank input cells.
+          const inputs = getResultMedia(id)
+            .filter((m) => m.kind === 'input')
+            .map((m) => ({ label: m.label, dataUrl: fileToDataUrl(m.filePath) }));
+          const newId = await recordResult({
+            source: 'catalog',
+            status,
+            gender: payload.gender,
+            personName: row.personName,
+            categorySlug: row.categorySlug,
+            garmentName: row.garmentName,
+            jobId: job?.jobId,
+            inputs,
+            outputs: job?.imageUrl ? [{ label: 'Output', imageUrl: job.imageUrl }] : undefined,
+            error: job?.error,
+            startedBy: session!.username,
+            retryPayload: row.retryPayload, // carried forward — a retry can itself be retried again
+            durationMs: Date.now() - startedAt,
+          });
+          json(res, 200, { id: newId, status, error: job?.error });
+          return;
+        }
+
+        json(res, 400, { error: { code: 'VALIDATION', message: `Unknown source '${row.source}'.` } });
+      } catch (err) {
+        if (err instanceof PropiclyApiError) {
+          propiclyErrorResponse(res, err);
+          return;
+        }
+        json(res, 502, {
+          error: {
+            code: err instanceof DevApiError ? err.code : 'RETRY_FAILED',
+            message: err instanceof Error ? err.message : String(err),
+          },
+        });
+      }
       return;
     }
 

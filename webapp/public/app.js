@@ -1912,6 +1912,13 @@ function dateToIso(value, isEndOfDay = false) {
 }
 let resultsPollHandle = null;
 
+// Job ids currently mid-retry — checked by retryBtnHtml on every render (not
+// just the one that fired the click) so the button stays disabled/"Retrying…"
+// even if loadResults' background poll (see the run-banner interval further
+// down) re-renders the whole table body while the retry's fetch is still in
+// flight. Cleared in handleRetryClick's finally block regardless of outcome.
+const retryingIds = new Set();
+
 // ---------- fullscreen lightbox ----------
 function openLightbox(url) {
   lightboxImgEl.src = url;
@@ -1946,9 +1953,42 @@ resultsTbodyEl.addEventListener('click', (e) => {
     openFlagModal(flagEl.dataset.flagBtn, flagEl.dataset.flagReason, flagEl.dataset.flagNote);
     return;
   }
+  const retryEl = e.target.closest('[data-retry-btn]');
+  if (retryEl && !retryEl.disabled) {
+    handleRetryClick(Number(retryEl.dataset.retryBtn));
+    return;
+  }
   const box = e.target.closest('.media-box');
   if (box?.dataset.full) openLightbox(box.dataset.full);
 });
+
+// Fires a failed/errored job right back through the same upstream API that
+// created it — see webapp/server.mts's POST /api/results/:id/retry for the
+// per-source (Try-On/RedChief/Catalog) details. This is the one point in the
+// Results page UI that spends real credits, so — per CLAUDE.md's "never
+// create jobs without going through the existing confirmation flow" — it's
+// gated on an explicit confirm() naming that cost, exactly like Upload's
+// Generate button and Catalog Batch's confirmed-total check.
+async function handleRetryClick(id) {
+  if (retryingIds.has(id)) return; // already in flight — the button should already be disabled, but don't double-fire on a stale click
+  if (!confirm('Retry this job? This resubmits it to the live API and spends real credits, same as the original run.')) return;
+  retryingIds.add(id);
+  loadResults(false); // re-render now so the button flips to "Retrying…" immediately, not just after the request resolves
+  try {
+    const res = await fetch(`/api/results/${id}/retry`, { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) {
+      alert(`Retry failed: ${data.error?.message || 'Unknown error'}`);
+    } else if (data.status !== 'COMPLETED') {
+      alert(`Retry ran but did not complete (status: ${data.status})${data.error ? `\n${data.error}` : ''}`);
+    }
+  } catch (err) {
+    alert(`Retry failed: ${err instanceof Error ? err.message : String(err)}`);
+  } finally {
+    retryingIds.delete(id);
+    loadResults(false); // pick up the new row (and its outcome) regardless of success/failure
+  }
+}
 
 function formatRunId(runId) {
   // runIds are ISO timestamps with : and . replaced by - (see run.mts / server.mts)
@@ -1995,6 +2035,20 @@ function formatDuration(durationMs) {
 
 const SOURCE_LABEL = { tryon: 'Try-On', redchief: 'RedChief', catalog: 'Catalog' };
 
+// Sits next to the status badge on FAILED/ERROR rows across all three
+// per-source row layouts — never shown on COMPLETED rows (nothing to retry).
+// `row.retryable` mirrors the server's own status !== 'COMPLETED' check (see
+// GET /api/results in server.mts) rather than re-deriving it here, so the two
+// never drift; the server re-validates per-source retryability for real (was
+// the original input ever persisted? is retry_payload present?) only when the
+// button is actually clicked, since that requires a DB lookup this list
+// response doesn't do per row.
+function retryBtnHtml(row) {
+  if (!row.retryable) return '';
+  const busy = retryingIds.has(row.id);
+  return `<button type="button" class="btn-secondary btn-small retry-btn" data-retry-btn="${row.id}" ${busy ? 'disabled' : ''}>${busy ? 'Retrying…' : 'Retry'}</button>`;
+}
+
 // A small labeled thumbnail for the RedChief table's Inputs/Output cells —
 // same click-to-lightbox/download behavior as mediaBoxHtml (delegated on
 // resultsTbodyEl, see wireResultsTable below), just laid out with its label
@@ -2031,7 +2085,7 @@ function redchiefResultRowHtml(row, position) {
       <td><div class="media-chip-row">${inputs.length ? inputs.map(mediaChipHtml).join('') : '<div class="thumb-missing">—</div>'}</div></td>
       <td><div class="media-chip-row">${outputs.length ? outputs.map(mediaChipHtml).join('') : '<div class="thumb-missing">—</div>'}</div></td>
       <td class="cell-when">${row.credits != null ? row.credits : '—'}</td>
-      <td><span class="badge ${statusClass}"${errTitle}>${statusLabel}</span></td>
+      <td><span class="badge ${statusClass}"${errTitle}>${statusLabel}</span> ${retryBtnHtml(row)}</td>
       <td class="cell-when">${when}</td>
       <td class="cell-flag">${flagCellHtml(row)}</td>
     </tr>`;
@@ -2046,10 +2100,12 @@ function redchiefResultRowHtml(row, position) {
  * intentionally not its own column here (not in the shared mockup) even
  * though it's captured in row.media when selected — can be added if needed.
  *
- * Credits is always "—": the aivastra dev API doesn't expose per-job catalog
- * credit cost anywhere (it's resolution-dependent and set by admin config —
- * see catalog.js's own submit-confirmation text) — no source in this repo to
- * show a real number instead of the mockup's placeholder-looking "10".
+ * Shows Duration instead of RedChief's flat Credits column: the aivastra dev
+ * API has no per-job catalog credit figure to read (it's resolution-dependent
+ * and set by admin config — see catalog.js's own submit-confirmation text),
+ * but wall-clock generate time is easy to measure server-side and more useful
+ * here anyway — see runCatalogAggregate/the retry route's catalog branch in
+ * server.mts for where durationMs is actually timed.
  */
 function catalogResultRowHtml(row, position) {
   const statusClass = row.status === 'COMPLETED' ? 'ok' : 'err';
@@ -2070,8 +2126,8 @@ function catalogResultRowHtml(row, position) {
       ${cell(byLabel('Background'))}
       ${cell(byLabel('Shoes'))}
       ${cell(output)}
-      <td class="cell-when">${row.credits != null ? row.credits : '—'}</td>
-      <td><span class="badge ${statusClass}"${errTitle}>${statusLabel}</span></td>
+      <td class="cell-when">${formatDuration(row.durationMs)}</td>
+      <td><span class="badge ${statusClass}"${errTitle}>${statusLabel}</span> ${retryBtnHtml(row)}</td>
       <td class="cell-when">${when}</td>
       <td class="cell-flag">${flagCellHtml(row)}</td>
     </tr>`;
@@ -2106,7 +2162,7 @@ function resultRowHtml(row, position) {
       </td>
       <td><span class="chip">${row.categorySlug}</span></td>
       <td>${mediaBoxHtml(row.outputThumb, 'output-thumb-box')}</td>
-      <td><span class="badge ${statusClass}"${errTitle}>${statusLabel}</span></td>
+      <td><span class="badge ${statusClass}"${errTitle}>${statusLabel}</span> ${retryBtnHtml(row)}</td>
       <td class="cell-when">${when}</td>
       <td class="cell-when">${duration}</td>
       <td class="cell-flag">${flagCellHtml(row)}</td>
