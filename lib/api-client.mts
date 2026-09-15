@@ -135,7 +135,18 @@ export interface CatalogPose extends CatalogAsset {
 }
 
 export interface CatalogOptions {
-  garmentTypes: { slug: string; label: string }[];
+  garmentTypes: {
+    slug: string;
+    label: string;
+    /** True when this garment type needs the caller's OWN 2nd/3rd piece photo
+     *  (kurta+pyjama, sherwani+pyjama, saree+dupatta, ...) rather than (or in
+     *  addition to) picking a curated lowerItems/shoeItems slug below — see
+     *  CatalogGenerateBody's lowerGarment/thirdGarment fields. */
+    requiresLowerUpload: boolean;
+    lowerUploadLabel: string | null;
+    requiresThirdUpload: boolean;
+    thirdUploadLabel: string | null;
+  }[];
   faces: CatalogAsset[];
   backgrounds: CatalogAsset[];
   poses: CatalogPose[];
@@ -171,6 +182,14 @@ export interface CatalogGenerateBody {
   garmentType?: string;
   lower?: string;
   shoe?: string;
+  /** Own-photo 2nd/3rd piece uploads for composite garment types — same
+   *  base64/data-URI shape as `garment`. Orthogonal to `lower`/`shoe`: those
+   *  pick an admin-curated asset by slug, these carry the caller's own photo
+   *  through. Only meaningful (and only enforced server-side) when the
+   *  selected garmentType's requiresLowerUpload/requiresThirdUpload is true —
+   *  see CatalogOptions.garmentTypes above. */
+  lowerGarment?: string;
+  thirdGarment?: string;
   aspectRatio: '1:1' | '2:3' | '3:4' | '4:5';
   resolution: 'HD' | '2K' | '4K';
 }

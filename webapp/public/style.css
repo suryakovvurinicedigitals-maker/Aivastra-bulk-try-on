@@ -2863,6 +2863,30 @@ select:focus, input:focus, textarea:focus, .dropzone:focus-within {
   margin-top: 14px;
 }
 
+/* Wraps a main garment tile with its lower/third own-photo upload tiles
+   (only rendered for garment types that require them — see
+   catalogGarmentCardHtml in catalog.js) so the group reads as one row item
+   inside .catalog-rows' flex-wrap layout rather than three unrelated tiles. */
+.catalog-garment-group {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.catalog-extra-badge {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  z-index: 2;
+  font-size: 0.65rem;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: var(--radius-sm, 4px);
+  background: var(--panel-alt);
+  color: var(--muted);
+  pointer-events: none;
+}
+
 .catalog-garment-card {
   position: relative;
   width: 140px;
