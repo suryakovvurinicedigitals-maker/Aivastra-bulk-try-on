@@ -4,10 +4,91 @@
  * on @aivastra/types, so response shapes here are hand-kept in sync with
  * packages/types/src/dev.ts rather than imported.
  */
+import http from 'node:http';
 
 export interface DevApiConfig {
   baseUrl: string;
   apiKey: string;
+}
+
+// Opt-in same-host shortcut for downloadAsset() below. The `imageUrl` a
+// completed job returns is a 900s-TTL presigned URL shaped like
+// `${baseUrl}/minio/<bucket>/<key>?X-Amz-...` — on the production VPS,
+// nginx's own "MinIO presigned URL pass-through" block (see
+// /etc/nginx/sites-enabled/app.aivastra.com.conf) just proxies that straight
+// through to a MinIO container already listening on 127.0.0.1:9000 on the
+// SAME box this tool now also runs on (confirmed 2026-09-15). Fetching the
+// public URL as-is means every result image leaves this machine, bounces
+// off Cloudflare, and comes straight back to a container a few inches away
+// — pure waste when colocated. Set LOCAL_MINIO_URL (e.g.
+// http://127.0.0.1:9000) to skip that round trip. Left unset (the default
+// for anyone running this tool anywhere else, e.g. a dev's laptop against
+// the same public API), behavior is completely unchanged — this stays a
+// pure external API client per CLAUDE.md.
+const LOCAL_MINIO_URL = process.env.LOCAL_MINIO_URL?.replace(/\/$/, '');
+const MINIO_PROXY_PATH_PREFIX = '/minio';
+
+// Presigned S3/MinIO URLs sign the `Host` header (see the query string's own
+// `X-Amz-SignedHeaders=host`) against whatever endpoint the backend used to
+// generate the URL — here that's the public host (app.aivastra.com), not
+// wherever we actually point the TCP connection. Confirmed live 2026-09-15:
+// a plain `fetch(localUrl)` sends `Host: 127.0.0.1:9000` (fetch/undici always
+// sets Host from the connection target and won't let a caller override it),
+// which MinIO rejected with 403 SignatureDoesNotMatch every time — the
+// shortcut silently never fired, it just added a failed round trip before
+// falling back. node:http.request has no such restriction, so we use it
+// here specifically to send the connection to LOCAL_MINIO_URL while keeping
+// the Host header MinIO actually signed against.
+function fetchWithHost(targetUrl: string, hostHeader: string): Promise<Response> {
+  return new Promise((resolve, reject) => {
+    const target = new URL(targetUrl);
+    const req = http.request(
+      {
+        hostname: target.hostname,
+        port: target.port || 80,
+        path: `${target.pathname}${target.search}`,
+        headers: { Host: hostHeader },
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (chunk) => chunks.push(chunk));
+        res.on('end', () => {
+          const headers = Object.entries(res.headers).flatMap(([k, v]) =>
+            v === undefined ? [] : (Array.isArray(v) ? v : [v]).map((value): [string, string] => [k, value]),
+          );
+          resolve(new Response(Buffer.concat(chunks), { status: res.statusCode ?? 502, statusText: res.statusMessage, headers }));
+        });
+      },
+    );
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+/**
+ * Fetches a job's result image, transparently preferring the same-host MinIO
+ * container over the public presigned URL when LOCAL_MINIO_URL is set and
+ * the URL matches the known pass-through shape. Any problem talking to the
+ * local URL (wrong path shape, container down, MinIO rejecting the
+ * signature) falls straight back to the real presigned URL — this is purely
+ * a network shortcut, never allowed to be the reason a real download fails.
+ */
+export async function downloadAsset(cfg: DevApiConfig, url: string): Promise<Response> {
+  if (LOCAL_MINIO_URL) {
+    try {
+      const parsed = new URL(url);
+      const base = new URL(cfg.baseUrl);
+      if (parsed.origin === base.origin && parsed.pathname.startsWith(`${MINIO_PROXY_PATH_PREFIX}/`)) {
+        const localUrl = `${LOCAL_MINIO_URL}${parsed.pathname.slice(MINIO_PROXY_PATH_PREFIX.length)}${parsed.search}`;
+        const localRes = await fetchWithHost(localUrl, base.host);
+        if (localRes.ok) return localRes;
+        localRes.body?.cancel();
+      }
+    } catch {
+      // Malformed URL, connection refused, etc. — fall through below.
+    }
+  }
+  return fetch(url);
 }
 
 /** Mirrors the `{ error: { code, message } }` shape every dev route throws (server.ts). */

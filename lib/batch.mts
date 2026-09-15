@@ -5,7 +5,7 @@
  */
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { createTryonJob, DevApiError, getJob, type DevApiConfig } from './api-client.mts';
+import { createTryonJob, DevApiError, downloadAsset, getJob, type DevApiConfig } from './api-client.mts';
 import { createLimiter } from './concurrency.mts';
 import { ensureRun, getRunRows, insertJobResult } from './db.mts';
 import type { TryonJobSpec } from './scan-input.mts';
@@ -94,7 +94,7 @@ export async function runOneJob(
     return { ...base(), jobId: created.jobId, status: 'FAILED', error: outcome.error };
   }
 
-  const imgRes = await fetch(outcome.imageUrl!);
+  const imgRes = await downloadAsset(cfg, outcome.imageUrl!);
   if (!imgRes.ok) {
     return { ...base(), jobId: created.jobId, status: 'ERROR', error: `failed to download result: HTTP ${imgRes.status}` };
   }
