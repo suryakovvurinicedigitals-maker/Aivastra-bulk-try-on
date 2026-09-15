@@ -777,6 +777,8 @@ function validateCatalogRunFields(input: {
   face: unknown;
   lower?: unknown;
   shoe?: unknown;
+  lowerGarment?: unknown;
+  thirdGarment?: unknown;
 }): { code: string; message: string } | null {
   if (typeof input.garment !== 'string' || input.garment.length === 0) {
     return { code: 'VALIDATION', message: 'garment must be a non-empty base64/data-URI string' };
@@ -789,6 +791,14 @@ function validateCatalogRunFields(input: {
   }
   if (input.shoe !== undefined && (typeof input.shoe !== 'string' || !CATALOG_SLUG_RE.test(input.shoe))) {
     return { code: 'VALIDATION', message: 'invalid shoe' };
+  }
+  // Own-photo 2nd/3rd piece uploads — same shape check as `garment` above,
+  // just optional (most garment types don't require either).
+  if (input.lowerGarment !== undefined && (typeof input.lowerGarment !== 'string' || input.lowerGarment.length === 0)) {
+    return { code: 'VALIDATION', message: 'lowerGarment must be a non-empty base64/data-URI string' };
+  }
+  if (input.thirdGarment !== undefined && (typeof input.thirdGarment !== 'string' || input.thirdGarment.length === 0)) {
+    return { code: 'VALIDATION', message: 'thirdGarment must be a non-empty base64/data-URI string' };
   }
   return null;
 }
@@ -945,6 +955,11 @@ async function runCatalogAggregate(cfg: DevApiConfig, run: CatalogAggregateRun, 
                 { label: 'Face', imageUrl: run.faceThumbnailUrl },
                 { label: 'Garment', dataUrl: base.garment },
               ];
+              // Own-photo 2nd/3rd piece uploads (composite garment types) —
+              // same base64/data-URI shape as `base.garment` above, only
+              // present when the tester actually attached one.
+              if (base.lowerGarment) inputs.push({ label: 'Lower Garment', dataUrl: base.lowerGarment });
+              if (base.thirdGarment) inputs.push({ label: 'Third Piece', dataUrl: base.thirdGarment });
               if (stub.poseThumbnailUrl) inputs.push({ label: 'Pose', imageUrl: stub.poseThumbnailUrl });
               if (stub.backgroundThumbnailUrl) inputs.push({ label: 'Background', imageUrl: stub.backgroundThumbnailUrl });
               if (run.shoeThumbnailUrl) inputs.push({ label: 'Shoes', imageUrl: run.shoeThumbnailUrl });
@@ -2574,6 +2589,12 @@ const server = http.createServer(async (req, res) => {
         garmentType,
         lower,
         shoe,
+        // Own-photo 2nd/3rd piece uploads for composite garment types — same
+        // base64/data-URI shape as `garment`, passed straight through to
+        // generateCatalog() via `base` below. Optional: absent for every
+        // garment type that doesn't require them.
+        lowerGarment,
+        thirdGarment,
         aspectRatio,
         resolution,
         garmentLabel,
@@ -2585,7 +2606,7 @@ const server = http.createServer(async (req, res) => {
         shoeLabel,
         shoeThumbnailUrl,
       } = parsed ?? {};
-      const runErr = validateCatalogRunFields({ garment, face, lower, shoe });
+      const runErr = validateCatalogRunFields({ garment, face, lower, shoe, lowerGarment, thirdGarment });
       if (runErr) {
         json(res, 400, { error: runErr });
         return;
@@ -2650,6 +2671,8 @@ const server = http.createServer(async (req, res) => {
         garmentType: garmentType || undefined,
         lower: lower || undefined,
         shoe: shoe || undefined,
+        lowerGarment: (lowerGarment as string) || undefined,
+        thirdGarment: (thirdGarment as string) || undefined,
         aspectRatio: aspectRatio as CatalogGenerateBody['aspectRatio'],
         resolution: resolution as CatalogGenerateBody['resolution'],
       };
@@ -2749,7 +2772,17 @@ const server = http.createServer(async (req, res) => {
             json(res, 400, { error: { code: 'VALIDATION', message: `garment ${g.garmentId} has a run missing runId` } });
             return;
           }
-          const runErr = validateCatalogRunFields({ garment: g.garmentDataUrl, face: r.face, lower: r.lower, shoe: r.shoe });
+          const runErr = validateCatalogRunFields({
+            garment: g.garmentDataUrl,
+            face: r.face,
+            lower: r.lower,
+            shoe: r.shoe,
+            // Per-garment-card, not per-run — the tester's own 2nd/3rd piece
+            // photo is one upload per garment, reused across every run of
+            // that same garment (mirrors garmentDataUrl itself).
+            lowerGarment: g.lowerGarmentDataUrl,
+            thirdGarment: g.thirdGarmentDataUrl,
+          });
           if (runErr) {
             json(res, 400, { error: { code: runErr.code, message: `garment ${g.garmentId} run ${r.runId}: ${runErr.message}` } });
             return;
@@ -2789,6 +2822,8 @@ const server = http.createServer(async (req, res) => {
             garmentType: garmentType || undefined,
             lower: r.lower || undefined,
             shoe: r.shoe || undefined,
+            lowerGarment: g.lowerGarmentDataUrl || undefined,
+            thirdGarment: g.thirdGarmentDataUrl || undefined,
             aspectRatio: aspectRatio as CatalogGenerateBody['aspectRatio'],
             resolution: resolution as CatalogGenerateBody['resolution'],
           };

@@ -321,6 +321,16 @@ function catalogNewGarment(file) {
     label: file ? catalogFileNameToLabel(file) : `Garment ${++catalogRowCounter}`,
     file: file ?? null,
     previewUrl: file ? URL.createObjectURL(file) : null,
+    // Own-photo 2nd/3rd piece uploads for composite garment types (kurta+
+    // pyjama, sherwani+pyjama, saree+dupatta, ...) — only ever populated (and
+    // only ever shown, see catalogGarmentCardHtml) when the currently
+    // selected garmentType's requiresLowerUpload/requiresThirdUpload is true.
+    // One per garment card, reused across every (face, lower, shoe) run of
+    // that same garment — mirrors `file` above, not per-run.
+    lowerFile: null,
+    lowerPreviewUrl: null,
+    thirdFile: null,
+    thirdPreviewUrl: null,
     status: 'idle', // idle | submitting | RUNNING | COMPLETED | FAILED | PARTIAL
     runs: [], // one per (face, lower, shoe) combination: [{id, face, lower, shoe, runLabel, catalogueId, jobs, status, error, pollTimer, pollToken}]
     error: null, // garment-level error (e.g. couldn't even read the file before fanning out to runs)
@@ -367,6 +377,27 @@ function clearCatalogGarmentFile(garmentId) {
   const garment = catalogFindGarment(garmentId);
   garment.file = null;
   garment.previewUrl = null;
+  renderCatalog();
+}
+
+/** `slot` is 'lower' | 'third' — the two optional own-photo upload slots a
+ *  garment card can grow, gated by the selected garmentType's
+ *  requiresLowerUpload/requiresThirdUpload (see catalogGarmentCardHtml). Kept
+ *  as one pair of functions rather than four near-duplicates of
+ *  setCatalogGarmentFile/clearCatalogGarmentFile above. */
+function setCatalogGarmentExtraFile(garmentId, slot, file) {
+  const garment = catalogFindGarment(garmentId);
+  if (!garment) return;
+  garment[`${slot}File`] = file;
+  garment[`${slot}PreviewUrl`] = URL.createObjectURL(file);
+  renderCatalog();
+}
+
+function clearCatalogGarmentExtraFile(garmentId, slot) {
+  const garment = catalogFindGarment(garmentId);
+  if (!garment) return;
+  garment[`${slot}File`] = null;
+  garment[`${slot}PreviewUrl`] = null;
   renderCatalog();
 }
 
@@ -642,7 +673,17 @@ function catalogBackgroundUploadControlHtml() {
     ${status ? `<p class="status ${statusClass} catalog-asset-folder-status">${catalogEscapeHtml(status.message)}</p>` : ''}`;
 }
 
-function catalogGarmentCardHtml(garment) {
+/** The currently-selected garmentType's full options-list entry (carrying
+ *  requiresLowerUpload/requiresThirdUpload), or null when "— any —" is
+ *  selected or options haven't loaded yet. Read fresh on every render rather
+ *  than cached, since it depends on both catalogBatch.garmentType and
+ *  catalogBatch.options, either of which can change independently. */
+function catalogSelectedGarmentTypeMeta() {
+  if (!catalogBatch.options || !catalogBatch.garmentType) return null;
+  return catalogBatch.options.garmentTypes.find((t) => t.slug === catalogBatch.garmentType) ?? null;
+}
+
+function catalogGarmentMainCardHtml(garment) {
   const invalid = garment.status === 'idle' && !garment.file;
   if (garment.previewUrl) {
     return `
@@ -674,8 +715,71 @@ function catalogGarmentCardHtml(garment) {
     </div>`;
 }
 
+/** `slot` is 'lower' | 'third' — a garment card's optional 2nd/3rd own-photo
+ *  upload, shown only when the selected garmentType requires it (see
+ *  catalogGarmentCardHtml). Same visual language as the main card
+ *  (catalogGarmentMainCardHtml) but never removes the whole garment: its
+ *  remove button (wired in wireCatalogGarmentEvents, keyed off data-slot)
+ *  just clears this one slot, and `label` (falling back to a generic default
+ *  when the admin hasn't set a custom upload label) doubles as both the
+ *  empty-state prompt and the filled-state badge, since two upload tiles
+ *  with no distinguishing text would otherwise look identical. */
+function catalogGarmentExtraCardHtml(garment, slot, label) {
+  const file = garment[`${slot}File`];
+  const previewUrl = garment[`${slot}PreviewUrl`];
+  if (previewUrl) {
+    return `
+      <div class="catalog-garment-card upload-thumb" data-row="${garment.id}" data-slot="${slot}">
+        <span class="catalog-extra-badge">${catalogEscapeHtml(label)}</span>
+        <img src="${previewUrl}" alt="${catalogEscapeHtml(label)}" title="${catalogEscapeHtml(label)}" />
+        <button type="button" class="thumb-remove catalog-garment-remove" title="Remove" aria-label="Remove">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="18" y1="6" x2="6" y2="18"/>
+            <line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>`;
+  }
+  const invalid = garment.status === 'idle' && !file;
+  return `
+    <div class="catalog-garment-card upload-thumb catalog-garment-empty dropzone redchief-dropzone${invalid ? ' invalid' : ''}" data-row="${garment.id}" data-slot="${slot}" tabindex="0" title="Click or drop photo">
+      <input type="file" class="catalog-garment-input" accept="image/*" hidden />
+      <div class="catalog-empty-placeholder">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+        </svg>
+        <span>${catalogEscapeHtml(label)}</span>
+      </div>
+    </div>`;
+}
+
+/** One garment "row" — the main upload tile, plus (only when the selected
+ *  garmentType requires them) its lower/third own-photo upload tiles grouped
+ *  right next to it. Falls back to a bare main-card-only render (no wrapper)
+ *  for every garment type that doesn't need an extra upload, which is most
+ *  of them — keeps the DOM identical to before this feature for that common
+ *  case. */
+function catalogGarmentCardHtml(garment) {
+  const meta = catalogSelectedGarmentTypeMeta();
+  const extras = [];
+  if (meta?.requiresLowerUpload) {
+    extras.push(catalogGarmentExtraCardHtml(garment, 'lower', meta.lowerUploadLabel || 'Add bottom photo'));
+  }
+  if (meta?.requiresThirdUpload) {
+    extras.push(catalogGarmentExtraCardHtml(garment, 'third', meta.thirdUploadLabel || 'Add third piece'));
+  }
+  if (extras.length === 0) return catalogGarmentMainCardHtml(garment);
+  return `<div class="catalog-garment-group">${catalogGarmentMainCardHtml(garment)}${extras.join('')}</div>`;
+}
+
 function catalogSubmittableGarments() {
-  return catalogGarments.filter((g) => g.status === 'idle' && g.file);
+  const meta = catalogSelectedGarmentTypeMeta();
+  return catalogGarments.filter((g) => {
+    if (g.status !== 'idle' || !g.file) return false;
+    if (meta?.requiresLowerUpload && !g.lowerFile) return false;
+    if (meta?.requiresThirdUpload && !g.thirdFile) return false;
+    return true;
+  });
 }
 
 function updateCatalogSubmitEnabled() {
@@ -976,18 +1080,36 @@ function wireCatalogGarmentEvents() {
     const garmentId = card.dataset.row;
     const garment = catalogFindGarment(garmentId);
     if (!garment) continue;
+    // Set only on a lower/third extra upload tile (catalogGarmentExtraCardHtml);
+    // absent on the main garment tile — see catalogGarmentCardHtml.
+    const slot = card.dataset.slot;
 
     const removeBtn = card.querySelector('.catalog-garment-remove');
     if (removeBtn) {
       removeBtn.addEventListener('click', (e) => {
         e.stopPropagation();
-        removeCatalogGarment(garmentId);
+        // An extra tile's remove button only clears that one slot; the main
+        // tile's removes the whole garment row (existing behavior).
+        if (slot) clearCatalogGarmentExtraFile(garmentId, slot);
+        else removeCatalogGarment(garmentId);
       });
     }
 
-    const dz = card.querySelector('.catalog-garment-empty');
+    // The empty-state template puts the 'catalog-garment-empty' class on
+    // `card` itself (both the main tile and the lower/third extra tiles) —
+    // querySelector only matches descendants, never the element it's called
+    // on, so `card.querySelector(...)` here always returned null and the
+    // click/drop handlers never attached. Went unnoticed for the main tile
+    // because garments normally arrive pre-filled from the bulk dropzone
+    // above (its empty branch is rarely rendered); the new lower/third tiles
+    // start out empty every time, so they hit this dead path immediately.
+    const dz = card.classList.contains('catalog-garment-empty') ? card : null;
     if (dz) {
       const input = card.querySelector('.catalog-garment-input');
+      const applyFile = (file) => {
+        if (slot) setCatalogGarmentExtraFile(garmentId, slot, file);
+        else setCatalogGarmentFile(garmentId, file);
+      };
       dz.addEventListener('click', (e) => {
         if (e.target.closest('.catalog-garment-remove')) return;
         if (e.target.tagName === 'INPUT') return;
@@ -1000,11 +1122,11 @@ function wireCatalogGarmentEvents() {
       dz.addEventListener('drop', (e) => {
         e.preventDefault();
         const file = e.dataTransfer.files[0];
-        if (file) setCatalogGarmentFile(garmentId, file);
+        if (file) applyFile(file);
       });
       input.addEventListener('change', () => {
         const file = input.files[0];
-        if (file) setCatalogGarmentFile(garmentId, file);
+        if (file) applyFile(file);
         input.value = '';
       });
     }
@@ -1037,7 +1159,21 @@ catalogSubmitBtn.addEventListener('click', () => {
   const scaleNote = totalJobs > 200
     ? ` This is a large batch — at the current concurrency limit it will take a while to fully process; the queue banner will show live progress and can be paused/resumed.`
     : '';
+  // Lower Garments is always an optional multi-select (see catalogBatch.lowers'
+  // own comment) — nothing else in this UI stops a tester from picking a
+  // composite garmentType (kurta-pyjama, sherwani-pyjama, co-ord-set, ...)
+  // and forgetting the second piece, silently generating a top-only look. The
+  // options fetch is already scoped to the current gender+garmentType (see
+  // fetchCatalogOptionsCached), so an empty catalogBatch.lowers here with a
+  // non-empty lowerItems pool is exactly that oversight, not a garmentType
+  // that genuinely has no lower (e.g. anarkali/co-ord-set with zero
+  // lowerItems configured — those get no warning since there's nothing to pick).
+  const lowerAvailable = (catalogBatch.options?.lowerItems?.length ?? 0) > 0;
+  const lowerWarning = lowerAvailable && catalogBatch.lowers.size === 0
+    ? `⚠ No Lower Garment is selected, even though lower-garment options exist for this garment type — the result will only show the uploaded piece with no bottom. `
+    : '';
   catalogSubmitConfirmTextEl.textContent =
+    lowerWarning +
     `This will submit ${totalCombinations} combination${totalCombinations === 1 ? '' : 's'} across ${submittable.length} garment${submittable.length === 1 ? '' : 's'} ` +
     `(${totalJobs} job${totalJobs === 1 ? '' : 's'} total, ${jobsPerRun} pose×background pair${jobsPerRun === 1 ? '' : 's'} each) against PRODUCTION. ` +
     `Exact credit cost per job depends on the selected resolution and is set by admin config (not shown here).${scaleNote} This can't be undone. Continue?`;
@@ -1077,8 +1213,21 @@ async function submitCatalogGarments() {
   for (const garment of submittable) garment.status = 'submitting';
   renderCatalog();
 
-  const reads = await Promise.allSettled(submittable.map((garment) => catalogFileToDataUrl(garment.file)));
-  const included = []; // [{garment, garmentDataUrl}] — only garments whose file actually read
+  // Reads the main photo plus whichever of lowerFile/thirdFile this garment
+  // card actually has (catalogSubmittableGarments already enforced they're
+  // present when the selected garmentType requires them) — one
+  // Promise.all per garment so a failure on ANY of its photos fails the
+  // whole garment rather than silently submitting with a piece missing.
+  const reads = await Promise.allSettled(
+    submittable.map((garment) =>
+      Promise.all([
+        catalogFileToDataUrl(garment.file),
+        garment.lowerFile ? catalogFileToDataUrl(garment.lowerFile) : Promise.resolve(undefined),
+        garment.thirdFile ? catalogFileToDataUrl(garment.thirdFile) : Promise.resolve(undefined),
+      ]),
+    ),
+  );
+  const included = []; // [{garment, garmentDataUrl, lowerGarmentDataUrl, thirdGarmentDataUrl}] — only garments whose files actually read
   for (let i = 0; i < submittable.length; i++) {
     const garment = submittable[i];
     const read = reads[i];
@@ -1087,6 +1236,7 @@ async function submitCatalogGarments() {
       garment.error = read.reason instanceof Error ? read.reason.message : String(read.reason);
       continue;
     }
+    const [garmentDataUrl, lowerGarmentDataUrl, thirdGarmentDataUrl] = read.value;
     garment.runs = templates.map((t) => ({
       id: catalogUid('run'),
       ...t,
@@ -1098,7 +1248,7 @@ async function submitCatalogGarments() {
       pollToken: 0,
     }));
     garment.error = null;
-    included.push({ garment, garmentDataUrl: read.value });
+    included.push({ garment, garmentDataUrl, lowerGarmentDataUrl, thirdGarmentDataUrl });
   }
   renderCatalog();
   if (included.length === 0) return; // every file failed to read locally — nothing to send
@@ -1125,9 +1275,15 @@ async function submitCatalogGarments() {
           poseThumbnailUrl: catalogBatch.options?.poses.find((p) => p.slug === l.pose)?.thumbnailUrl,
           backgroundThumbnailUrl: catalogAssetListForKind('background').find((b) => b.slug === l.background)?.thumbnailUrl,
         })),
-        garments: included.map(({ garment, garmentDataUrl }) => ({
+        garments: included.map(({ garment, garmentDataUrl, lowerGarmentDataUrl, thirdGarmentDataUrl }) => ({
           garmentId: garment.id,
           garmentDataUrl,
+          // Own-photo 2nd/3rd piece uploads — one per garment card, reused
+          // across every run of that garment (see webapp/server.mts's
+          // /api/catalog/batch/start handler). undefined when this
+          // garmentType doesn't require them.
+          lowerGarmentDataUrl,
+          thirdGarmentDataUrl,
           garmentLabel: garment.label,
           runs: garment.runs.map((run) => ({
             runId: run.id,
