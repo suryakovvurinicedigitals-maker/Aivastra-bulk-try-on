@@ -582,7 +582,9 @@ async function pollPropiclyJobToTerminal(cfgP: PropiclyApiConfig, jobId: string)
   const deadline = Date.now() + POLL_TIMEOUT_MS;
   for (;;) {
     const job = await getPropiclyJob(cfgP, jobId);
-    if (job.status === 'COMPLETED' || job.status === 'FAILED') return job;
+    if (job.status === 'COMPLETED' || job.status === 'FAILED') {
+      return { status: job.status, imageUrl: job.imageUrl, imageUrls: job.imageUrls, error: job.error };
+    }
     if (Date.now() > deadline) return { status: 'FAILED', error: 'poll timeout' };
     await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
   }
@@ -893,6 +895,13 @@ function registerCatalogAggregateRun(fields: {
 let catalogActiveLooks = 0;
 
 async function runCatalogAggregate(cfg: DevApiConfig, run: CatalogAggregateRun, base: Omit<CatalogGenerateBody, 'looks'>): Promise<void> {
+  // Lengths only, never the base64 payload itself — just enough to confirm
+  // from the server console whether a composite garmentType's own-photo
+  // lower/third upload actually made it into the request this tool sends
+  // upstream, since that's otherwise invisible once it leaves this process.
+  console.log(
+    `[catalog] run starting at job ${run.jobs[0]?.jobId ?? '?'}: lowerGarment=${base.lowerGarment ? `${base.lowerGarment.length}b` : 'absent'} thirdGarment=${base.thirdGarment ? `${base.thirdGarment.length}b` : 'absent'}`,
+  );
   await Promise.all(
     run.jobs.map((stub) =>
       catalogGenerateLimit(async () => {

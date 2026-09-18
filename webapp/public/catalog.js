@@ -753,6 +753,40 @@ function catalogGarmentExtraCardHtml(garment, slot, label) {
     </div>`;
 }
 
+/** Surfaces the actual backend error message(s) for a garment's failed/
+ *  partial runs — e.g. the upstream VALIDATION 400 a garment type's
+ *  requiresLowerUpload/requiresThirdUpload check can now return when the
+ *  resolved pose's workflow has no matching node (see the aivastra bug
+ *  report this was written for). Before this, a run.jobs[i].error the
+ *  server already captures (catalogueId poll response, GET
+ *  /api/catalog/catalogues/:id) was tracked in memory but never rendered
+ *  anywhere in this tab — a failure only ever showed up as a number in the
+ *  whole-batch banner's "N failed" count, so an actionable, specific
+ *  message like this one was effectively swallowed. Dedupes identical
+ *  messages across a garment's runs/looks rather than repeating the same
+ *  line once per (pose, background) job. */
+function catalogGarmentErrorSummaryHtml(garment) {
+  if (garment.runs.length === 0) return '';
+  const messages = new Set();
+  for (const run of garment.runs) {
+    if (run.status !== 'FAILED' && run.status !== 'PARTIAL') continue;
+    let anyJobError = false;
+    for (const job of run.jobs) {
+      if (job.status === 'FAILED' && job.error) {
+        messages.add(job.error);
+        anyJobError = true;
+      }
+    }
+    // Falls back to the run's own error (e.g. a poll failure, or the batch
+    // start request itself failing) only when no individual job carried
+    // one — the per-job error is always the more specific one when present.
+    if (!anyJobError && run.error) messages.add(run.error);
+  }
+  if (messages.size === 0) return '';
+  const items = [...messages].map((m) => `<li>${catalogEscapeHtml(m)}</li>`).join('');
+  return `<div class="status err catalog-garment-error"><b>${messages.size === 1 ? 'Generation failed:' : 'Some generations failed:'}</b><ul>${items}</ul></div>`;
+}
+
 /** One garment "row" — the main upload tile, plus (only when the selected
  *  garmentType requires them) its lower/third own-photo upload tiles grouped
  *  right next to it. Falls back to a bare main-card-only render (no wrapper)
@@ -768,8 +802,8 @@ function catalogGarmentCardHtml(garment) {
   if (meta?.requiresThirdUpload) {
     extras.push(catalogGarmentExtraCardHtml(garment, 'third', meta.thirdUploadLabel || 'Add third piece'));
   }
-  if (extras.length === 0) return catalogGarmentMainCardHtml(garment);
-  return `<div class="catalog-garment-group">${catalogGarmentMainCardHtml(garment)}${extras.join('')}</div>`;
+  const tiles = extras.length === 0 ? catalogGarmentMainCardHtml(garment) : `<div class="catalog-garment-group">${catalogGarmentMainCardHtml(garment)}${extras.join('')}</div>`;
+  return tiles + catalogGarmentErrorSummaryHtml(garment);
 }
 
 function catalogSubmittableGarments() {
@@ -1168,7 +1202,13 @@ catalogSubmitBtn.addEventListener('click', () => {
   // non-empty lowerItems pool is exactly that oversight, not a garmentType
   // that genuinely has no lower (e.g. anarkali/co-ord-set with zero
   // lowerItems configured — those get no warning since there's nothing to pick).
-  const lowerAvailable = (catalogBatch.options?.lowerItems?.length ?? 0) > 0;
+  // EXCEPT when this garmentType's bottom comes from the tester's own-photo
+  // upload instead (requiresLowerUpload — see catalogGarmentCardHtml):
+  // catalogSubmittableGarments() already refused to submit without that
+  // photo, so "no bottom" would be false here — the curated Lower Garments
+  // picker is simply not how this garmentType's bottom gets supplied.
+  const meta = catalogSelectedGarmentTypeMeta();
+  const lowerAvailable = !meta?.requiresLowerUpload && (catalogBatch.options?.lowerItems?.length ?? 0) > 0;
   const lowerWarning = lowerAvailable && catalogBatch.lowers.size === 0
     ? `⚠ No Lower Garment is selected, even though lower-garment options exist for this garment type — the result will only show the uploaded piece with no bottom. `
     : '';
