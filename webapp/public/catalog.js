@@ -1212,8 +1212,21 @@ catalogSubmitBtn.addEventListener('click', () => {
   const lowerWarning = lowerAvailable && catalogBatch.lowers.size === 0
     ? `⚠ No Lower Garment is selected, even though lower-garment options exist for this garment type — the result will only show the uploaded piece with no bottom. `
     : '';
+  // Unlike Lower Garment above (a soft "will look incomplete" case), a pose
+  // with hasShoes:true has NO valid way to succeed without a shoe slug —
+  // resolveTryonPlan hard-rejects it server-side (see catalog-options/
+  // build.ts's own doc comment on hasShoes) regardless of garment type.
+  // catalogBatch.shoes is one flat axis applied to every selected pose in a
+  // run, so mixing "poses that need shoes" with "poses that don't" while
+  // leaving Shoes unselected silently fails only the ones that needed it —
+  // exactly the "full pose" (full-body) jobs failing while others succeed.
+  const posesNeedingShoes = (catalogBatch.options?.poses ?? []).filter((p) => catalogBatch.poses.has(p.slug) && p.hasShoes);
+  const shoeWarning = posesNeedingShoes.length > 0 && catalogBatch.shoes.size === 0
+    ? `⚠ No Shoes selected, but ${posesNeedingShoes.length} selected pose${posesNeedingShoes.length === 1 ? '' : 's'} (${posesNeedingShoes.map((p) => p.label).join(', ')}) require${posesNeedingShoes.length === 1 ? 's' : ''} one — ${posesNeedingShoes.length === 1 ? 'that job' : 'those jobs'} will fail outright ("shoe catalog item required for this pose") instead of generating; every other selected pose is unaffected. `
+    : '';
   catalogSubmitConfirmTextEl.textContent =
     lowerWarning +
+    shoeWarning +
     `This will submit ${totalCombinations} combination${totalCombinations === 1 ? '' : 's'} across ${submittable.length} garment${submittable.length === 1 ? '' : 's'} ` +
     `(${totalJobs} job${totalJobs === 1 ? '' : 's'} total, ${jobsPerRun} pose×background pair${jobsPerRun === 1 ? '' : 's'} each) against PRODUCTION. ` +
     `Exact credit cost per job depends on the selected resolution and is set by admin config (not shown here).${scaleNote} This can't be undone. Continue?`;
@@ -1521,10 +1534,21 @@ function renderCatalogBatchBanner(status) {
     return;
   }
   catalogRunBannerEl.hidden = false;
-  const runningLine = running
-    ? `<div class="run-banner-item in-progress"><span class="run-spinner"></span><span>Batch in progress: <b>${status.completed + status.failed} / ${status.total}</b> (${status.completed} completed${status.failed ? `, ${status.failed} failed` : ''})</span></div>`
-    : '';
   const canManage = currentUser?.role === 'superadmin';
+  let runningLine = '';
+  if (running) {
+    // Cancel only, deliberately no Pause here — a batch's first
+    // CATALOG_CONCURRENCY looks acquire their limiter slots synchronously
+    // the instant it starts, before this banner has even rendered once, so
+    // a pause button on an already-running batch couldn't actually stop
+    // anything a user would expect it to. /api/catalog/batch/cancel marks
+    // every not-yet-started look "Cancelled by user" instead of running it
+    // — already-dispatched ones still finish (see runCatalogAggregate's own
+    // comment in server.mts). Queued-but-not-started batches below still
+    // get real Pause.
+    const cancelBtn = canManage ? ` <button type="button" class="link-btn danger" id="catalog-cancel-btn">Cancel</button>` : '';
+    runningLine = `<div class="run-banner-item in-progress"><span class="run-spinner"></span><span>Batch in progress: <b>${status.completed + status.failed} / ${status.total}</b> (${status.completed} completed${status.failed ? `, ${status.failed} failed` : ''})</span>${cancelBtn}</div>`;
+  }
   const queuedLines = queuedList
     .map((q, i) => {
       const badge = `<span class="queue-badge">#${i + 1}</span>`;
@@ -1552,7 +1576,14 @@ catalogRunBannerEl?.addEventListener('click', (e) => {
   if (pauseBtn) return pauseCatalogQueuedBatch(pauseBtn.dataset.pauseCatalogQueueId);
   const resumeBtn = e.target.closest('[data-resume-catalog-queue-id]');
   if (resumeBtn) return resumeCatalogQueuedBatch(resumeBtn.dataset.resumeCatalogQueueId);
+  if (e.target.closest('#catalog-cancel-btn')) return cancelActiveCatalogBatch();
 });
+
+async function cancelActiveCatalogBatch() {
+  if (!confirm('Cancel the in-progress batch? Looks already dispatched will still finish; everything not yet started will be marked cancelled.')) return;
+  await fetch('/api/catalog/batch/cancel', { method: 'POST' });
+  await catalogPollBatchStatus();
+}
 
 async function cancelCatalogQueuedBatch(id) {
   if (!confirm('Cancel this queued batch? It will not start automatically.')) return;

@@ -4,6 +4,7 @@
 // only the client-side UI: one card per product ("row"), each with its own
 // independent job lifecycle (submit -> poll -> complete/fail, or cancel).
 
+const redchiefRunBannerEl = document.getElementById('redchief-run-banner');
 const redchiefConfigLoadingEl = document.getElementById('redchief-config-loading');
 const redchiefConfigErrorEl = document.getElementById('redchief-config-error');
 const redchiefConfigBodyEl = document.getElementById('redchief-config-body');
@@ -265,7 +266,56 @@ function renderRedchiefRows() {
   redchiefFooterBarEl.hidden = redchiefRows.length === 0;
   if (redchiefRows.length > 0) redchiefRowCountEl.textContent = `${redchiefRows.length} row${redchiefRows.length === 1 ? '' : 's'}`;
   updateRedchiefSubmitEnabled();
+  // Piggybacked rather than called from every submission-path site
+  // individually — row.status mutations (submitting/QUEUED/RUNNING/
+  // COMPLETED/FAILED) always go through a renderRedchiefRows() call already,
+  // so this is the one place guaranteed to see every state change.
+  renderRedchiefRunBanner();
 }
+
+// ---------- whole-batch pause/cancel banner — entirely client-side, unlike
+// Catalog/Try-On's server-tracked batches, since RedChief has no server-side
+// batch grouping at all: redchiefSubmitLimit (a client-side concurrency
+// limiter) is the only thing gating how many rows are in flight at once, so
+// pause/cancel just has to reach into that same client-side loop. ----------
+
+let redchiefBatchControl = null; // { cancelled, rowIds: Set } while a submitted batch is still in flight; null otherwise
+
+function renderRedchiefRunBanner() {
+  if (!redchiefBatchControl) {
+    redchiefRunBannerEl.hidden = true;
+    redchiefRunBannerEl.innerHTML = '';
+    return;
+  }
+  const rows = redchiefRows.filter((r) => redchiefBatchControl.rowIds.has(r.id));
+  const completed = rows.filter((r) => r.status === 'COMPLETED').length;
+  const failed = rows.filter((r) => r.status === 'FAILED').length;
+  const total = rows.length;
+  if (total === 0 || completed + failed >= total) {
+    redchiefBatchControl = null;
+    redchiefRunBannerEl.hidden = true;
+    redchiefRunBannerEl.innerHTML = '';
+    return;
+  }
+  redchiefRunBannerEl.hidden = false;
+  const canManage = currentUser?.role === 'superadmin';
+  // Cancel only, deliberately no Pause — RedChief has no separate "queued"
+  // state at all (every row goes straight into the same client-side
+  // concurrency limiter), and the first redchiefSubmitLimit slots are
+  // already claimed synchronously the instant Submit is clicked, before
+  // this banner even renders once — same reasoning Catalog/Try-On's running
+  // batches follow for dropping their Pause button.
+  const cancelBtn = canManage ? ` <button type="button" class="link-btn danger" id="redchief-cancel-btn">Cancel</button>` : '';
+  redchiefRunBannerEl.innerHTML = `<div class="run-banner-item in-progress"><span class="run-spinner"></span><span>Batch in progress: <b>${completed + failed} / ${total}</b> (${completed} completed${failed ? `, ${failed} failed` : ''})</span>${cancelBtn}</div>`;
+}
+
+redchiefRunBannerEl?.addEventListener('click', (e) => {
+  if (e.target.closest('#redchief-cancel-btn')) {
+    if (!confirm('Cancel the in-progress batch? Jobs already submitted will still finish; everything not yet started will be marked cancelled.')) return;
+    if (redchiefBatchControl) redchiefBatchControl.cancelled = true;
+    renderRedchiefRunBanner();
+  }
+});
 
 function wireRedchiefRowEvents() {
   for (const card of redchiefRowsEl.querySelectorAll('.redchief-row-card')) {
@@ -609,10 +659,32 @@ function submitRedchiefRows() {
   // this distinguishes "waiting behind other rows in this tool's own local
   // queue" from "request actually in flight" for a large submission.
   for (const row of submittable) row.status = 'queued-local';
+  // A second Submit click while a batch is already in flight adds its rows
+  // to the SAME control object (and whatever cancelled state it's already
+  // in) rather than starting a fresh, separate one — there's only ever one
+  // client-side concurrency limiter (redchiefSubmitLimit) for all of
+  // RedChief, so there's really only ever one "batch" at a time here.
+  if (redchiefBatchControl) {
+    for (const row of submittable) redchiefBatchControl.rowIds.add(row.id);
+  } else {
+    redchiefBatchControl = { cancelled: false, rowIds: new Set(submittable.map((r) => r.id)) };
+  }
   renderRedchiefRows();
   Promise.allSettled(
     submittable.map((row) =>
-      redchiefSubmitLimit(() => {
+      redchiefSubmitLimit(async () => {
+        // Cancelling is terminal for whatever's left — marks the row FAILED
+        // instead of submitting it, same "Cancelled by user" treatment
+        // Catalog/Try-On give not-yet-started work. Can't interrupt a row
+        // already mid-flight (submitRedchiefRow's own create→poll cycle has
+        // no abort point).
+        if (redchiefBatchControl?.cancelled) {
+          row.status = 'FAILED';
+          row.error = 'Cancelled by user';
+          renderRedchiefRows();
+          recordRedchiefRowResult(row);
+          return;
+        }
         row.status = 'submitting';
         renderRedchiefRows();
         return submitRedchiefRow(row);

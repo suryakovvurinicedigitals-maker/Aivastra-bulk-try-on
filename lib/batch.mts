@@ -120,13 +120,34 @@ export function writeSummaryCsv(runDir: string, runId: string) {
   writeFileSync(path.join(runDir, 'summary.csv'), [header, ...body].join('\n') + '\n');
 }
 
+/** Mutable, shared-by-reference cancel switch for a running batch — the
+ *  caller (webapp/server.mts) holds onto the same object it passed in and
+ *  flips this from its cancel API route while runBatch's loop below is
+ *  still going. Deliberately cancel-only, no pause: a pause flag here could
+ *  only ever stop jobs that hadn't yet acquired a concurrency-limiter slot,
+ *  and since the first `concurrency` jobs acquire their slots synchronously
+ *  the instant the batch starts — before the UI has even shown anything to
+ *  click, let alone before a human can react — "pause" on an
+ *  already-running batch couldn't actually stop anything a user would
+ *  expect it to, so it was removed rather than ship a control that misleads
+ *  about what it does. (Queued-but-not-yet-started batches elsewhere in
+ *  this app still have real pause — that's a different, unstarted-batch
+ *  code path with no such race.) Cancelling is terminal: once true, every
+ *  job still waiting on the limiter is recorded FAILED/"Cancelled by user"
+ *  instead of run, and there's no way back from it for this run.
+ */
+export interface BatchControl {
+  cancelled: boolean;
+}
+
 export interface RunBatchOptions {
   concurrency: number;
   poll: PollOptions;
   onEvent?: (evt: { type: 'job'; result: JobResult } | { type: 'credits-exhausted' }) => void;
+  control?: BatchControl;
 }
 
-/** Resolves once every job has either finished or been skipped after credits ran out. */
+/** Resolves once every job has either finished, been skipped after credits ran out, or been cancelled. */
 export async function runBatch(
   cfg: DevApiConfig,
   jobs: TryonJobSpec[],
@@ -146,6 +167,22 @@ export async function runBatch(
   await Promise.all(
     jobs.map((job) =>
       limit(async () => {
+        if (opts.control?.cancelled) {
+          const result: JobResult = {
+            gender: job.gender,
+            personName: job.personName,
+            categorySlug: job.categorySlug,
+            garmentName: job.garmentName,
+            status: 'FAILED',
+            error: 'Cancelled by user',
+            finishedAt: new Date().toISOString(),
+            durationMs: 0,
+          };
+          insertJobResult(runId, result);
+          failed++;
+          opts.onEvent?.({ type: 'job', result });
+          return;
+        }
         if (creditsExhausted) return;
         const startedAt = Date.now();
         const result = await runOneJob(cfg, job, resultsDir, opts.poll, startedAt).catch(

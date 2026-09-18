@@ -1075,10 +1075,20 @@ function renderUploadRunBanner(run, running) {
     return;
   }
   uploadRunBannerEl.hidden = false;
-  const runningLine = running
-    ? `<div class="run-banner-item in-progress"><span class="run-spinner"></span><span>Run in progress: <b>${run.completed + run.failed} / ${run.total}</b> (${run.completed} completed${run.failed ? `, ${run.failed} failed` : ''})</span></div>`
-    : '';
   const canManage = currentUser?.role === 'superadmin';
+  let runningLine = '';
+  if (running) {
+    // Cancel only, deliberately no Pause here — a batch's first `concurrency`
+    // jobs acquire their limiter slots synchronously the instant it starts,
+    // before this banner has even rendered once, so a pause button on an
+    // already-running batch couldn't actually stop anything a user would
+    // expect it to. /api/run/cancel marks every not-yet-started job
+    // "Cancelled by user" instead of running it — already-dispatched ones
+    // still finish (see runBatch's own doc comment in lib/batch.mts).
+    // Queued-but-not-started batches below still get real Pause.
+    const cancelBtn = canManage ? ` <button type="button" class="link-btn danger" id="run-cancel-btn">Cancel</button>` : '';
+    runningLine = `<div class="run-banner-item in-progress"><span class="run-spinner"></span><span>Run in progress: <b>${run.completed + run.failed} / ${run.total}</b> (${run.completed} completed${run.failed ? `, ${run.failed} failed` : ''})</span>${cancelBtn}</div>`;
+  }
   const queuedLines = queuedList
     .map((q, i) => {
       const badge = `<span class="queue-badge">#${i + 1}</span>`;
@@ -1106,7 +1116,14 @@ uploadRunBannerEl.addEventListener('click', (e) => {
   if (pauseBtn) return pauseQueuedRun(pauseBtn.dataset.pauseQueueId);
   const resumeBtn = e.target.closest('[data-resume-queue-id]');
   if (resumeBtn) return resumeQueuedRun(resumeBtn.dataset.resumeQueueId);
+  if (e.target.closest('#run-cancel-btn')) return cancelActiveRun();
 });
+
+async function cancelActiveRun() {
+  if (!confirm('Cancel the in-progress run? Jobs already dispatched will still finish; everything not yet started will be marked cancelled.')) return;
+  await fetch('/api/run/cancel', { method: 'POST' });
+  await pollRunStatus();
+}
 
 async function cancelQueuedRun(id) {
   if (!confirm('Cancel this queued batch? It will not start automatically.')) return;
@@ -2077,9 +2094,13 @@ function retryBtnHtml(row) {
 // same click-to-lightbox/download behavior as mediaBoxHtml (delegated on
 // resultsTbodyEl, see wireResultsTable below), just laid out with its label
 // underneath instead of beside it, since a row can carry 1-6 of these.
-function mediaChipHtml(item) {
+// `hoverTitle`, when given, becomes a native browser tooltip on the chip
+// itself (e.g. the job id on Catalog's Output chip — see
+// catalogResultRowHtml) — kept out of the download button's own `title` so
+// the two tooltips never collide.
+function mediaChipHtml(item, hoverTitle) {
   return `
-    <div class="media-box media-chip" data-full="${item.thumb}">
+    <div class="media-box media-chip" data-full="${item.thumb}"${hoverTitle ? ` title="${escapeHtml(hoverTitle)}"` : ''}>
       <img src="${item.thumb}" loading="lazy" />
       <a class="dl-btn" href="${item.thumb}" download title="Download">⬇</a>
       <span class="media-chip-label">${item.label}</span>
@@ -2116,13 +2137,18 @@ function redchiefResultRowHtml(row, position) {
 }
 
 /**
- * Catalog's dedicated row layout: fixed Face/Garment/Pose/Background/Shoes
- * columns (each a single thumbnail, picked out of row.media by label — see
- * runCatalogAggregate's recordResult call in server.mts for where those
- * labels come from) instead of RedChief's flexible N-chip Inputs cell, since
- * Catalog's axes are fixed and always mean the same thing. Lower is
- * intentionally not its own column here (not in the shared mockup) even
- * though it's captured in row.media when selected — can be added if needed.
+ * Catalog's dedicated row layout: fixed Face/Garment/Lower Garment/Third
+ * Piece/Pose/Background/Shoes columns (each a single thumbnail, picked out
+ * of row.media by label — see runCatalogAggregate's recordResult call in
+ * server.mts for where those labels come from) instead of RedChief's
+ * flexible N-chip Inputs cell, since Catalog's axes are fixed and always
+ * mean the same thing. Lower Garment/Third Piece are the composite garment
+ * types' own-photo 2nd/3rd piece uploads (requiresLowerUpload/
+ * requiresThirdUpload) — server.mts has always recorded them into row.media
+ * when present, but this row layout never rendered them until now, so they
+ * silently never appeared even though the data was there. The admin-curated
+ * "Lower" catalog pick (a different axis — see catalogBatch.lowers) is still
+ * intentionally not its own column here, unlike these two.
  *
  * Shows Duration instead of RedChief's flat Credits column: the aivastra dev
  * API has no per-job catalog credit figure to read (it's resolution-dependent
@@ -2140,16 +2166,28 @@ function catalogResultRowHtml(row, position) {
   const byLabel = (label) => row.media.find((m) => m.kind === 'input' && m.label === label);
   const output = row.media.find((m) => m.kind === 'output');
   const cell = (item) => `<td>${item ? mediaChipHtml(item) : '<div class="thumb-missing">—</div>'}</td>`;
+  // Only the final-result chip gets a hover tooltip, and only the job id —
+  // that's the one piece of per-job identity this tool actually has. Which
+  // ComfyUI worker ran it and which workflow template it used are NOT
+  // exposed by the aivastra dev API's job/catalogue responses (checked
+  // directly against a live response: just jobId/status/imageUrl) — showing
+  // those would mean inventing data this tool has no source for, so they're
+  // left out rather than faked.
+  const outputCell = output
+    ? `<td>${mediaChipHtml(output, row.jobId ? `Job ID: ${row.jobId}` : undefined)}</td>`
+    : `<td><div class="thumb-missing">—</div></td>`;
   return `
     <tr${rowClass ? ` class="${rowClass}"` : ''}>
       <td class="cell-id">${row.id}<br /><span class="cell-position">#${position}</span></td>
       <td class="cell-when">${row.startedBy || '—'}</td>
       ${cell(byLabel('Face'))}
       ${cell(byLabel('Garment'))}
+      ${cell(byLabel('Lower Garment'))}
+      ${cell(byLabel('Third Piece'))}
       ${cell(byLabel('Pose'))}
       ${cell(byLabel('Background'))}
       ${cell(byLabel('Shoes'))}
-      ${cell(output)}
+      ${outputCell}
       <td class="cell-when">${formatDuration(row.durationMs)}</td>
       <td><span class="badge ${statusClass}"${errTitle}>${statusLabel}</span> ${retryBtnHtml(row)}</td>
       <td class="cell-when">${when}</td>
@@ -2278,7 +2316,24 @@ async function loadResults(resetPage) {
   fillSelectPreserving(filterCategoryEl, data.categories, resultsState.category, 'All categories');
   fillSelectPreserving(filterUserEl, data.users, resultsState.user, 'All users');
 
-  const colCount = resultsState.source === 'redchief' ? 8 : resultsState.source === 'catalog' ? 12 : 11;
+  // On the "All" tab (resultsState.source === '') the returned rows can be
+  // any mix of tryon/redchief/catalog, each rendered by resultRowHtml with a
+  // totally different column count/shape — but setActiveSourceTab only ever
+  // set the header once, from the clicked TAB, never from what actually came
+  // back. That left the generic 11-column header showing above 14-column
+  // catalog rows (or redchief's) any time "All" happened to be all one
+  // non-default source, misaligning every column. Explicit Try-On/RedChief/
+  // Catalog tab clicks are unaffected — those are already homogeneous by
+  // definition of the filter, so leave that header exactly as the tab set it.
+  const effectiveSource =
+    resultsState.source || (new Set(data.rows.map((r) => r.source)).size === 1 ? data.rows[0]?.source : undefined);
+  if (!resultsState.source) {
+    resultsTheadDefaultEl.hidden = effectiveSource === 'redchief' || effectiveSource === 'catalog';
+    resultsTheadRedchiefEl.hidden = effectiveSource !== 'redchief';
+    resultsTheadCatalogEl.hidden = effectiveSource !== 'catalog';
+  }
+
+  const colCount = effectiveSource === 'redchief' ? 8 : effectiveSource === 'catalog' ? 14 : 11;
   resultsTbodyEl.innerHTML =
     data.rows.length === 0
       ? `<tr><td colspan="${colCount}" class="empty">No results yet — run a batch from Upload, RedChief, or Catalog Batch.</td></tr>`

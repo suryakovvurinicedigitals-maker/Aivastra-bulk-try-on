@@ -38,7 +38,7 @@ import {
   type CatalogJobStatus,
   type DevApiConfig,
 } from '../lib/api-client.mts';
-import { runBatch, runOneJob } from '../lib/batch.mts';
+import { type BatchControl, runBatch, runOneJob } from '../lib/batch.mts';
 import { createLimiter } from '../lib/concurrency.mts';
 import { clearFlag, ensureRun, getFlag, getResultMedia, getResultRow, insertJobResult, listResults, resolveFlag, setFlag } from '../lib/db.mts';
 import { scanInput, type TryonJobSpec } from '../lib/scan-input.mts';
@@ -292,6 +292,13 @@ interface RunState {
   startedAt: string;
   finishedAt?: string;
   log: RunLogEntry[];
+  // Same object identity as what's handed to runBatch's opts.control — the
+  // cancel API route below mutates this in place while runBatch's loop is
+  // mid-flight, and /api/run/status reads it back out for the client's
+  // Cancel button on the RUNNING batch (separate from queuedRuns' own
+  // paused flag, which gates batches that haven't started yet — those keep
+  // real pause, see BatchControl's own doc comment for why this one doesn't).
+  control: BatchControl;
 }
 let currentRun: RunState | null = null;
 
@@ -894,7 +901,12 @@ function registerCatalogAggregateRun(fields: {
 // next one starting) without needing to inspect the DB or add a debug UI.
 let catalogActiveLooks = 0;
 
-async function runCatalogAggregate(cfg: DevApiConfig, run: CatalogAggregateRun, base: Omit<CatalogGenerateBody, 'looks'>): Promise<void> {
+async function runCatalogAggregate(
+  cfg: DevApiConfig,
+  run: CatalogAggregateRun,
+  base: Omit<CatalogGenerateBody, 'looks'>,
+  control?: BatchControl,
+): Promise<void> {
   // Lengths only, never the base64 payload itself — just enough to confirm
   // from the server console whether a composite garmentType's own-photo
   // lower/third upload actually made it into the request this tool sends
@@ -905,14 +917,26 @@ async function runCatalogAggregate(cfg: DevApiConfig, run: CatalogAggregateRun, 
   await Promise.all(
     run.jobs.map((stub) =>
       catalogGenerateLimit(async () => {
+        // Incremented unconditionally, right beside the finally block's
+        // unconditional decrement below — every path through this callback
+        // (including a cancelled-before-submit return) must balance the two,
+        // or catalogActiveLooks drifts (and can go negative) over time.
         catalogActiveLooks++;
-        console.log(`[catalog] submitting look ${stub.jobId} (${stub.pose} x ${stub.background}) — active=${catalogActiveLooks}/${CATALOG_CONCURRENCY}`);
-        // Measured from right before the actual upstream submit (not from
-        // when this look was queued behind catalogGenerateLimit/the whole
-        // batch) so Duration reflects generate-to-terminal time for THIS
-        // look, the same thing a tester watching one job would time by hand.
         const startedAt = Date.now();
         try {
+          // Cancelling is terminal — marks this look FAILED instead of
+          // submitting it, and still falls through to the finally block
+          // below so it gets persisted/counted exactly like a real failure
+          // would. Can't interrupt a look already mid-flight (same
+          // limitation runBatch's try-on equivalent has). Checked before
+          // logging "submitting" — a cancelled look was never actually
+          // submitted.
+          if (control?.cancelled) {
+            stub.status = 'FAILED';
+            stub.error = 'Cancelled by user';
+            return;
+          }
+          console.log(`[catalog] submitting look ${stub.jobId} (${stub.pose} x ${stub.background}) — active=${catalogActiveLooks}/${CATALOG_CONCURRENCY}`);
           const result = await generateCatalog(cfg, { ...base, looks: [{ pose: stub.pose, background: stub.background }] });
           const realJob = result.jobs[0];
           if (!realJob) throw new Error('upstream returned no job for this look');
@@ -1032,6 +1056,15 @@ interface CatalogBatchState {
   paused: boolean;
   garmentTypeLabel?: string; // for the queue banner's category chip
   runInputs: CatalogBatchRunInput[];
+  // Only meaningful once this batch is actually RUNNING (see
+  // startCatalogBatch) — distinct from the `paused` flag above, which only
+  // ever gates a batch still waiting in catalogQueuedBatches (that one keeps
+  // real pause; a running batch only gets cancel — see BatchControl's own
+  // doc comment in lib/batch.mts for why). Threaded into every
+  // runCatalogAggregate call for this batch's runInputs so the
+  // cancel-the-active-batch API route can reach into an already-started
+  // batch's in-flight loop.
+  control: BatchControl;
 }
 let currentCatalogBatch: CatalogBatchState | null = null;
 let catalogQueuedBatches: CatalogBatchState[] = [];
@@ -1045,7 +1078,7 @@ let nextCatalogBatchId = 1;
 async function startCatalogBatch(batch: CatalogBatchState, batchCfg: DevApiConfig): Promise<void> {
   currentCatalogBatch = batch;
   batch.status = 'running';
-  await Promise.all(batch.runInputs.map(({ run, base }) => runCatalogAggregate(batchCfg, run, base)));
+  await Promise.all(batch.runInputs.map(({ run, base }) => runCatalogAggregate(batchCfg, run, base, batch.control)));
   batch.status = 'done';
   if (currentCatalogBatch?.id === batch.id) currentCatalogBatch = null;
   tryStartNextCatalogBatch();
@@ -1236,12 +1269,14 @@ function startRun(jobs: TryonJobSpec[], startedBy: string): { runId: string; tot
   mkdirSync(runDir, { recursive: true });
   ensureRun(runId, startedBy);
 
-  currentRun = { runId, status: 'running', total: jobs.length, completed: 0, failed: 0, startedAt: new Date().toISOString(), log: [] };
+  const control: BatchControl = { cancelled: false };
+  currentRun = { runId, status: 'running', total: jobs.length, completed: 0, failed: 0, startedAt: new Date().toISOString(), log: [], control };
   pushLog('info', `Starting ${jobs.length} job(s) against ${BASE_URL}.`);
 
   runBatch(cfg!, jobs, runId, runDir, {
     concurrency: CONCURRENCY,
     poll: { intervalMs: POLL_INTERVAL_MS, timeoutMs: POLL_TIMEOUT_MS },
+    control,
     onEvent: (evt) => {
       if (!currentRun || currentRun.runId !== runId) return;
       if (evt.type === 'credits-exhausted') {
@@ -1740,6 +1775,27 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // ---- Cancel the run that's ACTUALLY IN PROGRESS right now — distinct
+    // from /api/run/queue/:id/pause above, which only ever affects a batch
+    // still waiting its turn (that one keeps real pause; see BatchControl's
+    // doc comment in lib/batch.mts for why a running batch doesn't get one).
+    // Cancelling is terminal and marks every job still waiting on the
+    // limiter FAILED/"Cancelled by user" instead of running it.
+    if (req.method === 'POST' && url.pathname === '/api/run/cancel') {
+      if (session!.role !== 'superadmin') {
+        json(res, 403, { error: 'Super admin only.' });
+        return;
+      }
+      if (!currentRun || currentRun.status !== 'running') {
+        json(res, 404, { error: 'No run in progress.' });
+        return;
+      }
+      currentRun.control.cancelled = true;
+      pushLog('warn', `Cancelled by ${session!.username} — jobs not yet started will be marked cancelled; already-running ones finish.`);
+      json(res, 200, { cancelled: true });
+      return;
+    }
+
     if (req.method === 'GET' && url.pathname === '/api/run/status') {
       json(res, 200, {
         ...(currentRun ?? { status: 'idle' }),
@@ -1803,6 +1859,7 @@ const server = http.createServer(async (req, res) => {
         const files = findTryonInputFiles(r);
         return {
           id: r.id,
+          jobId: r.jobId ?? null,
           runId: r.runId,
           source: r.source,
           startedBy: r.startedBy,
@@ -2853,6 +2910,7 @@ const server = http.createServer(async (req, res) => {
         // other *Label field on this route (see faceLabel etc. above).
         garmentTypeLabel: safeResultLabel(garmentTypeLabel, 100) ?? (garmentType as string) ?? undefined,
         runInputs,
+        control: { cancelled: false },
       };
 
       if (currentCatalogBatch) {
@@ -2938,6 +2996,25 @@ const server = http.createServer(async (req, res) => {
       // already-unpaused entry ahead of it) can start immediately.
       tryStartNextCatalogBatch();
       json(res, 200, { paused: false });
+      return;
+    }
+
+    // ---- Cancel the batch that's ACTUALLY RUNNING right now — distinct
+    // from the /queue/:id/pause routes above, which only ever affect a
+    // batch still waiting its turn (that one keeps real pause; see
+    // BatchControl's doc comment in lib/batch.mts for why a running batch
+    // doesn't get one). Mirrors /api/run/cancel for the try-on flow.
+    if (req.method === 'POST' && url.pathname === '/api/catalog/batch/cancel') {
+      if (session!.role !== 'superadmin') {
+        json(res, 403, { error: { code: 'FORBIDDEN', message: 'Super admin only.' } });
+        return;
+      }
+      if (!currentCatalogBatch || currentCatalogBatch.status !== 'running') {
+        json(res, 404, { error: { code: 'NOT_FOUND', message: 'No batch in progress.' } });
+        return;
+      }
+      currentCatalogBatch.control.cancelled = true;
+      json(res, 200, { cancelled: true });
       return;
     }
 
