@@ -177,8 +177,8 @@ export async function createTryonJob(
 ): Promise<{ jobId: string; status: string; personKey?: string }> {
   const form = new FormData();
   form.set('category', category);
-  form.set('person', new File([person.buf], person.filename, { type: person.mime }));
-  form.set('garment', new File([garment.buf], garment.filename, { type: garment.mime }));
+  form.set('person', new File([new Uint8Array(person.buf)], person.filename, { type: person.mime }));
+  form.set('garment', new File([new Uint8Array(garment.buf)], garment.filename, { type: garment.mime }));
   const res = await request(cfg, '/v1/dev/tryon', { method: 'POST', body: form });
   return parseOrThrow(res);
 }

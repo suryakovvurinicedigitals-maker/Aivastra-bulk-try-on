@@ -526,6 +526,8 @@ function catalogAssetPickersHtml() {
     // 'background' this also brings in the merchant's own uploaded
     // candidates (see that function's doc comment); every other kind is
     // unaffected, it's exactly o[meta.optionsKey] either way.
+    if (kind === 'lower' && catalogGarmentTypeHasNoLowerAxis()) return '';
+    if (kind === 'shoe' && catalogGarmentTypeHasNoShoeAxis()) return '';
     const items = catalogAssetListForKind(kind);
     if (items.length === 0 && !meta.required) return '';
 
@@ -646,6 +648,16 @@ function catalogConfigFieldsHtml() {
           `).join('')}
         </div>
       </div>
+      <div class="control-row">
+        <span class="control-row-label">Resolution</span>
+        <div class="segmented-control" id="catalog-resolution-pills" role="tablist" aria-label="Resolution">
+          ${CATALOG_RESOLUTIONS.map((r) => `
+            <button type="button" class="segmented-pill${catalogBatch.resolution === r ? ' active' : ''}" data-value="${r}" role="tab" aria-selected="${catalogBatch.resolution === r}">
+              ${r}
+            </button>
+          `).join('')}
+        </div>
+      </div>
     </div>
     ${catalogBatch.optionsLoading ? '<p class="hint">Loading assets for this gender…</p>' : ''}
     ${catalogBatch.optionsError ? `<p class="redchief-validation-msg">${catalogEscapeHtml(catalogBatch.optionsError)}</p>` : ''}
@@ -681,6 +693,76 @@ function catalogBackgroundUploadControlHtml() {
 function catalogSelectedGarmentTypeMeta() {
   if (!catalogBatch.options || !catalogBatch.garmentType) return null;
   return catalogBatch.options.garmentTypes.find((t) => t.slug === catalogBatch.garmentType) ?? null;
+}
+
+// Men's garment types (GET /v1/dev/catalog/options?gender=men, confirmed live
+// 2026-09-28) where the curated "Lower Garments" picker never applies, for
+// two different reasons:
+//  - pure bottomwear (baggy-jean, jean, trouser, cargo-men, formal, track):
+//    the uploaded garment itself IS the lower piece, so a second curated
+//    bottom would only ever produce a nonsensical two-bottoms result.
+//  - composite types whose bottom is supplied a different way, or not at
+//    all: kurta-pyjama/sherwani-pyjama/shirt-trouser/suit already collect
+//    the tester's OWN bottom photo via requiresLowerUpload's extra upload
+//    tile (catalogGarmentCardHtml) — the curated picker would be a second,
+//    conflicting way to supply the same piece; tank-top/under-wear are worn
+//    with no separate bottom shown in-frame at all.
+// Hardcoded rather than sourced from the API because the dev API carries no
+// category/isBottom field on a garmentType, only slug+label(+requiresLowerUpload).
+const CATALOG_MEN_NO_LOWER_PICKER_GARMENT_TYPES = new Set([
+  'baggy-jean', 'jean', 'trouser', 'cargo-men', 'formal', 'track',
+  'kurta-pyjama', 'sherwani-pyjama', 'shirt-trouser', 'suit',
+  'tank-top', 'under-wear',
+]);
+
+// Women's garment types (GET /v1/dev/catalog/options?gender=women, confirmed
+// live 2026-09-28) where the curated "Lower Garments" picker never applies —
+// frocks/cocktail/jumpsuit/inner-wear are one-piece looks with no separate
+// bottom shown at all (inner-wear same reasoning as under-wear/tank-top in
+// the men's set above), the "on Mannequin" variants are the same one-piece
+// looks shot on a mannequin instead of a face, and chudidar/saree/suit-women/
+// kurti-pyjama are composite types that already collect their own second
+// piece via requiresLowerUpload's extra upload tile (chudidar's pyjama,
+// saree's pallu, suit-women's trouser, kurti-pyjama's own pyjama — same
+// reasoning as kurta-pyjama/suit in the men's set above; the curated picker
+// is for a separate curated bottom garment, which doesn't apply here).
+// one-piece-suit-women/knee-length-frock(-on-mannequin) added 2026-10-02 —
+// live-verified every pose for these three reports hasLower: false (same
+// "0 poses ever use it" signal as long-frock/mini-frock above), confirming
+// they're one-piece looks too despite not having "one piece"/"frock" catch
+// every case by name alone.
+const CATALOG_WOMEN_NO_LOWER_PICKER_GARMENT_TYPES = new Set([
+  'saree', 'saree-on-mannequin', 'chudidar', 'mini-frock', 'long-frock', 'cocktail', 'jumpsuit', 'suit-women', 'kurti-pyjama', 'inner-wear',
+  'long-frock-mannequin-women', 'kurti-on-mannequin', 'cocktail-mannequin', 'chudidar-on-mannequin',
+  'lehenga-mannequin', 'half-saree-mannequin', 'mini-frock-mannequin',
+  'one-piece-suit-women', 'knee-length-frock', 'knee-length-frock-on-mannequin',
+]);
+
+/** True when the currently-selected gender+garmentType is one where the
+ *  Lower Garments picker doesn't apply at all — see
+ *  CATALOG_MEN_NO_LOWER_PICKER_GARMENT_TYPES / CATALOG_WOMEN_NO_LOWER_PICKER_GARMENT_TYPES above. */
+function catalogGarmentTypeHasNoLowerAxis() {
+  if (catalogBatch.gender === 'men') return CATALOG_MEN_NO_LOWER_PICKER_GARMENT_TYPES.has(catalogBatch.garmentType);
+  if (catalogBatch.gender === 'women') return CATALOG_WOMEN_NO_LOWER_PICKER_GARMENT_TYPES.has(catalogBatch.garmentType);
+  return false;
+}
+
+// Women's garment types where the curated "Footwear" picker never applies —
+// long-frock is a floor-length look, so feet (and any selected shoe) aren't
+// visible in frame. Confirmed live 2026-09-28: every one of long-frock's
+// poses already reports hasShoes: false (no pose ever hard-requires a shoe
+// for this type — see the hasShoes doc comment near posesNeedingShoes below),
+// but the picker would still show and imply footwear matters here, so it's
+// hidden at the garmentType level rather than relying on that being merely
+// unenforced.
+const CATALOG_WOMEN_NO_SHOE_PICKER_GARMENT_TYPES = new Set(['long-frock']);
+
+/** True when the currently-selected gender+garmentType is one where the
+ *  Footwear picker doesn't apply at all — see
+ *  CATALOG_WOMEN_NO_SHOE_PICKER_GARMENT_TYPES above. */
+function catalogGarmentTypeHasNoShoeAxis() {
+  if (catalogBatch.gender === 'women') return CATALOG_WOMEN_NO_SHOE_PICKER_GARMENT_TYPES.has(catalogBatch.garmentType);
+  return false;
 }
 
 function catalogGarmentMainCardHtml(garment) {
@@ -883,6 +965,15 @@ function wireCatalogConfigEvents() {
       const val = btn.dataset.value;
       if (catalogBatch.aspectRatio === val) return;
       catalogBatch.aspectRatio = val;
+      renderCatalog();
+    });
+  }
+
+  for (const btn of catalogConfigBodyEl.querySelectorAll('#catalog-resolution-pills .segmented-pill')) {
+    btn.addEventListener('click', () => {
+      const val = btn.dataset.value;
+      if (catalogBatch.resolution === val) return;
+      catalogBatch.resolution = val;
       renderCatalog();
     });
   }
@@ -1208,7 +1299,7 @@ catalogSubmitBtn.addEventListener('click', () => {
   // photo, so "no bottom" would be false here — the curated Lower Garments
   // picker is simply not how this garmentType's bottom gets supplied.
   const meta = catalogSelectedGarmentTypeMeta();
-  const lowerAvailable = !meta?.requiresLowerUpload && (catalogBatch.options?.lowerItems?.length ?? 0) > 0;
+  const lowerAvailable = !meta?.requiresLowerUpload && !catalogGarmentTypeHasNoLowerAxis() && (catalogBatch.options?.lowerItems?.length ?? 0) > 0;
   const lowerWarning = lowerAvailable && catalogBatch.lowers.size === 0
     ? `⚠ No Lower Garment is selected, even though lower-garment options exist for this garment type — the result will only show the uploaded piece with no bottom. `
     : '';
