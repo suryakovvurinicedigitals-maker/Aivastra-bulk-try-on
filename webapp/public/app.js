@@ -458,6 +458,38 @@ async function loadCategories() {
   }
 }
 
+const primaryWorkerSelectEl = document.getElementById('primary-worker-select');
+const fallbackWorkerSelectEl = document.getElementById('fallback-worker-select');
+
+function statusLabel(status) {
+  return { IDLE: 'idle', BUSY: 'busy', DRAINING: 'draining', UNKNOWN: 'unknown' }[status] ?? status.toLowerCase();
+}
+
+async function loadWorkers() {
+  if (!primaryWorkerSelectEl || !fallbackWorkerSelectEl) return;
+  try {
+    const res = await fetch('/api/workers');
+    const data = await res.json();
+    const workers = data.workers || [];
+    const optionsHtml = workers
+      .map((w) => `<option value="${escapeHtml(w.id)}">${escapeHtml(w.label || w.id)} (${statusLabel(w.status)})</option>`)
+      .join('');
+    for (const sel of [primaryWorkerSelectEl, fallbackWorkerSelectEl]) {
+      const prevSelected = new Set([...sel.selectedOptions].map((o) => o.value));
+      sel.innerHTML = optionsHtml;
+      for (const opt of sel.options) {
+        if (prevSelected.has(opt.value)) opt.selected = true;
+      }
+    }
+  } catch (err) {
+    console.error('Could not load GPU worker list — worker pinning unavailable this session.', err);
+  }
+}
+
+function selectedWorkerIds(selectEl) {
+  return selectEl ? [...selectEl.selectedOptions].map((o) => o.value) : [];
+}
+
 let currentPlanTotal = 0;
 
 function escapeHtml(str) {
@@ -1210,7 +1242,13 @@ confirmRunBtn.addEventListener('click', async () => {
     const res = await fetch('/api/run/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ confirmedTotal: currentPlanTotal, scope: 'selected', selection }),
+      body: JSON.stringify({
+        confirmedTotal: currentPlanTotal,
+        scope: 'selected',
+        selection,
+        primaryWorkerIds: selectedWorkerIds(primaryWorkerSelectEl),
+        fallbackWorkerIds: selectedWorkerIds(fallbackWorkerSelectEl),
+      }),
     });
     data = await res.json();
     if (!res.ok) {
@@ -1253,7 +1291,7 @@ confirmRunBtn.addEventListener('click', async () => {
 async function enterUploadView() {
   renderUploadThumbs('person');
   renderUploadThumbs('garment');
-  await Promise.all([loadCategories(), loadPlan(), pollRunStatus()]);
+  await Promise.all([loadCategories(), loadWorkers(), loadPlan(), pollRunStatus()]);
 }
 
 // ---------- results view ----------

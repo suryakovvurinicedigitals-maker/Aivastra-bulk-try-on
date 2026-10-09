@@ -84,6 +84,25 @@
             </button>
           </div>
           <div id="plan-summary"></div>
+
+          <details class="worker-picker-details" id="worker-picker-details">
+            <summary>Pin to specific GPU workers (optional)</summary>
+            <p class="hint">
+              Leave both empty to use the normal worker pool. If you pick workers, jobs try
+              <strong>primary</strong> workers first, then <strong>fallback</strong> workers — if
+              none of either are available, the job fails instead of silently running on some
+              other worker.
+            </p>
+            <div class="control-row">
+              <span class="control-row-label">Primary</span>
+              <select id="primary-worker-select" class="worker-picker-select" multiple></select>
+            </div>
+            <div class="control-row">
+              <span class="control-row-label">Fallback</span>
+              <select id="fallback-worker-select" class="worker-picker-select" multiple></select>
+            </div>
+          </details>
+
           <div class="run-banner" id="upload-run-banner" hidden></div>
           <div class="confirm-panel" id="confirm-panel" hidden>
             <p id="confirm-text"></p>

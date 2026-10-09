@@ -32,11 +32,13 @@ import {
   getCatalogueStatus,
   getCategories,
   listDevBackgrounds,
+  listWorkers,
   presignDevBackground,
   type CatalogGender,
   type CatalogGenerateBody,
   type CatalogJobStatus,
   type DevApiConfig,
+  type WorkerPinning,
 } from '../lib/api-client.mts';
 import { type BatchControl, runBatch, runOneJob } from '../lib/batch.mts';
 import { createLimiter } from '../lib/concurrency.mts';
@@ -1248,6 +1250,7 @@ interface QueuedRun {
   confirmedTotal: number;
   queuedBy: string;
   queuedAt: string;
+  pinning?: WorkerPinning;
   // Keeps its place in line but is skipped by tryStartQueuedRun until
   // resumed — same shape as Catalog Batch's queue pause (see
   // CatalogBatchState.paused), lets someone queue several runs and hold
@@ -1263,7 +1266,7 @@ function queuedCategories(selection: Selection): string[] {
 }
 
 /** Actually launches a batch — shared by "start now" and "queued batch's turn arrived". */
-function startRun(jobs: TryonJobSpec[], startedBy: string): { runId: string; total: number } {
+function startRun(jobs: TryonJobSpec[], startedBy: string, pinning?: WorkerPinning): { runId: string; total: number } {
   const runId = new Date().toISOString().replace(/[:.]/g, '-');
   const runDir = path.join(OUTPUT_DIR, runId);
   mkdirSync(runDir, { recursive: true });
@@ -1277,6 +1280,7 @@ function startRun(jobs: TryonJobSpec[], startedBy: string): { runId: string; tot
     concurrency: CONCURRENCY,
     poll: { intervalMs: POLL_INTERVAL_MS, timeoutMs: POLL_TIMEOUT_MS },
     control,
+    pinning,
     onEvent: (evt) => {
       if (!currentRun || currentRun.runId !== runId) return;
       if (evt.type === 'credits-exhausted') {
@@ -1328,7 +1332,7 @@ async function tryStartQueuedRun(): Promise<void> {
       `Queued run from ${pending.queuedBy}: plan changed since queuing (confirmed ${pending.confirmedTotal}, now ${jobs.length}) — running the current plan anyway.`,
     );
   }
-  startRun(jobs, pending.queuedBy);
+  startRun(jobs, pending.queuedBy, pending.pinning);
 }
 
 /** Same id → row resolution as /api/results' per-page mapping, but for a single id (plus resolved absolute input/output file paths) — used by the resolve/bundle routes, which need the actual files, not just a listing. */
@@ -1544,6 +1548,24 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // Powers the Virtual Tryon tab's primary/fallback worker pickers. Same
+    // try/fallback shape as /api/categories above, but an empty list (rather
+    // than a hardcoded fallback) is the right empty state here — there's no
+    // sensible default worker to offer, and the pickers are optional anyway.
+    if (req.method === 'GET' && url.pathname === '/api/workers') {
+      if (!cfg) {
+        json(res, 200, { workers: [] });
+        return;
+      }
+      try {
+        const workers = await listWorkers(cfg);
+        json(res, 200, { workers });
+      } catch (err) {
+        json(res, 200, { workers: [], error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
+
     if (req.method === 'GET' && url.pathname === '/api/balance') {
       if (!cfg) {
         json(res, 200, { available: false });
@@ -1695,6 +1717,13 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const confirmedTotal = payload.confirmedTotal;
+      const pinning: WorkerPinning | undefined =
+        Array.isArray(payload.primaryWorkerIds) || Array.isArray(payload.fallbackWorkerIds)
+          ? {
+              primaryWorkerIds: Array.isArray(payload.primaryWorkerIds) ? payload.primaryWorkerIds.filter((v: unknown) => typeof v === 'string') : undefined,
+              fallbackWorkerIds: Array.isArray(payload.fallbackWorkerIds) ? payload.fallbackWorkerIds.filter((v: unknown) => typeof v === 'string') : undefined,
+            }
+          : undefined;
 
       const jobs = await computeJobs(cfg, payload.scope, payload.selection);
       if (jobs.length === 0) {
@@ -1714,12 +1743,12 @@ const server = http.createServer(async (req, res) => {
           return;
         }
         const id = String(nextQueueId++);
-        queuedRuns.push({ id, selection: payload.selection, confirmedTotal, queuedBy: session!.username, queuedAt: new Date().toISOString(), paused: false });
+        queuedRuns.push({ id, selection: payload.selection, confirmedTotal, queuedBy: session!.username, queuedAt: new Date().toISOString(), paused: false, pinning });
         json(res, 202, { queued: true, position: queuedRuns.length, total: confirmedTotal });
         return;
       }
 
-      const { runId, total } = startRun(jobs, session!.username);
+      const { runId, total } = startRun(jobs, session!.username, pinning);
       json(res, 202, { queued: false, runId, total });
       return;
     }

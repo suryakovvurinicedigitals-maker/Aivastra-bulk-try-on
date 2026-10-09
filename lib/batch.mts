@@ -5,7 +5,7 @@
  */
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { createTryonJob, DevApiError, downloadAsset, getJob, type DevApiConfig } from './api-client.mts';
+import { createTryonJob, DevApiError, downloadAsset, getJob, type DevApiConfig, type WorkerPinning } from './api-client.mts';
 import { createLimiter } from './concurrency.mts';
 import { ensureRun, getRunRows, insertJobResult } from './db.mts';
 import type { TryonJobSpec } from './scan-input.mts';
@@ -70,6 +70,7 @@ export async function runOneJob(
   resultsDir: string,
   poll: PollOptions,
   startedAt: number = Date.now(),
+  pinning?: WorkerPinning,
 ): Promise<JobResult> {
   // base() is called at each return point (not once up front) so finishedAt/
   // durationMs reflect when *that* outcome actually happened, not when the
@@ -87,7 +88,7 @@ export async function runOneJob(
   const person = { buf: readFileSync(job.personFile), filename: path.basename(job.personFile), mime: mimeFor(job.personFile) };
   const garment = { buf: readFileSync(job.garmentFile), filename: path.basename(job.garmentFile), mime: mimeFor(job.garmentFile) };
 
-  const created = await createTryonJob(cfg, job.categorySlug, person, garment);
+  const created = await createTryonJob(cfg, job.categorySlug, person, garment, pinning);
   const outcome = await pollJob(cfg, created.jobId, poll);
 
   if (outcome.status === 'FAILED') {
@@ -145,6 +146,7 @@ export interface RunBatchOptions {
   poll: PollOptions;
   onEvent?: (evt: { type: 'job'; result: JobResult } | { type: 'credits-exhausted' }) => void;
   control?: BatchControl;
+  pinning?: WorkerPinning;
 }
 
 /** Resolves once every job has either finished, been skipped after credits ran out, or been cancelled. */
@@ -185,7 +187,7 @@ export async function runBatch(
         }
         if (creditsExhausted) return;
         const startedAt = Date.now();
-        const result = await runOneJob(cfg, job, resultsDir, opts.poll, startedAt).catch(
+        const result = await runOneJob(cfg, job, resultsDir, opts.poll, startedAt, opts.pinning).catch(
           (err): JobResult => ({
             gender: job.gender,
             personName: job.personName,

@@ -169,18 +169,38 @@ export interface ImageInput {
   mime: string;
 }
 
+export interface WorkerPinning {
+  primaryWorkerIds?: string[];
+  fallbackWorkerIds?: string[];
+}
+
 export async function createTryonJob(
   cfg: DevApiConfig,
   category: string,
   person: ImageInput,
   garment: ImageInput,
+  pinning?: WorkerPinning,
 ): Promise<{ jobId: string; status: string; personKey?: string }> {
   const form = new FormData();
   form.set('category', category);
   form.set('person', new File([new Uint8Array(person.buf)], person.filename, { type: person.mime }));
   form.set('garment', new File([new Uint8Array(garment.buf)], garment.filename, { type: garment.mime }));
+  if (pinning?.primaryWorkerIds?.length) form.set('primaryWorkerIds', pinning.primaryWorkerIds.join(','));
+  if (pinning?.fallbackWorkerIds?.length) form.set('fallbackWorkerIds', pinning.fallbackWorkerIds.join(','));
   const res = await request(cfg, '/v1/dev/tryon', { method: 'POST', body: form });
   return parseOrThrow(res);
+}
+
+export interface DevWorkerListItem {
+  id: string;
+  label: string;
+  status: 'IDLE' | 'BUSY' | 'DRAINING' | 'UNKNOWN';
+}
+
+/** Needs a 'full'-scoped key — see apps/api/src/modules/dev/routes.ts's GET /v1/dev/workers. */
+export async function listWorkers(cfg: DevApiConfig): Promise<DevWorkerListItem[]> {
+  const body = await parseOrThrow(await request(cfg, '/v1/dev/workers'));
+  return body.workers;
 }
 
 export async function getJob(
